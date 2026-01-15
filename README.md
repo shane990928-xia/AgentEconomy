@@ -1,2 +1,2 @@
 # AgentEconomy
-A llm
+A LLM-based Economic Simulation System
