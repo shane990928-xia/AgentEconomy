@@ -1,0 +1,28 @@
+model_list:
+  # --- 1. 定义 OpenAI 模型 ---
+  - model_name: gpt-4-turbo      # 这是你在代码里调用的名字
+    litellm_params:
+      model: gpt-4-turbo-preview # 这是实际转发给厂商的模型名字
+      api_key: os.environ/OPENAI_API_KEY # 从环境变量读取 Key（推荐）
+
+  # --- 2. 定义 Claude 模型 ---
+  - model_name: claude-3         # 代码里叫 "claude-3"
+    litellm_params:
+      model: anthropic/claude-3-opus-20240229
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # --- 3. 定义本地 Ollama 模型 ---
+  - model_name: local-llama      # 代码里叫 "local-llama"
+    litellm_params:
+      model: ollama/llama3       # 格式: ollama/模型名
+      api_base: "http://localhost:11434" # 指向本地 Ollama 端口
+
+  - model_name: deepseek
+    litellm_params:
+      model: os.environ/MODEL
+      api_key: os.environ/OPENAI_API_KEY
+      base_url: os.environ/BASE_URL
+
+litellm_settings:
+  drop_params: true              # 自动丢弃模型不支持的参数（防止报错）
+  set_verbose: true              # 开启详细日志（调试用）

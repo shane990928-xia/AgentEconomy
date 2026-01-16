@@ -1,0 +1,4941 @@
+"""
+Economic Center Module
+
+This module implements the central economic system that manages all economic activities
+in the agent-based economic simulation, including:
+
+- Asset Management: Ledgers, products, labor hours, capital stocks
+- Transaction Processing: Purchases, labor payments, taxes
+- Tax System: Progressive income tax, corporate tax, VAT
+- Firm Finances: Revenue, expenses, depreciation, innovation
+- Job Market: Job postings, applications, matching
+- Inventory Management: Reservations, stock tracking
+- GDP Calculation: Production-based and expenditure-based GDP
+- Government Operations: Tax collection and redistribution
+
+Key Components:
+    - EconomicCenter: Main class coordinating all economic activities
+"""
+
+import copy
+import os
+import random
+import time
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from uuid import uuid4
+
+import numpy as np
+import ray
+from dotenv import load_dotenv
+
+from agenteconomy.center.model import *
+from agenteconomy.utils import safe_call
+from agenteconomy.utils.logger import get_logger
+from agenteconomy.utils.product_attribute_loader import inject_product_attributes
+
+# Initialize environment and logger
+load_dotenv()
+
+
+# =============================================================================
+# Economic Center Class
+# =============================================================================
+
+@ray.remote(num_cpus=8)
+class EconomicCenter:
+
+    # =========================================================================
+    # Initialization
+    # =========================================================================
+    def __init__(self, tax_policy: TaxPolicy = None, category_profit_margins: Dict[str, float] = None):
+        """
+        Initialize EconomicCenter with tax rates
+        
+        Args:
+            tax_policy: 税收政策配置（包含累进税阶梯）
+            category_profit_margins: 各行业毛利率配置
+        """
+        # 税率配置 - 如果未提供，使用默认值
+        if tax_policy is None:
+            tax_policy = TaxPolicy()  # 使用默认配置
+        
+        self.income_tax_rate = tax_policy.income_tax_rate  # List[TaxBracket] - 累进税阶梯
+        self.vat_rate = tax_policy.vat_rate  # float - 消费税率
+        self.corporate_tax_rate = tax_policy.corporate_tax_rate  # float - 企业所得税率（固定）
+        self.logger = get_logger(name="economic_center")
+
+        # 💰 商品毛利率配置（基于Daily Category的12个大类）
+        # 由GPT-5生成，基于行业实际情况和市场竞争程度
+        # 🔧 修复：如果传入 None，初始化默认配置（类似 SimulationConfig.__post_init__）
+        if category_profit_margins is None:
+            print('使用默认毛利率')
+            self.category_profit_margins = {
+                "Beverages": 25.0,                              # 饮料
+                "Confectionery and Snacks": 32.0,               # 糖果和零食
+                "Dairy Products": 15.0,                         # 乳制品
+                "Furniture and Home Furnishing": 30.0,          # 家具和家居装饰
+                "Garden and Outdoor": 28.0,                     # 园艺和户外
+                "Grains and Bakery": 18.0,                      # 谷物和烘焙
+                "Household Appliances and Equipment": 30.0,     # 家用电器和设备
+                "Meat and Seafood": 16.0,                       # 肉类和海鲜
+                "Personal Care and Cleaning": 40.0,            # 个人护理和清洁
+                "Pharmaceuticals and Health": 45.0,            # 药品和健康
+                "Retail and Stores": 25.0,                      # 零售和商店
+                "Sugars, Oils, and Seasonings": 20.0,           # 糖类、油类和调料
+            }
+        else:
+            self.category_profit_margins = category_profit_margins
+
+        # ===== Asset Storage =====
+        # Save assets for different agents
+        self.ledger: Dict[str, Ledger] = defaultdict(Ledger)
+        self.products: Dict[str, List[Product]] = defaultdict(list)
+        self.laborhour: Dict[str, List[LaborHour]] = defaultdict(list)
+
+        # ===== Agent ID Registry =====
+        # Save IDs for different agents
+        self.government_id: List[str] = []  # government ID
+        self.household_id: List[str] = []  #  household ID
+        self.company_id: List[str] = []  #  firm ID
+        self.bank_id: List[str] = []  #  bank ID
+
+        # ===== Transaction & Financial Tracking =====
+        self.middleware = MiddlewareRegistry()
+        self.tx_history: List[Transaction] = []  # Store transaction history
+        self.wage_history: List[Wage] = []
+        self.firm_financials: Dict[str, Dict[str, float]] = defaultdict(lambda: {"total_income": 0.0, "total_expenses": 0.0})  # 企业财务记录
+        self.firm_monthly_financials: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"income": 0.0, "expenses": 0.0}))  # 企业月度财务记录
+        self.firm_production_stats: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"base_production": 0.0, "labor_production": 0.0}))  # 企业月度生产统计
+        # 月度细分：用于“现金流口径”的生产预算计算
+        self.firm_monthly_wage_expenses: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_monthly_corporate_tax: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_monthly_production_cost: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # 劳动力生产的总价值（按销售价格估值），用于统计输出
+        self.firm_monthly_labor_production_value: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # 企业税月度结算防重（避免重复扣税）
+        self._corporate_tax_settled_months: set[int] = set()
+        self.redistribution_record_per_person:Dict[int, float] = defaultdict(float)
+        # 创新系统数据结构
+        # ===== Innovation System =====
+        self.firm_innovation_strategy: Dict[str, str] = {}  # {company_id: "encouraged" or "suppressed"}
+        self.firm_research_share: List[Dict[str, [float, int]]] = []  # [company_id: [research_share, month]] 研发投入比例
+        
+        # 创新系统数据结构
+        self.firm_innovation_config: Dict[str, FirmInnovationConfig] = {}  # {company_id: innovation_config}
+        self.firm_innovation_events: List[FirmInnovationEvent] = []  # [company_id: innovation_events, month: month] 创新事件历史记录
+        # ✨ 创新模块开关（由仿真侧每月传入 innovation_config 决定；未开启时应忽略创新配置/事件）
+        self.enable_innovation_module: bool = False
+        
+        # 🔒 库存预留系统（解决并发竞争问题）
+        # ===== Inventory Reservation System =====
+        self.inventory_reservations: Dict[str, InventoryReservation] = {}  # {reservation_id: InventoryReservation}
+        self.reservation_timeout: float = 300.0  # 默认预留超时时间（秒）= 5分钟
+
+        # 📉 未满足需求统计（用于“缺货→补货”闭环）
+        # 结构：{month: {"product_id@company_id": {"attempts": float, "qty_requested": float, "qty_short": float}}}
+        # ===== Unmet Demand Tracking =====
+        self.unmet_demand_by_month: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
+
+        # =========================
+        # 🏦 企业资产负债表（固定资产/现金）与折旧（新增）
+        # =========================
+        # 资本存量（book value / 用作CD-K）：{company_id: capital_stock_value}
+        # ===== Firm Capital & Depreciation =====
+        self.firm_capital_stock: Dict[str, float] = defaultdict(float)
+        # 月度折旧费用（非现金费用）：{company_id: {month: depreciation_expense}}
+        self.firm_monthly_depreciation: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # 月度资本投资（现金→固定资产，不计入当期费用）：{company_id: {month: capex_amount}}
+        self.firm_monthly_capital_investment: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # 资本存量历史（便于调试/导出）：{company_id: {month: capital_stock_end}}
+        self.firm_capital_stock_history: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        
+        # 初始化日志
+        print(f"EconomicCenter initialized with tax policy:")
+        print(f"  📊 个人所得税: 累进税制 ({len(self.income_tax_rate)} 档)")
+        for i, bracket in enumerate(self.income_tax_rate):
+            if i + 1 < len(self.income_tax_rate):
+                print(f"     档位{i+1}: ${bracket.cutoff:>8,.0f} - ${self.income_tax_rate[i+1].cutoff:>8,.0f} → {bracket.rate:>5.1%}")
+            else:
+                print(f"     档位{i+1}: ${bracket.cutoff:>8,.0f}+          → {bracket.rate:>5.1%}")
+        print(f"  💼 企业所得税: {self.corporate_tax_rate:.1%} (固定税率)")
+        print(f"  🛒 消费税(VAT): {self.vat_rate:.1%}")
+
+        # =========================
+        # 🧮 Month1 CD 校准结果（由仿真侧写入，后续月份沿用不变）
+        # =========================
+        # 结构与 simulation/joint_debug_test.py 一致
+        # ===== CD Production Function Calibration =====
+        self._cd_calibration: Dict[str, Any] = {}
+        self._cd_industry_A: Dict[str, float] = {}
+        self._cd_industry_K_tot: Dict[str, float] = {}
+        self._cd_firm_K: Dict[str, float] = {}
+        self._cd_firm_A: Dict[str, float] = {}
+
+    @staticmethod
+    def _monthly_rate_from_annual(annual_rate: float) -> float:
+        """
+        Geometric conversion:
+            r_m = 1 - (1 - r_a)^(1/12)
+        """
+        try:
+            r = float(annual_rate or 0.0)
+        except Exception:
+            r = 0.0
+        r = max(0.0, min(0.99, r))
+        return float(1.0 - ((1.0 - r) ** (1.0 / 12.0)))
+
+
+    # =========================================================================
+    # Firm Asset Management (Capital & Inventory)
+    # =========================================================================
+    def register_firm_assets(self, allocations: Dict[str, Dict[str, float]], overwrite_cash: bool = True, overwrite_capital: bool = True) -> Dict[str, float]:
+        """
+        批量注册企业“资本存量(K) + 现金(Cash)”。
+
+        allocations:
+            {company_id: {"capital_stock": float, "cash": float}}
+        """
+        if not isinstance(allocations, dict):
+            return {"firms_updated": 0, "capital_total": 0.0, "cash_total": 0.0}
+
+        firms_updated = 0
+        cap_total = 0.0
+        cash_total = 0.0
+
+        for cid, rec in allocations.items():
+            company_id = str(cid)
+            if not company_id:
+                continue
+            if company_id not in self.ledger:
+                self.ledger[company_id] = Ledger.create(company_id, 0.0)
+            if company_id not in self.company_id:
+                # 确保是企业ID（避免因为初始化顺序导致漏注册）
+                self.company_id.append(company_id)
+
+            try:
+                cap = float((rec or {}).get("capital_stock", 0.0) or 0.0)
+            except Exception:
+                cap = 0.0
+            try:
+                cash = float((rec or {}).get("cash", 0.0) or 0.0)
+            except Exception:
+                cash = 0.0
+
+            if overwrite_capital:
+                self.firm_capital_stock[company_id] = max(0.0, cap)
+            if overwrite_cash:
+                self.ledger[company_id].amount = float(cash)
+
+            firms_updated += 1
+            cap_total += max(0.0, cap)
+            cash_total += cash
+
+        return {"firms_updated": int(firms_updated), "capital_total": float(cap_total), "cash_total": float(cash_total)}
+
+    def overwrite_product_amounts(
+        self,
+        inventory_by_firm: Dict[str, Dict[str, float]],
+        set_unmentioned_to_zero: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Overwrite inventory amounts for existing products.
+
+        inventory_by_firm:
+            {company_id: {product_id: amount}}
+        """
+        if not isinstance(inventory_by_firm, dict):
+            return {"firms_updated": 0, "products_updated": 0, "products_missing": 0}
+
+        firms_updated = 0
+        products_updated = 0
+        products_missing = 0
+
+        for cid, prod_map in (inventory_by_firm or {}).items():
+            company_id = str(cid or "")
+            if not company_id or not isinstance(prod_map, dict):
+                continue
+
+            if company_id not in self.products:
+                # Inventory overwrite assumes products are already registered for the firm
+                self.products[company_id] = []
+
+            existing = {str(getattr(p, "product_id", "") or ""): p for p in (self.products.get(company_id) or [])}
+
+            touched = set()
+            for pid, qty in (prod_map or {}).items():
+                product_id = str(pid or "")
+                if not product_id:
+                    continue
+                touched.add(product_id)
+                try:
+                    amount = float(qty or 0.0)
+                except Exception:
+                    amount = 0.0
+                if amount < 0:
+                    amount = 0.0
+
+                if product_id in existing:
+                    try:
+                        existing[product_id].amount = amount
+                        products_updated += 1
+                    except Exception:
+                        products_missing += 1
+                else:
+                    products_missing += 1
+
+            if set_unmentioned_to_zero:
+                for pid, p in existing.items():
+                    if pid and pid not in touched:
+                        try:
+                            p.amount = 0.0
+                            products_updated += 1
+                        except Exception:
+                            continue
+
+            firms_updated += 1
+
+        return {
+            "firms_updated": int(firms_updated),
+            "products_updated": int(products_updated),
+            "products_missing": int(products_missing),
+        }
+
+    def query_firm_assets(self, company_id: str) -> Dict[str, float]:
+        cid = str(company_id or "")
+        if not cid:
+            return {"capital_stock": 0.0, "cash_balance": 0.0, "net_assets": 0.0}
+        if cid not in self.ledger:
+            self.ledger[cid] = Ledger.create(cid, 0.0)
+        capital = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+        cash = float(self.ledger[cid].amount or 0.0)
+        return {"capital_stock": capital, "cash_balance": cash, "net_assets": float(capital + cash)}
+
+    def query_all_firm_assets(self) -> Dict[str, Dict[str, float]]:
+        result: Dict[str, Dict[str, float]] = {}
+        for cid in list(self.company_id or []):
+            result[str(cid)] = self.query_firm_assets(str(cid))
+        return result
+
+    def invest_in_capital(self, company_id: str, amount: float, month: int, allow_negative_cash: bool = True) -> Dict[str, float]:
+        """
+        Capital investment (capex):
+        - Decrease firm cash balance (ledger) by `amount`
+        - Increase firm capital stock K by `amount`
+        - Record monthly capex for reporting
+
+        Note: does NOT count as current-period expense (depreciation will amortize).
+        """
+        cid = str(company_id or "")
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if not cid or m <= 0:
+            return {"invested": 0.0, "capital_stock": 0.0, "cash_balance": 0.0}
+
+        try:
+            amt = float(amount or 0.0)
+        except Exception:
+            amt = 0.0
+        if amt <= 0:
+            assets = self.query_firm_assets(cid)
+            assets["invested"] = 0.0
+            return assets
+
+        if cid not in self.ledger:
+            self.ledger[cid] = Ledger.create(cid, 0.0)
+        cash = float(self.ledger[cid].amount or 0.0)
+        if (not allow_negative_cash) and cash < amt:
+            amt = max(0.0, cash)
+        if amt <= 0:
+            assets = self.query_firm_assets(cid)
+            assets["invested"] = 0.0
+            return assets
+
+        # Cash outflow
+        self.ledger[cid].amount -= amt
+        # Capital stock inflow
+        k0 = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+        k1 = max(0.0, k0 + amt)
+        self.firm_capital_stock[cid] = k1
+        self.firm_capital_stock_history[cid][m] = k1
+        self.firm_monthly_capital_investment[cid][m] += amt
+
+        return {"invested": float(amt), "capital_stock": float(k1), "cash_balance": float(self.ledger[cid].amount or 0.0)}
+
+    def apply_monthly_depreciation(self, month: int, annual_depreciation_rate: float = 0.08, reduce_capital_stock: bool = True) -> Dict[str, float]:
+        """
+        对所有企业计提月度折旧：
+        - 折旧费用计入 firm_monthly_financials[month]["expenses"]（用于企业税基/利润口径）
+        - 默认同时减少 firm_capital_stock（K_{t+1} = (1-δ_m)K_t）
+        """
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if m <= 0:
+            return {"depreciation_total": 0.0, "firms": 0}
+
+        r_m = self._monthly_rate_from_annual(annual_depreciation_rate)
+        if r_m <= 0:
+            return {"depreciation_total": 0.0, "firms": 0}
+
+        total_dep = 0.0
+        firms = 0
+        for cid in list(self.company_id or []):
+            company_id = str(cid)
+            k0 = float(self.firm_capital_stock.get(company_id, 0.0) or 0.0)
+            if k0 <= 0:
+                continue
+            dep = float(k0 * r_m)
+            if dep <= 1e-12:
+                continue
+
+            self.firm_monthly_depreciation[company_id][m] += dep
+            total_dep += dep
+            firms += 1
+
+            # 费用发生制：折旧计入支出（不扣现金）
+            self.record_firm_expense(company_id, dep)
+            self.record_firm_monthly_expense(company_id, m, dep)
+
+            if reduce_capital_stock:
+                k1 = max(0.0, k0 - dep)
+                self.firm_capital_stock[company_id] = k1
+                self.firm_capital_stock_history[company_id][m] = k1
+            else:
+                self.firm_capital_stock_history[company_id][m] = k0
+
+        return {"depreciation_total": float(total_dep), "firms": int(firms), "monthly_rate": float(r_m)}
+
+    def query_firm_monthly_depreciation(self, company_id: str, month: int) -> float:
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if m <= 0:
+            return 0.0
+        return float(self.firm_monthly_depreciation.get(str(company_id), {}).get(m, 0.0) or 0.0)
+
+    def query_all_firms_monthly_depreciation(self, month: int) -> Dict[str, float]:
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if m <= 0:
+            return {}
+        return {str(cid): float(self.firm_monthly_depreciation.get(str(cid), {}).get(m, 0.0) or 0.0) for cid in list(self.company_id or [])}
+
+    @staticmethod
+    def _unmet_key(product_id: str, seller_id: str) -> str:
+        return f"{str(product_id)}@{str(seller_id)}"
+
+    def record_unmet_demand(
+        self,
+        month: int,
+        buyer_id: str,
+        seller_id: str,
+        product_id: str,
+        product_name: str,
+        quantity_requested: float,
+        available_stock: float,
+        reason: str = "reserve_failed",
+    ) -> None:
+        """
+        记录“未满足需求”（预留失败/库存不足）。
+
+        qty_short = max(0, requested - available_stock)
+        """
+        try:
+            m = int(month or 0)
+            if m <= 0:
+                return
+            qty_req = max(0.0, float(quantity_requested or 0.0))
+            avail = max(0.0, float(available_stock or 0.0))
+            qty_short = max(0.0, qty_req - avail)
+            if qty_req <= 0:
+                return
+
+            key = self._unmet_key(product_id, seller_id)
+        # ===== Unmet Demand Tracking =====
+            rec = (self.unmet_demand_by_month.get(m, {}) or {}).get(key)
+            if rec is None:
+                rec = {"attempts": 0.0, "qty_requested": 0.0, "qty_short": 0.0}
+        # ===== Unmet Demand Tracking =====
+                self.unmet_demand_by_month[m][key] = rec
+            rec["attempts"] = float(rec.get("attempts", 0.0) or 0.0) + 1.0
+            rec["qty_requested"] = float(rec.get("qty_requested", 0.0) or 0.0) + qty_req
+            rec["qty_short"] = float(rec.get("qty_short", 0.0) or 0.0) + qty_short
+        except Exception:
+            return
+
+    def query_unmet_demand(self, month: int) -> Dict[str, Dict[str, float]]:
+        """查询指定月份的未满足需求统计（可序列化）。"""
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if m <= 0:
+            return {}
+        # ===== Unmet Demand Tracking =====
+        return dict(self.unmet_demand_by_month.get(m, {}) or {})
+
+    def set_cd_calibration(self, calibration: Dict[str, Any]) -> bool:
+        """
+        接收并固化 month=1 的 CD 校准结果。
+
+        calibration 结构（建议）：
+          - industry_A: {industry: A_s}
+          - industry_K_tot: {industry: K_s_tot}
+          - firm_K: {company_id: K_i}
+          - firm_w: {company_id: w_i}
+          - firm_A: {company_id: A_i}  (可选；若无则回退 industry_A)
+          - meta: {...}
+        """
+        try:
+            if not isinstance(calibration, dict):
+                return False
+            self._cd_calibration = calibration
+            self._cd_industry_A = dict(calibration.get("industry_A", {}) or {})
+            self._cd_industry_K_tot = dict(calibration.get("industry_K_tot", {}) or {})
+            self._cd_firm_K = dict(calibration.get("firm_K", {}) or {})
+            self._cd_firm_A = dict(calibration.get("firm_A", {}) or {})
+            logger.info(
+                f"✅ CD校准结果已写入EconomicCenter: industries={len(self._cd_industry_A)}, firms(K)={len(self._cd_firm_K)}, firms(A)={len(self._cd_firm_A)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"写入CD校准结果失败: {e}")
+            return False
+
+    @safe_call("EconomicCenter init_agent_ledger", "warning")
+
+    # =========================================================================
+    # Agent Initialization
+    # =========================================================================
+    def init_agent_ledger(self, agent_id: str, initial_amount: float = 0.0):
+        """
+        Initialize a ledger for an agent with a given initial amount.
+        If the agent already exists, it will not overwrite the existing ledger.
+        """
+        if agent_id not in self.ledger:
+            ledger = Ledger.create(agent_id, amount=initial_amount)
+            self.ledger[agent_id] = ledger
+            # logger.info(f"Initialized ledger for agent {agent_id} with amount {initial_amount}")
+    
+    @safe_call("EconomicCenter init_agent_product", "warning")
+    def init_agent_product(self, agent_id: str, product: Optional[Product]=None):
+        """
+        Initialize a product for an agent. If the product already exists, it will merge the amounts.
+        """
+        if agent_id not in self.products:
+            # print(f"Initialized product for agent {agent_id}")
+            self.products[agent_id] = []
+        
+        if product:
+            self._add_or_merge_product(agent_id, product)
+            # logger.info(f"Initialized product {product.name} for agent {agent_id} with amount {product.amount}")
+
+    @safe_call("EconomicCenter init_agent_labor", "warning")
+    def init_agent_labor(self, agent_id:str, labor:[LaborHour]=[]):
+        """
+        Initialize the labor hour for an agent.
+        """
+        if agent_id not in self.laborhour:
+            self.laborhour[agent_id] = []
+        if labor:
+            self.laborhour[agent_id] = labor
+
+    def register_id(self, agent_id: str, agent_type: Literal['government', 'household', 'firm', 'bank']):
+        """
+        Register an agent ID based on its type.
+        """
+        if agent_type == 'government':
+            self.government_id.append(agent_id)
+        elif agent_type == 'household':
+            self.household_id.append(agent_id)
+        elif agent_type == 'firm':
+            self.company_id.append(agent_id)
+        elif agent_type == 'bank':
+            self.bank_id.append(agent_id)
+
+
+    # =========================================================================
+    # Query Methods
+    # =========================================================================
+    def query_all_products(self):
+        return self.products
+
+    def query_all_tx(self):
+        return self.tx_history
+
+    def set_all_firm_products_amount(self, amount: float) -> Dict[str, float]:
+        """
+        将所有企业名下商品库存 amount 设为统一值（用于需求采样/压力测试）。
+
+        Returns:
+            {"products_updated": int, "amount": float}
+        """
+        try:
+            amt = float(amount)
+        except Exception:
+            amt = 0.0
+        if amt < 0:
+            amt = 0.0
+        updated = 0
+        for owner_id, products in (self.products or {}).items():
+            if owner_id not in (self.company_id or []):
+                continue
+            for p in (products or []):
+                try:
+                    p.amount = amt
+                    updated += 1
+                except Exception:
+                    continue
+        return {"products_updated": int(updated), "amount": float(amt)}
+    
+    def query_exsiting_agents(self, agent_type: Literal['government', 'household', 'firm']) -> List[str]:
+        """
+        Query existing agents based on their type.
+        """
+        if agent_type == 'government':
+            return self.government_id
+        elif agent_type == 'household':
+            return self.household_id
+        elif agent_type == 'firm':
+            return self.company_id
+        else:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+        
+    # query interface
+    def query_balance(self, agent_id: str) -> float:
+        """
+        Query the cash balance of an agent.
+        
+        Args:
+            agent_id: Unique identifier of the agent
+            
+        Returns:
+            Current cash balance
+        """
+        if agent_id in self.ledger:
+            return self.ledger[agent_id].amount
+        else:
+            return 0.0
+
+    def query_redistribution_record_per_person(self, month: int) -> float:
+        return self.redistribution_record_per_person[month]
+    
+    def query_products(self, agent_id: str) -> List[Product]:
+        """
+        Query all products owned by an agent.
+        
+        Args:
+            agent_id: Unique identifier of the agent
+            
+        Returns:
+            List of products owned by the agent
+        """
+        return self.products[agent_id]
+    
+    def query_price(self, agent_id: str, product_id: str) -> float:
+        for product in self.products[agent_id]:
+            if product.product_id == product_id:
+                return product.price
+        return 0.0
+    
+    def query_financial_summary(self, agent_id: str) -> Dict[str, float]:
+        """查询代理的财务摘要：余额、总收入、总支出（企业适用）"""
+        result = {}
+        
+        if agent_id in self.ledger:
+            result["balance"] = self.ledger[agent_id].amount
+        else:
+            result["balance"] = 0.0
+        
+        # 如果是企业，添加收支记录
+        if agent_id in self.firm_financials:
+            result.update(self.firm_financials[agent_id])
+            result["net_profit"] = result.get("total_income", 0.0) - result.get("total_expenses", 0.0)
+        
+        result['total_income'] = self.firm_financials[agent_id].get("total_income", 0.0)
+        result['total_expenses'] = self.firm_financials[agent_id].get("total_expenses", 0.0)
+        return result
+    
+    def record_firm_income(self, company_id: str, amount: float):
+        """记录企业收入"""
+        self.firm_financials[company_id]["total_income"] += amount
+        
+    def record_firm_expense(self, company_id: str, amount: float):
+        """记录企业支出"""
+        self.firm_financials[company_id]["total_expenses"] += amount
+    
+    def record_firm_monthly_income(self, company_id: str, month: int, amount: float):
+        """记录企业月度收入"""
+        self.firm_monthly_financials[company_id][month]["income"] += amount
+        
+    def record_firm_monthly_expense(self, company_id: str, month: int, amount: float):
+        """记录企业月度支出"""
+        self.firm_monthly_financials[company_id][month]["expenses"] += amount
+    
+    def query_firm_monthly_financials(self, company_id: str, month: int) -> Dict[str, float]:
+        """查询企业指定月份的财务数据"""
+        if company_id in self.firm_monthly_financials and month in self.firm_monthly_financials[company_id]:
+            monthly_data = self.firm_monthly_financials[company_id][month]
+            depreciation = float(self.firm_monthly_depreciation.get(company_id, {}).get(month, 0.0) or 0.0)
+            return {
+                "monthly_income": monthly_data["income"],
+                "monthly_expenses": monthly_data["expenses"],
+                "monthly_profit": monthly_data["income"] - monthly_data["expenses"],
+                "monthly_depreciation": depreciation,
+            }
+        depreciation = float(self.firm_monthly_depreciation.get(company_id, {}).get(month, 0.0) or 0.0)
+        return {
+            "monthly_income": 0.0,
+            "monthly_expenses": 0.0,
+            "monthly_profit": 0.0,
+            "monthly_depreciation": depreciation,
+        }
+
+    def query_all_firms_monthly_financials(self, month: int) -> Dict[str, Dict[str, float]]:
+        """
+        批量查询“所有企业”在指定月份的财务数据（减少Ray远程调用次数）。
+
+        Returns:
+            {company_id: {"monthly_income":..., "monthly_expenses":..., "monthly_profit":...}}
+        """
+        result: Dict[str, Dict[str, float]] = {}
+        try:
+            for cid in list(self.company_id or []):
+                data = self.firm_monthly_financials.get(cid, {}).get(month, None)
+                if data:
+                    inc = float(data.get("income", 0.0) or 0.0)
+                    exp = float(data.get("expenses", 0.0) or 0.0)
+                else:
+                    inc = 0.0
+                    exp = 0.0
+                dep = float(self.firm_monthly_depreciation.get(str(cid), {}).get(month, 0.0) or 0.0)
+                result[str(cid)] = {
+                    "monthly_income": inc,
+                    "monthly_expenses": exp,
+                    "monthly_profit": inc - exp,
+                    "monthly_depreciation": dep,
+                }
+        except Exception:
+            # 兜底：返回已收集到的部分结果
+            return result
+        return result
+
+    def query_firm_monthly_wage_expenses(self, company_id: str, month: int) -> float:
+        """
+        查询企业指定月份的工资总支出（税前 gross_wage）。
+
+        注意：工资在 process_labor 中以 gross_wage 计入 firm_monthly_wage_expenses，
+        与 tx_history 的 labor_payment（税后）不同。
+        """
+        try:
+            return float(self.firm_monthly_wage_expenses.get(company_id, {}).get(month, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+    
+    def query_firm_production_stats(self, company_id: str, month: int) -> Dict[str, float]:
+        """查询企业指定月份的生产统计数据"""
+        if company_id in self.firm_production_stats and month in self.firm_production_stats[company_id]:
+            production_data = self.firm_production_stats[company_id][month]
+            return {
+                "base_production": production_data["base_production"],
+                "labor_production": production_data["labor_production"],
+                "total_production": production_data["base_production"] + production_data["labor_production"]
+            }
+        return {"base_production": 0.0, "labor_production": 0.0, "total_production": 0.0}
+    
+    def query_firm_all_monthly_financials(self, company_id: str) -> Dict[int, Dict[str, float]]:
+        """查询企业所有月份的财务数据"""
+        result = {}
+        if company_id in self.firm_monthly_financials:
+            for month, data in self.firm_monthly_financials[company_id].items():
+                result[month] = {
+                    "monthly_income": data["income"],
+                    "monthly_expenses": data["expenses"],
+                    "monthly_profit": data["income"] - data["expenses"]
+                }
+        return result
+
+    def query_income(self, agent_id: str, month: int) -> float:
+        total_wage = 0.0
+        for wage in self.wage_history:
+            if wage.agent_id == agent_id and wage.month == month:
+                total_wage += wage.amount
+        return total_wage
+
+    def query_net_wage(self, household_id: str, month: int) -> float:
+        """
+        查询家庭指定月份的“税后工资”（来自 labor_payment 交易）。
+
+        说明：
+        - wage_history 记录的是税前工资（gross），用于企业成本/宏观核算；
+        - 家庭可支配收入应以 labor_payment（net）为准，避免把个税/FICA也当作可消费收入。
+        """
+        total = 0.0
+        try:
+            for tx in self.tx_history:
+                if int(getattr(tx, "month", 0) or 0) != int(month):
+                    continue
+                if getattr(tx, "type", None) != "labor_payment":
+                    continue
+                if str(getattr(tx, "receiver_id", "") or "") != str(household_id):
+                    continue
+                total += float(getattr(tx, "amount", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+        return float(total)
+
+
+    def query_labor(self, agent_id: str) -> List[LaborHour]:
+        return self.laborhour[agent_id]
+
+    def deposit_funds(self, agent_id: str, amount: float):
+        """
+        Deposit funds into an agent's ledger.
+        
+        Args:
+            agent_id: Unique identifier of the agent
+            amount: Amount to deposit
+        """
+        self.ledger[agent_id].amount += amount
+    
+    def set_agent_balance(self, agent_id: str, amount: float) -> float:
+        """
+        设置代理余额为指定值（覆盖式）。
+        用于“企业初始资金 = 初始库存总价值”等初始化场景。
+        """
+        if agent_id not in self.ledger:
+            self.ledger[agent_id] = Ledger()
+        self.ledger[agent_id].amount = float(amount)
+        return self.ledger[agent_id].amount
+    
+    def update_balance(self, agent_id: str, amount: float):
+        """
+        更新代理的余额（可以是正数或负数）
+        
+        Args:
+            agent_id: 代理ID
+            amount: 变动金额（正数增加，负数减少）
+        """
+        if agent_id not in self.ledger:
+            self.ledger[agent_id] = Ledger()
+        self.ledger[agent_id].amount += amount
+    
+    def consume_product_inventory(self, company_id: str, product_id: str, quantity: float) -> bool:
+        """
+        减少企业商品库存
+        
+        Args:
+            company_id: 企业ID
+            product_id: 商品ID
+            quantity: 消耗数量
+            
+        Returns:
+            bool: 是否成功消耗
+        """
+        if company_id not in self.products:
+            logger.warning(f"企业 {company_id} 没有产品库存")
+            return False
+        
+        for product in self.products[company_id]:
+            if product.product_id == product_id:
+                if product.amount >= quantity:
+                    product.amount -= quantity
+                    # logger.info(f"企业 {company_id} 商品 {product_id} 消耗 {quantity} 单位，剩余 {product.amount}")
+                    return True
+                else:
+                    logger.warning(f"企业 {company_id} 商品 {product_id} 库存不足: {product.amount} < {quantity}")
+                    return False
+        
+        logger.warning(f"企业 {company_id} 没有找到商品 {product_id}")
+        return False
+    
+
+    # =========================================================================
+    # Product Management
+    # =========================================================================
+    def register_product(self, agent_id: str, product: Product):
+        """
+        Register a product for an agent. If the product already exists, it will merge the amounts.
+        """
+        if agent_id not in self.products:
+            # print(f"Initialized product for agent {agent_id}")
+            self.products[agent_id] = []
+        
+        self._add_or_merge_product(agent_id, product, product.amount)
+        # logger.info(f"Registered product {product.name} for agent {agent_id} with amount {product.amount}")
+
+    def _add_or_merge_product(self, agent_id:str, product: Product, quantity: float = 1.0):
+
+        product.owner_id = agent_id
+        product.amount = quantity
+        for existing_product in self.products[agent_id]:
+            if existing_product.product_id == product.product_id:
+                existing_product.amount += quantity
+                return
+        self.products[agent_id].append(product)
+
+    def _check_and_reserve_inventory(self, seller_id: str, product: Product, quantity: float) -> bool:
+        """
+        检查并预留库存，确保原子性购买操作
+        返回True表示库存充足且已预留，False表示库存不足
+        """
+        if seller_id not in self.products:
+            return False
+
+        # 🔒 兼容预留系统：无 reservation_id 的购买也应考虑“已被其他人预留”的数量
+        try:
+            available_stock = self._get_available_stock(seller_id, product.product_id)
+            return available_stock >= quantity
+        except Exception:
+            # 回退旧逻辑
+            for existing_product in self.products[seller_id]:
+                if existing_product.product_id == product.product_id:
+                    return existing_product.amount >= quantity
+            return False
+    
+    def _get_profit_margin(self, category: str) -> float:
+        """
+        根据商品大类获取毛利率（用于利润计算）
+        
+        Args:
+            category: 商品大类名称（daily_cate）
+            
+        Returns:
+            毛利率（百分比，如25.0表示25%）
+        """
+        # 如果配置中有该大类，返回配置的毛利率
+        if category in self.category_profit_margins:
+            return self.category_profit_margins[category]
+        
+        # 如果找不到该大类，返回默认毛利率25%
+        logger.warning(f"未找到大类 '{category}' 的毛利率配置，使用默认值25%")
+        return 25.0
+
+    def _ensure_product_cost_fields(self, product: Product, default_category: Optional[str] = None) -> None:
+        """
+        Ensure product has stable base_price and unit_cost.
+
+        - base_price: original (initial) price used for cost derivation
+        - unit_cost: derived from base_price and category gross margin (kept stable even if price changes)
+        """
+        try:
+            current_price = float(getattr(product, "price", 0.0) or 0.0)
+        except Exception:
+            current_price = 0.0
+
+        try:
+            base_price = getattr(product, "base_price", None)
+            base_price = float(base_price) if base_price is not None else 0.0
+        except Exception:
+            base_price = 0.0
+
+        if base_price <= 0 and current_price > 0:
+            product.base_price = current_price
+            base_price = current_price
+
+        try:
+            unit_cost = getattr(product, "unit_cost", None)
+            unit_cost = float(unit_cost) if unit_cost is not None else 0.0
+        except Exception:
+            unit_cost = 0.0
+
+        if unit_cost <= 0 and base_price > 0:
+            category = getattr(product, "classification", None) or default_category or "Unknown"
+            try:
+                margin_pct = float(self.category_profit_margins.get(category, 25.0) or 25.0)
+            except Exception:
+                margin_pct = 25.0
+            margin_pct = max(0.0, min(80.0, margin_pct))
+            unit_cost = base_price * (1.0 - margin_pct / 100.0)
+            if unit_cost <= 1e-6:
+                unit_cost = max(0.01, base_price * 0.2)
+            product.unit_cost = float(unit_cost)
+    
+    def _reduce_or_remove_product(self, agent_id: str, product: Product, quantity: float = 1.0):
+        """
+        减少商品库存（在确认库存充足后调用）
+        """
+        for existing_product in self.products[agent_id]:
+            if existing_product.product_id == product.product_id:
+                # 再次检查库存（双重保险）
+                if existing_product.amount < quantity:
+                    raise ValueError(f"库存不足: 需要 {quantity}，但只有 {existing_product.amount}")
+                
+                existing_product.amount -= quantity
+                return
+        raise ValueError("Asset not found or insufficient amount to reduce.")
+    
+    # register_middleware
+    def register_middleware(self, tx_type: str, middleware_fn: Callable[[Transaction, Dict[str, float]], None], tag: Optional[str] = None):
+        """
+        Register a middleware function for transaction processing.
+        
+        Args:
+            tx_type: Type of transaction to apply middleware to
+            middleware_fn: Middleware function to execute
+            tag: Optional tag for identifying/replacing middleware
+        """
+        if tag:
+            self.middleware.register(tx_type, middleware_fn, tag)
+        else:
+            self.middleware.register(tx_type, middleware_fn)
+    
+    # ============================================================================
+    # 🔒 库存预留系统（解决并发竞争问题）
+    # ============================================================================
+    
+
+    # =========================================================================
+    # Inventory Reservation System
+    # =========================================================================
+    def reserve_inventory(self, buyer_id: str, seller_id: str, product_id: str,
+                         product_name: str, quantity: float,
+                         timeout_seconds: float = None,
+                         month: Optional[int] = None) -> Optional[str]:
+        """
+        预留库存
+        
+        Args:
+            buyer_id: 买家ID
+            seller_id: 卖家ID
+            product_id: 商品ID
+            product_name: 商品名称
+            quantity: 预留数量
+            timeout_seconds: 超时时间（秒），默认使用系统配置
+        
+        Returns:
+            预留ID（成功）或 None（失败）
+        """
+        # 清理过期预留
+        self._cleanup_expired_reservations()
+        
+        # 检查库存是否充足（考虑已预留的数量）
+        available_stock = self._get_available_stock(seller_id, product_id)
+        
+        if available_stock < quantity:
+            logger.warning(f"🔒 库存预留失败: {product_name} 可用库存 {available_stock:.2f} < 需求 {quantity:.2f}")
+            try:
+                if month is not None:
+                    self.record_unmet_demand(
+                        month=int(month),
+                        buyer_id=str(buyer_id),
+                        seller_id=str(seller_id),
+                        product_id=str(product_id),
+                        product_name=str(product_name),
+                        quantity_requested=float(quantity or 0.0),
+                        available_stock=float(available_stock or 0.0),
+                        reason="reserve_failed",
+                    )
+            except Exception:
+                pass
+            return None
+        
+        # 创建预留记录
+        timeout = timeout_seconds if timeout_seconds is not None else self.reservation_timeout
+        reservation = InventoryReservation.create(
+            buyer_id=buyer_id,
+            seller_id=seller_id,
+            product_id=product_id,
+            product_name=product_name,
+            quantity=quantity,
+            timeout_seconds=timeout
+        )
+        
+        # 保存预留记录
+        # ===== Inventory Reservation System =====
+        self.inventory_reservations[reservation.reservation_id] = reservation
+        
+        logger.info(f"✅ 库存预留成功: {product_name} × {quantity:.2f} (预留ID: {reservation.reservation_id[:8]}...)")
+        return reservation.reservation_id
+    
+    def confirm_reservation(self, reservation_id: str) -> bool:
+        """
+        确认预留（购买成功后调用）
+        
+        Args:
+            reservation_id: 预留ID
+        
+        Returns:
+            是否成功确认
+        """
+        # ===== Inventory Reservation System =====
+        if reservation_id not in self.inventory_reservations:
+            logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
+            return False
+        
+        # ===== Inventory Reservation System =====
+        reservation = self.inventory_reservations[reservation_id]
+
+        # 只允许确认“活跃”的预留，避免重复确认/错误确认
+        if reservation.status != 'active':
+            logger.warning(
+                f"⚠️ 预留状态不可确认: {reservation.product_name} status={reservation.status} "
+                f"(预留ID: {reservation_id[:8]}...)"
+            )
+            return False
+        
+        # 检查预留是否已过期
+        if time.time() > reservation.expires_at:
+            logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
+            reservation.status = 'expired'
+            return False
+        
+        # 标记为已确认
+        reservation.status = 'confirmed'
+        logger.info(f"✅ 预留已确认: {reservation.product_name} × {reservation.quantity:.2f}")
+        
+        return True
+
+    def validate_reservation(
+        self,
+        reservation_id: str,
+        buyer_id: Optional[str] = None,
+        seller_id: Optional[str] = None,
+        product_id: Optional[str] = None,
+        quantity: Optional[float] = None,
+    ) -> bool:
+        """
+        校验预留是否可用于本次购买（不改变预留状态）。
+
+        说明：预留在“商品转移完成后”才会被 confirm；在此之前保持 active，
+        使得 _get_available_stock 能正确扣除已预留数量，避免并发超卖。
+        """
+        self._cleanup_expired_reservations()
+
+        # ===== Inventory Reservation System =====
+        if reservation_id not in self.inventory_reservations:
+            logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
+            return False
+
+        # ===== Inventory Reservation System =====
+        reservation = self.inventory_reservations[reservation_id]
+        if reservation.status != 'active':
+            logger.warning(
+                f"⚠️ 预留不可用: {reservation.product_name} status={reservation.status} "
+                f"(预留ID: {reservation_id[:8]}...)"
+            )
+            return False
+
+        if time.time() > reservation.expires_at:
+            reservation.status = 'expired'
+            logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
+            return False
+
+        if buyer_id is not None and reservation.buyer_id != buyer_id:
+            logger.warning(f"⚠️ 预留buyer不匹配: expected={buyer_id} got={reservation.buyer_id}")
+            return False
+        if seller_id is not None and reservation.seller_id != seller_id:
+            logger.warning(f"⚠️ 预留seller不匹配: expected={seller_id} got={reservation.seller_id}")
+            return False
+        if product_id is not None and reservation.product_id != product_id:
+            logger.warning(f"⚠️ 预留product不匹配: expected={product_id} got={reservation.product_id}")
+            return False
+        if quantity is not None and abs(float(reservation.quantity) - float(quantity)) > 1e-6:
+            logger.warning(f"⚠️ 预留quantity不匹配: expected={quantity} got={reservation.quantity}")
+            return False
+
+        return True
+    
+    def release_reservation(self, reservation_id: str, reason: str = "cancelled") -> bool:
+        """
+        释放预留（购买失败或取消时调用）
+        
+        Args:
+            reservation_id: 预留ID
+            reason: 释放原因
+        
+        Returns:
+            是否成功释放
+        """
+        # ===== Inventory Reservation System =====
+        if reservation_id not in self.inventory_reservations:
+            return False
+        
+        # ===== Inventory Reservation System =====
+        reservation = self.inventory_reservations[reservation_id]
+        reservation.status = 'released'
+        
+        logger.info(f"🔓 预留已释放: {reservation.product_name} × {reservation.quantity:.2f} (原因: {reason})")
+        return True
+    
+    def _get_available_stock(self, seller_id: str, product_id: str) -> float:
+        """
+        获取可用库存（实际库存 - 已预留数量）
+        
+        Args:
+            seller_id: 卖家ID
+            product_id: 商品ID
+        
+        Returns:
+            可用库存数量
+        """
+        # 获取实际库存
+        actual_stock = 0.0
+        for product in self.products.get(seller_id, []):
+            if product.product_id == product_id:
+                actual_stock = product.amount
+                break
+        
+        # 计算已预留数量（只统计活跃状态的预留）
+        reserved_quantity = 0.0
+        # ===== Inventory Reservation System =====
+        for reservation in self.inventory_reservations.values():
+            if (reservation.seller_id == seller_id and
+                reservation.product_id == product_id and
+                reservation.status == 'active' and
+                time.time() <= reservation.expires_at):
+                reserved_quantity += reservation.quantity
+        
+        available = actual_stock - reserved_quantity
+        return max(0.0, available)  # 确保不返回负数
+    
+    def _cleanup_expired_reservations(self):
+        """清理过期的预留记录"""
+        current_time = time.time()
+        expired_ids = []
+        
+        # ===== Inventory Reservation System =====
+        for reservation_id, reservation in self.inventory_reservations.items():
+            if reservation.status == 'active' and current_time > reservation.expires_at:
+                reservation.status = 'expired'
+                expired_ids.append(reservation_id)
+        
+        if expired_ids:
+            logger.info(f"🧹 清理了 {len(expired_ids)} 个过期预留")
+    
+    def get_reservation_stats(self) -> Dict[str, int]:
+        """获取预留统计信息（用于监控）"""
+        stats = {
+        # ===== Inventory Reservation System =====
+            'total': len(self.inventory_reservations),
+            'active': 0,
+            'confirmed': 0,
+            'released': 0,
+            'expired': 0
+        }
+        
+        # ===== Inventory Reservation System =====
+        for reservation in self.inventory_reservations.values():
+            stats[reservation.status] += 1
+        
+        return stats
+    
+
+    # =========================================================================
+    # Transaction Processing
+    # =========================================================================
+    def process_batch_purchases(self, month: int, buyer_id: str, purchase_list: List[Dict]) -> List[Optional[str]]:
+        """
+        批量处理购买，减少Ray远程调用次数
+        
+        Args:
+            month: 当前月份
+            buyer_id: 购买者ID
+            purchase_list: 购买列表，每项包含 {'seller_id', 'product', 'quantity', 'reservation_id'(可选)}
+        
+        Returns:
+            交易ID列表（成功返回tx_id，失败返回None）
+        """
+        results = []
+        for purchase in purchase_list:
+            seller_id = purchase['seller_id']
+            product = purchase['product']
+            quantity = purchase.get('quantity', 1.0)
+            reservation_id = purchase.get('reservation_id')  # 🔒 新增：预留ID
+            
+            tx_result = self.process_purchase(month, buyer_id, seller_id, product, quantity, reservation_id)
+            
+            # 🔧 处理返回值：Transaction对象或False
+            if tx_result and hasattr(tx_result, 'id'):
+                results.append(tx_result.id)  # 返回交易ID
+            else:
+                results.append(None)  # 购买失败
+        return results
+    
+    def process_purchase(self, month: int, buyer_id: str, seller_id: str, product: Product,
+                         quantity: float = 1.0, reservation_id: Optional[str] = None) -> Optional[str]:
+        """
+        处理购买交易
+        
+        Args:
+            month: 当前月份
+            buyer_id: 买家ID
+            seller_id: 卖家ID
+            product: 商品对象
+            quantity: 购买数量
+            reservation_id: 预留ID（如果有）
+        
+        Returns:
+            Transaction对象（成功）或 False（失败）
+        """
+        # 计算总费用：标价 + 消费税
+        base_price = product.price * quantity
+        total_cost_with_tax = base_price * (1 + self.vat_rate)  # 家庭支付标价+消费税
+        
+        # 检查家庭余额是否足够支付含税价格
+        if self.ledger[buyer_id].amount < total_cost_with_tax:
+            # 如果有预留，释放它
+            if reservation_id:
+                self.release_reservation(reservation_id, reason="insufficient_funds")
+            return False
+
+        # 🔒 新版库存检查：优先使用预留机制（先校验，不改变状态；成功转移后再 confirm）
+        if reservation_id:
+            if not self.validate_reservation(
+                reservation_id,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                product_id=getattr(product, "product_id", None),
+                quantity=quantity,
+            ):
+                # 尽量释放无效预留，避免“卡死库存”
+                self.release_reservation(reservation_id, reason="invalid_reservation")
+                logger.warning(f"预留无效，购买失败: {product.name} (预留ID: {reservation_id[:8]}...)")
+                return False
+        else:
+            # 无预留ID：使用旧的检查方式（向后兼容）
+            if not self._check_and_reserve_inventory(seller_id, product, quantity):
+                # 获取当前库存用于调试
+                current_stock = 0
+                for pro in self.products.get(seller_id, []):
+                    if pro.product_id == product.product_id:
+                        current_stock = pro.amount
+                        break
+                logger.warning(f"库存不足，购买失败: {product.name} 需要 {quantity}，但库存不足, 剩余库存: {current_stock}")
+                try:
+                    self.record_unmet_demand(
+                        month=int(month),
+                        buyer_id=str(buyer_id),
+                        seller_id=str(seller_id),
+                        product_id=str(getattr(product, "product_id", "")),
+                        product_name=str(getattr(product, "name", "")),
+                        quantity_requested=float(quantity or 0.0),
+                        available_stock=float(current_stock or 0.0),
+                        reason="purchase_no_reservation_insufficient_stock",
+                    )
+                except Exception:
+                    pass
+                return False
+
+        # 家庭支付含税价格
+        self.ledger[buyer_id].amount -= total_cost_with_tax
+
+        # 创建消费税交易记录（税收部分）
+        tax_amount = base_price * self.vat_rate
+        tax_tx = Transaction(
+            id=str(uuid4()),
+            sender_id=buyer_id,
+            receiver_id="gov_main_simulation",  # 固定政府ID
+            amount=tax_amount,
+            type='consume_tax',
+            month=month
+        )
+        self.tx_history.append(tax_tx)
+        
+        # 政府收取消费税
+        self.ledger["gov_main_simulation"].amount += tax_amount
+
+        # 创建购买交易记录（企业收入部分）
+        # 🔧 交易资产必须携带“本次成交数量”，否则销售统计会误读为“当时库存量”
+        try:
+            tx_product_id = str(getattr(product, "product_id", "") or "")
+            tx_name = str(getattr(product, "name", "Unknown") or "Unknown")
+            tx_classification = getattr(product, "classification", None) or "Unknown"
+            tx_price = float(getattr(product, "price", 0.0) or 0.0)
+            tx_base_price = float(getattr(product, "base_price", 0.0) or 0.0)
+            tx_unit_cost = float(getattr(product, "unit_cost", 0.0) or 0.0)
+
+            if seller_id in self.products and tx_product_id:
+                for inv_p in (self.products.get(seller_id) or []):
+                    if str(getattr(inv_p, "product_id", "") or "") == tx_product_id:
+                        self._ensure_product_cost_fields(inv_p, default_category=tx_classification)
+                        tx_name = str(getattr(inv_p, "name", tx_name) or tx_name)
+                        tx_classification = getattr(inv_p, "classification", tx_classification) or tx_classification
+                        tx_base_price = float(getattr(inv_p, "base_price", tx_base_price) or tx_base_price)
+                        tx_unit_cost = float(getattr(inv_p, "unit_cost", tx_unit_cost) or tx_unit_cost)
+                        break
+
+            if tx_base_price <= 0 and tx_price > 0:
+                tx_base_price = tx_price
+            if tx_unit_cost <= 0 and tx_base_price > 0:
+                margin_pct = float(self.category_profit_margins.get(tx_classification, 25.0) or 25.0)
+                margin_pct = max(0.0, min(80.0, margin_pct))
+                tx_unit_cost = tx_base_price * (1.0 - margin_pct / 100.0)
+                if tx_unit_cost <= 1e-6:
+                    tx_unit_cost = max(0.01, tx_base_price * 0.2)
+
+            product_kwargs = dict(
+                asset_type="products",
+                product_id=tx_product_id,
+                name=tx_name,
+                owner_id=seller_id,
+                amount=float(quantity or 0.0),
+                price=tx_price,
+                classification=tx_classification,
+                base_price=float(tx_base_price),
+                unit_cost=float(tx_unit_cost),
+            )
+            product_kwargs = inject_product_attributes(product_kwargs, tx_product_id)
+            product_asset = Product(**product_kwargs)
+        except Exception:
+            # 兜底：至少保证 amount=quantity，避免销量统计爆炸
+            product_asset = Product.create(
+                name=str(getattr(product, "name", "Unknown") or "Unknown"),
+                price=float(getattr(product, "price", 0.01) or 0.01),
+                owner_id=seller_id,
+                amount=float(quantity or 0.0),
+                classification=getattr(product, "classification", None),
+                product_id=getattr(product, "product_id", None),
+                base_price=getattr(product, "base_price", None),
+                unit_cost=getattr(product, "unit_cost", None),
+            )
+
+        purchase_tx = Transaction(
+            id=str(uuid4()),
+            sender_id=buyer_id,
+            receiver_id=seller_id,
+            amount=base_price,
+            assets=[product_asset],
+            type='purchase',
+            month=month
+        )
+        self.tx_history.append(purchase_tx)
+
+        # 💰 企业收入（现金流口径）：只记录真实收款额
+        # 说明：生产成本应在“生产补货阶段”作为当月支出记录，而不是在销售发生时扣除。
+        revenue = base_price
+        self.ledger[seller_id].amount += revenue
+        self.record_firm_income(seller_id, revenue)
+        self.record_firm_monthly_income(seller_id, month, revenue)
+        
+        # 企业所得税改为“月度结算”（按净利润计税），避免与生产预算形成循环依赖。
+        
+        # 商品转移
+        try:
+            self._add_or_merge_product(buyer_id, product, quantity)
+            self._reduce_or_remove_product(seller_id, product, quantity)
+        except Exception as e:
+            if reservation_id:
+                self.release_reservation(reservation_id, reason="transfer_failed")
+            print(f"Warning: Failed to process purchase: {e}")
+            return False
+
+        # 🔒 成功完成商品转移后，确认预留
+        if reservation_id:
+            self.confirm_reservation(reservation_id)
+        
+        return purchase_tx
+
+    def process_labor(
+        self,
+        month: int,
+        wage_hour: float,
+        household_id: str,
+        company_id: Optional[str] = None,
+        hours_per_period: float = 40.0,
+        periods_per_month: float = 4.0,
+    ) -> str:
+        """
+        发放工资（含税收拆分）
+
+        口径：
+        - 税前工资 w = wage_hour × hours_per_period × periods_per_month
+          其中 hours_per_period 默认为每周40小时，periods_per_month 默认为4（按月折算）
+        - 个人所得税：沿用既有的累进税计算（calculate_progressive_income_tax）
+        - 新增 FICA：按 w 的 7.65% 计算，直接转给政府
+        """
+        # 计算税前工资（w）
+        try:
+            hours = float(hours_per_period or 0.0)
+        except Exception:
+            hours = 0.0
+        try:
+            ppm = float(periods_per_month or 0.0)
+        except Exception:
+            ppm = 0.0
+        hours = max(0.0, hours)
+        ppm = max(0.0, ppm)
+        gross_wage = float(wage_hour or 0.0) * hours * ppm
+        
+        # 计算个人所得税
+        income_tax = self.calculate_progressive_income_tax(gross_wage)
+
+        # 新增：FICA（按税前工资比例）
+        fica_tax_rate = 0.0765
+        fica_tax = float(gross_wage) * float(fica_tax_rate)
+
+        net_wage = gross_wage - income_tax - fica_tax  # 税后工资（扣个税+FICA）
+        if net_wage < 0:
+            net_wage = 0.0
+        
+        # 创建工资支付交易记录
+        wage_tx = Transaction(
+            id=str(uuid4()),
+            sender_id=company_id,
+            receiver_id=household_id,
+            amount=net_wage,  # 家庭收到税后工资
+            type='labor_payment',
+            month=month,
+        )
+        self.tx_history.append(wage_tx)
+        
+        # 创建个人所得税交易记录
+        tax_tx = Transaction(
+            id=str(uuid4()),
+            sender_id=household_id,
+            receiver_id="gov_main_simulation",
+            amount=income_tax,
+            type='labor_tax',
+            month=month,
+        )
+        self.tx_history.append(tax_tx)
+        
+        # 创建 FICA 税交易记录
+        fica_tx = Transaction(
+            id=str(uuid4()),
+            sender_id=household_id,
+            receiver_id="gov_main_simulation",
+            amount=fica_tax,
+            type='fica_tax',
+            month=month,
+        )
+        self.tx_history.append(fica_tx)
+
+        # 更新账本
+        self.ledger[household_id].amount += net_wage  # 家庭收到税后工资
+        self.ledger["gov_main_simulation"].amount += income_tax  # 政府收到个人所得税
+        self.ledger["gov_main_simulation"].amount += fica_tax  # 政府收到FICA税
+        
+        # 企业支出工资
+        if company_id:
+            self.ledger[company_id].amount -= gross_wage
+            # 记录企业支出（经济中心层面）
+            self.record_firm_expense(company_id, gross_wage)
+            # 记录企业月度支出
+            self.record_firm_monthly_expense(company_id, month, gross_wage)
+            # 细分统计：月度工资支出（税前工资）
+            self.firm_monthly_wage_expenses[company_id][month] += gross_wage
+
+        # 记录工资历史（记录税前工资）
+        self.wage_history.append(Wage.create(household_id, gross_wage, month))
+        # print(f"Month {month} Processed labor payment: ${gross_wage:.2f} gross (${net_wage:.2f} net, ${income_tax:.2f} tax) from {company_id} to {household_id}")
+        return wage_tx.id
+
+
+    # =========================================================================
+    # Tax Calculations
+    # =========================================================================
+    def calculate_progressive_income_tax(self, gross_wage: float) -> float:
+        """
+        Calculate the income tax for a given gross wage
+        """
+        total_tax = 0
+        for i, bracket in enumerate(self.income_tax_rate):
+            if gross_wage > bracket.cutoff:
+                if i + 1 < len(self.income_tax_rate):
+                    upper_bracket = self.income_tax_rate[i + 1].cutoff
+                else:
+                    upper_bracket = float('inf')
+                taxable_in_bracket = min(gross_wage, upper_bracket) - bracket.cutoff
+                total_tax += taxable_in_bracket * bracket.rate
+            else:
+                break
+        return total_tax
+
+    def compute_household_settlement(self, household_id: str):
+        """
+        Process household settlement, including asset and labor hour settlement.
+        计算家庭累积收入和支出
+        """
+        # breakpoint()
+
+        total_income = 0
+        total_expense = 0
+        for tx in self.tx_history:
+            if tx.type == 'purchase' and tx.sender_id == household_id:
+                total_expense += tx.amount
+
+            elif tx.type == 'service' and tx.sender_id == household_id:
+                total_expense += tx.amount  # 服务费用直接计入支出，不需要税收调整
+
+            elif tx.type == 'labor_payment' and tx.receiver_id == household_id:
+                total_income += tx.amount
+
+            elif tx.type == 'redistribution' and tx.receiver_id == household_id:
+                total_income += tx.amount
+
+            elif tx.type == 'interest' and tx.receiver_id == household_id:
+                total_income += tx.amount
+
+        return total_income, total_expense
+
+    def compute_household_monthly_stats(self, household_id: str, target_month: int = None):
+        """
+        计算家庭月度收入和支出统计(收入不统计再分配)
+        如果不指定target_month，返回所有月份的统计
+        """
+        monthly_income = 0
+        monthly_expense = 0
+        
+        month = target_month
+
+
+        for tx in self.tx_history:
+            if tx.type == 'purchase' and tx.sender_id == household_id and tx.month == month:
+                monthly_expense += tx.amount
+            # 消费税属于“含税购物支出”的一部分（家庭真实现金流支出）
+            elif tx.type == 'consume_tax' and tx.sender_id == household_id and tx.month == month:
+                monthly_expense += tx.amount
+
+            elif tx.type == 'service' and tx.sender_id == household_id and tx.month == month:
+                monthly_expense += tx.amount
+
+            elif tx.type == 'labor_payment' and tx.receiver_id == household_id and tx.month == month:
+                monthly_income += tx.amount
+
+            elif tx.type == 'interest' and tx.receiver_id == household_id and tx.month == month:
+                monthly_income += tx.amount
+
+            # elif tx.type == 'redistribution' and tx.receiver_id == household_id and tx.month == month:
+            #     monthly_income += tx.amount
+
+        return monthly_income, monthly_expense, self.ledger[household_id].amount
+    
+
+    # =========================================================================
+    # Tax Collection & Redistribution
+    # =========================================================================
+    def get_monthly_tax_collection(self, month: int) -> Dict[str, float]:
+        """
+        获取指定月份的税收收入统计
+        
+        Args:
+            month: 目标月份
+            
+        Returns:
+            Dict: 各类税收收入统计
+        """
+        tax_summary = {
+            "consume_tax": 0.0,
+            "labor_tax": 0.0,
+            "fica_tax": 0.0,
+            "corporate_tax": 0.0,
+            "total_tax": 0.0
+        }
+        
+        for tx in self.tx_history:
+            if tx.month == month and tx.receiver_id == "gov_main_simulation":
+                if tx.type == 'consume_tax':
+                    tax_summary["consume_tax"] += tx.amount
+                elif tx.type == 'labor_tax':
+                    tax_summary["labor_tax"] += tx.amount
+                elif tx.type == 'fica_tax':
+                    tax_summary["fica_tax"] += tx.amount
+                elif tx.type == 'corporate_tax':
+                    tax_summary["corporate_tax"] += tx.amount
+        
+        tax_summary["total_tax"] = (tax_summary["consume_tax"] +
+                                   tax_summary["labor_tax"] +
+                                   tax_summary["fica_tax"] +
+                                   tax_summary["corporate_tax"])
+        
+        return tax_summary
+    
+
+    async def redistribute_monthly_taxes(self, month: int, strategy: str = "equal",
+                                       poverty_weight: float = 0.3,
+                                       unemployment_weight: float = 0.2,
+                                       family_size_weight: float = 0.1) -> Dict[str, float]:
+        """
+        税收再分配：支持多种分配策略
+        
+        Args:
+            month: 当前月份
+            strategy: 分配策略 ("none", "equal", "income_proportional", "poverty_focused", "unemployment_focused", "family_size", "mixed")
+            poverty_weight: 贫困权重 (0-1)
+            unemployment_weight: 失业权重 (0-1)
+            family_size_weight: 家庭规模权重 (0-1)
+            
+        Returns:
+            Dict: 再分配结果统计
+        """
+        # 如果策略为 "none"，不进行再分配
+        if strategy == "none":
+            tax_summary = self.get_monthly_tax_collection(month)
+            return {
+                "total_redistributed": 0.0,
+                "recipients": 0,
+                "per_person": 0.0,
+                "total_tax_collected": tax_summary["total_tax"],
+                "tax_breakdown": tax_summary
+            }
+        
+        # 获取当月税收总额
+        tax_summary = self.get_monthly_tax_collection(month)
+        total_tax = tax_summary["total_tax"]
+        
+        if total_tax <= 0:
+            print(f"Month {month}: No tax revenue to redistribute")
+            return {"total_redistributed": 0.0, "recipients": 0, "per_person": 0.0}
+        
+        # 获取所有有劳动力的家庭ID（基于现有的laborhour字典）
+        all_workers = [household_id for household_id, labor_hours in self.laborhour.items()
+                      if labor_hours]  # 只包括有劳动力的家庭
+        if not all_workers:
+            print(f"Month {month}: No households with labor hours found for tax redistribution")
+            return {"total_redistributed": 0.0, "recipients": 0, "per_person": 0.0}
+        
+        # 根据策略计算分配金额
+        household_allocations = self._calculate_redistribution_allocations(
+            all_workers, total_tax, strategy, poverty_weight, unemployment_weight, family_size_weight, month
+        )
+        
+        total_redistributed = 0.0
+        successful_redistributions = 0
+        
+        # 执行再分配
+        for household_id, allocation_amount in household_allocations.items():
+            try:
+                if allocation_amount > 0:
+                    # 政府向家庭转账
+                    tx_id = self.add_redistribution_tx(
+                        month=month,
+                        sender_id="gov_main_simulation",
+                        receiver_id=household_id,
+                        amount=allocation_amount,
+                    )
+                    
+                    total_redistributed += allocation_amount
+                    successful_redistributions += 1
+        
+            except Exception as e:
+                print(f"Failed to redistribute to household {household_id}: {e}")
+
+        # 计算平均分配金额（用于记录）
+        avg_allocation = total_redistributed / successful_redistributions if successful_redistributions > 0 else 0
+        
+        result = {
+            "total_tax_collected": total_tax,
+            "total_redistributed": total_redistributed,
+            "recipients": successful_redistributions,
+            "per_person": avg_allocation,
+            "strategy": strategy,
+            "tax_breakdown": tax_summary
+        }
+        self.redistribution_record_per_person[month] = avg_allocation
+
+        print(f"Month {month} Tax Redistribution ({strategy}):")
+        print(f"  Total tax collected: ${total_tax:.2f}")
+        print(f"  Redistributed to {successful_redistributions} households: ${total_redistributed:.2f}")
+        print(f"  Average per household: ${avg_allocation:.2f}")
+        
+        return result
+
+    def _calculate_redistribution_allocations(self, all_workers: List[str], total_tax: float,
+                                           strategy: str, poverty_weight: float,
+                                           unemployment_weight: float, family_size_weight: float,
+                                           month: int) -> Dict[str, float]:
+        """
+        根据策略计算每个家庭的分配金额
+        
+        Args:
+            all_workers: 所有有劳动力的家庭ID列表
+            total_tax: 税收总额
+            strategy: 分配策略
+            poverty_weight: 贫困权重
+            unemployment_weight: 失业权重
+            family_size_weight: 家庭规模权重
+            month: 当前月份
+            
+        Returns:
+            Dict[str, float]: 家庭ID到分配金额的映射
+        """
+        if strategy == "equal":
+            return self._equal_allocation(all_workers, total_tax)
+        elif strategy == "income_proportional":
+            return self._income_proportional_allocation(all_workers, total_tax, month)
+        elif strategy == "poverty_focused":
+            return self._poverty_focused_allocation(all_workers, total_tax, month)
+        elif strategy == "unemployment_focused":
+            return self._unemployment_focused_allocation(all_workers, total_tax, month)
+        elif strategy == "family_size":
+            return self._family_size_allocation(all_workers, total_tax)
+        elif strategy == "mixed":
+            return self._mixed_allocation(all_workers, total_tax, poverty_weight,
+                                        unemployment_weight, family_size_weight, month)
+        else:
+            print(f"Unknown redistribution strategy: {strategy}, using equal allocation")
+            return self._equal_allocation(all_workers, total_tax)
+
+    def _equal_allocation(self, all_workers: List[str], total_tax: float) -> Dict[str, float]:
+        """平均分配策略"""
+        amount_per_household = total_tax / len(all_workers)
+        return {household_id: amount_per_household for household_id in all_workers}
+
+    def _income_proportional_allocation(self, all_workers: List[str], total_tax: float, month: int) -> Dict[str, float]:
+        """按收入比例分配策略"""
+        household_incomes = {}
+        total_income = 0.0
+        
+        for household_id in all_workers:
+            monthly_income, _, _ = self.compute_household_monthly_stats(household_id, month)
+            household_incomes[household_id] = monthly_income
+            total_income += monthly_income
+        
+        if total_income <= 0:
+            return self._equal_allocation(all_workers, total_tax)
+        
+        allocations = {}
+        for household_id in all_workers:
+            proportion = household_incomes[household_id] / total_income
+            allocations[household_id] = total_tax * proportion
+        
+        return allocations
+
+    def _poverty_focused_allocation(self, all_workers: List[str], total_tax: float, month: int) -> Dict[str, float]:
+        """贫困导向分配策略（收入越低分配越多）"""
+        household_incomes = {}
+        household_balances = {}
+        
+        for household_id in all_workers:
+            monthly_income, _, balance = self.compute_household_monthly_stats(household_id, month)
+            household_incomes[household_id] = monthly_income
+            household_balances[household_id] = balance
+        
+        if not household_incomes:
+            return self._equal_allocation(all_workers, total_tax)
+        
+        max_income = max(household_incomes.values())
+        min_income = min(household_incomes.values())
+        max_balance = max(household_balances.values()) if household_balances else 0.0
+        min_balance = min(household_balances.values()) if household_balances else 0.0
+        
+        # 若收入与存款都无差异，则退化为均分
+        if max_income == min_income and max_balance == min_balance:
+            return self._equal_allocation(all_workers, total_tax)
+        
+        # 计算贫困权重（收入越低、存款越低权重越高）
+        # 组合权重：alpha 用于控制收入与存款的权重占比
+        alpha = 0.5  # 可按需调整/暴露为超参数
+        poverty_weights = {}
+        total_weight = 0.0
+        
+        for household_id, income in household_incomes.items():
+            # 收入成分（越低越高）
+            income_component = 0.0
+            if max_income != min_income:
+                income_component = (max_income - income) / (max_income - min_income)
+            
+            # 存款成分（越低越高）
+            balance = household_balances.get(household_id, 0.0)
+            balance_component = 0.0
+            if max_balance != min_balance:
+                balance_component = (max_balance - balance) / (max_balance - min_balance)
+            
+            # 综合权重
+            weight = alpha * income_component + (1 - alpha) * balance_component
+            poverty_weights[household_id] = weight
+            total_weight += weight
+        
+        allocations = {}
+        for household_id in all_workers:
+            proportion = poverty_weights[household_id] / total_weight
+            allocations[household_id] = total_tax * proportion
+        
+        return allocations
+
+    def _unemployment_focused_allocation(self, all_workers: List[str], total_tax: float, month: int) -> Dict[str, float]:
+        """失业导向分配策略（失业者获得更多）"""
+        unemployment_weights = {}
+        total_weight = 0.0
+        
+        for household_id in all_workers:
+            labor_hours = self.laborhour.get(household_id, [])
+            employed_count = sum(1 for lh in labor_hours if not lh.is_valid and lh.company_id is not None)
+            unemployed_count = len(labor_hours) - employed_count
+            
+            # 失业者权重更高
+            weight = unemployed_count * 2.0 + employed_count * 1.0
+            unemployment_weights[household_id] = weight
+            total_weight += weight
+        
+        if total_weight <= 0:
+            return self._equal_allocation(all_workers, total_tax)
+        
+        allocations = {}
+        for household_id in all_workers:
+            proportion = unemployment_weights[household_id] / total_weight
+            allocations[household_id] = total_tax * proportion
+        
+        return allocations
+
+    def _family_size_allocation(self, all_workers: List[str], total_tax: float) -> Dict[str, float]:
+        """按家庭规模分配策略"""
+        family_weights = {}
+        total_weight = 0.0
+        
+        for household_id in all_workers:
+            labor_hours = self.laborhour.get(household_id, [])
+            family_size = len(labor_hours)
+            family_weights[household_id] = family_size
+            total_weight += family_size
+        
+        if total_weight <= 0:
+            return self._equal_allocation(all_workers, total_tax)
+        
+        allocations = {}
+        for household_id in all_workers:
+            proportion = family_weights[household_id] / total_weight
+            allocations[household_id] = total_tax * proportion
+        
+        return allocations
+
+    def _mixed_allocation(self, all_workers: List[str], total_tax: float,
+                         poverty_weight: float, unemployment_weight: float,
+                         family_size_weight: float, month: int) -> Dict[str, float]:
+        """混合分配策略"""
+        # 获取各种权重
+        poverty_allocations = self._poverty_focused_allocation(all_workers, total_tax, month)
+        unemployment_allocations = self._unemployment_focused_allocation(all_workers, total_tax, month)
+        family_size_allocations = self._family_size_allocation(all_workers, total_tax)
+        equal_allocations = self._equal_allocation(all_workers, total_tax)
+        
+        # 计算剩余权重
+        remaining_weight = 1.0 - poverty_weight - unemployment_weight - family_size_weight
+        if remaining_weight < 0:
+            remaining_weight = 0.0
+        
+        # 混合分配
+        allocations = {}
+        for household_id in all_workers:
+            mixed_amount = (
+                poverty_allocations[household_id] * poverty_weight +
+                unemployment_allocations[household_id] * unemployment_weight +
+                family_size_allocations[household_id] * family_size_weight +
+                equal_allocations[household_id] * remaining_weight
+            )
+            allocations[household_id] = mixed_amount
+        
+        return allocations
+
+
+    # =========================================================================
+    # Transaction Creation Methods
+    # =========================================================================
+    def add_interest_tx(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
+        """
+        添加利息交易记录
+        """
+        tx = Transaction(
+            id=str(uuid4()),
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=amount,
+            type='interest',
+            month=month
+        )
+        self.tx_history.append(tx)
+        return tx.id
+    def add_redistribution_tx(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
+        """
+        添加再分配交易记录
+        """
+        tx = Transaction(
+            id=str(uuid4()),
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=amount,
+            type='redistribution',
+            month=month
+        )
+        self.tx_history.append(tx)
+        return tx.id
+
+    def add_tx_service(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
+        """
+        添加服务类型交易记录，直接更新账本并记录到交易历史
+        用于政府服务、基础服务等不需要商品库存的交易
+        
+        Args:
+            month: 交易月份
+            sender_id: 付款方ID
+            receiver_id: 收款方ID
+            amount: 交易金额
+            
+        Returns:
+            str: 交易ID
+        """
+        # 🔧 修改：只检查家庭的余额，企业允许负债
+        # 判断是否是企业：company_id 在 self.company_id 列表中
+        is_company = sender_id in self.company_id
+        
+        if not is_company and self.ledger[sender_id].amount < amount:
+            # 家庭余额不足，不允许交易
+            raise ValueError(f"Insufficient balance for household {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
+        elif is_company and self.ledger[sender_id].amount < amount:
+            # 企业余额不足，允许负债交易，记录日志
+            logger.info(f"💳 Company {sender_id} transaction with negative balance: "
+                      f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
+        
+        # 直接更新账本
+        self.ledger[sender_id].amount -= amount
+        self.ledger[receiver_id].amount += amount
+        
+        # 创建服务交易记录
+        tx = Transaction(
+            id=str(uuid4()),
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=amount,
+            assets=[],  # 服务交易没有具体商品
+            type='service',  # 使用service类型
+            month=month
+        )
+        
+        # 添加到交易历史
+        self.tx_history.append(tx)
+       
+        return tx.id
+    
+    def add_inherent_market_transaction(
+        self,
+        month: int,
+        sender_id: str,
+        receiver_id: str,
+        amount: float,
+        product_id: str,
+        quantity: float,
+        product_name: str = "Unknown",
+        product_price: float = 0.0,
+        product_classification: str = "Unknown",
+        consume_inventory: bool = False,
+    ) -> str:
+        """
+        添加固有市场交易记录（包含毛利率计算）
+        用于记录政府通过固有市场购买企业商品的交易
+        
+        Args:
+            month: 交易月份
+            sender_id: 付款方ID (通常是政府)
+            receiver_id: 收款方ID (企业)
+            amount: 交易金额
+            product_id: 商品ID
+            quantity: 购买数量
+            product_name: 商品名称
+            product_price: 商品单价
+            product_classification: 商品分类（daily_cate）
+            
+        Returns:
+            str: 交易ID
+        """
+        # 🔧 修改：只检查家庭和政府的余额，企业允许负债
+        is_company = sender_id in self.company_id
+        
+        if not is_company and self.ledger[sender_id].amount < amount:
+            # 家庭/政府余额不足，不允许交易
+            raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
+        elif is_company and self.ledger[sender_id].amount < amount:
+            # 企业余额不足，允许负债交易
+            logger.info(f"💳 Company {sender_id} inherent market transaction with negative balance: "
+                      f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
+
+        # 🔒 注意：固有市场可选择在此处原子扣库存（consume_inventory=True），避免“先扣库存后记账”失败导致不一致。
+        # 验证商品是否存在并记录当前库存状态
+        product_found = False
+        current_inventory = 0.0
+        if receiver_id in self.products:
+            for product in self.products[receiver_id]:
+                if product.product_id == product_id:
+                    product_found = True
+                    current_inventory = product.amount
+                    if consume_inventory:
+                        eps = 1e-9
+                        if current_inventory + eps < quantity:
+                            raise ValueError(
+                                f"Insufficient inventory for {receiver_id}:{product_id}: "
+                                f"{current_inventory} < {quantity}"
+                            )
+                        product.amount = max(0.0, float(product.amount) - float(quantity))
+                        current_inventory = product.amount
+                        logger.info(
+                            f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 消耗 {quantity}件，剩余 {current_inventory}件"
+                        )
+                    else:
+                        # 旧行为：库存已在调用方扣减，这里仅记录扣减后的库存
+                        logger.info(
+                            f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 已消耗 {quantity}件，剩余 {current_inventory}件"
+                        )
+                    break
+
+        if not product_found:
+            logger.warning(f"固有市场购买: 未找到企业 {receiver_id} 的商品 {product_id}")
+            if consume_inventory:
+                raise ValueError(f"Product not found for inherent market: {receiver_id}:{product_id}")
+
+        # 政府/买方支付企业（不含税销售额）
+        self.ledger[sender_id].amount -= amount
+        self.ledger[receiver_id].amount += amount
+
+        # 🧾 固有市场同样计入 VAT（消费税）
+        # 逻辑与家庭购买一致：税基为不含税销售额 amount，税额=amount*vat_rate。
+        # 若 sender 本身就是政府（gov_main_simulation），该税款在账面上“转给自己”不会改变余额，
+        # 但仍会生成 consume_tax 交易记录，供统计与GDP核算使用。
+        tax_amount = float(amount or 0.0) * float(self.vat_rate or 0.0)
+        if tax_amount > 0:
+            gov_id = "gov_main_simulation"
+            # 确保政府账本存在
+            if gov_id in self.ledger:
+                self.ledger[sender_id].amount -= tax_amount
+                self.ledger[gov_id].amount += tax_amount
+            tax_tx = Transaction(
+                id=str(uuid4()),
+                sender_id=sender_id,
+                receiver_id=gov_id,
+                amount=tax_amount,
+                type='consume_tax',
+                month=month
+            )
+            self.tx_history.append(tax_tx)
+        
+        # 💰 企业收入（现金流口径）：只记录真实收款额；生产成本在生产阶段记支出
+        revenue = amount
+        self.record_firm_income(receiver_id, revenue)
+        self.record_firm_monthly_income(receiver_id, month, revenue)
+        
+        # 创建固有市场交易记录
+        unit_price = product_price if product_price > 0 else (amount / quantity if quantity > 0 else 0)
+        if unit_price <= 0:
+            unit_price = 0.01
+            
+        product_kwargs = dict(
+            asset_type='products',
+            product_id=product_id,
+            name=product_name,
+            owner_id=receiver_id,
+            amount=quantity,
+            price=unit_price,
+            classification=product_classification
+        )
+        product_kwargs = inject_product_attributes(product_kwargs, product_id)
+        product_asset = Product(**product_kwargs)
+        
+        tx = Transaction(
+            id=str(uuid4()),
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=amount,
+            assets=[product_asset],
+            type='inherent_market',
+            month=month
+        )
+        self.tx_history.append(tx)
+        
+        # 企业所得税改为“月度结算”（按净利润计税），避免与生产预算形成循环依赖。
+        
+        # logger.info(f"固有市场交易: 政府购买商品 {product_name}(ID:{product_id}, {product_classification}) "
+        #            f"数量 {quantity} 金额 ${amount:.2f}, 成本 ${cost:.2f}, 毛利润 ${gross_profit:.2f} (毛利率{profit_margin}%), "
+        #            f"企业所得税 ${corporate_tax:.2f}")
+        
+        return tx.id
+
+    def add_government_procurement_transaction(
+        self,
+        month: int,
+        sender_id: str,
+        receiver_id: str,
+        amount: float,
+        product_id: str,
+        quantity: float,
+        product_name: str = "Unknown",
+        unit_price: float = 0.0,
+        product_classification: str = "Unknown",
+        consume_inventory: bool = True,
+    ) -> str:
+        """
+        Government procurement transaction:
+        - No VAT/consume_tax is generated (avoid government self-tax artifacts).
+        - Books firm revenue (cashflow) equal to `amount` (ex-tax).
+        - Optionally consumes inventory atomically.
+        """
+        # Balance check (government is not a company)
+        is_company = sender_id in self.company_id
+        if not is_company and self.ledger[sender_id].amount < amount:
+            raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
+
+        # Inventory consume
+        if consume_inventory:
+            product_found = False
+            current_inventory = 0.0
+            if receiver_id in self.products:
+                for p in (self.products.get(receiver_id) or []):
+                    if str(getattr(p, "product_id", "") or "") == str(product_id):
+                        product_found = True
+                        current_inventory = float(getattr(p, "amount", 0.0) or 0.0)
+                        eps = 1e-9
+                        if current_inventory + eps < float(quantity or 0.0):
+                            raise ValueError(
+                                f"Insufficient inventory for {receiver_id}:{product_id}: "
+                                f"{current_inventory} < {quantity}"
+                            )
+                        p.amount = max(0.0, float(p.amount) - float(quantity))
+                        current_inventory = float(p.amount)
+                        # enrich fields from inventory product
+                        try:
+                            self._ensure_product_cost_fields(p, default_category=getattr(p, "classification", product_classification))
+                            product_name = str(getattr(p, "name", product_name) or product_name)
+                            product_classification = getattr(p, "classification", product_classification) or product_classification
+                            if unit_price <= 0:
+                                unit_price = float(getattr(p, "price", 0.0) or 0.0)
+                        except Exception:
+                            pass
+                        break
+            if not product_found:
+                raise ValueError(f"Product not found for government procurement: {receiver_id}:{product_id}")
+
+        # Ledger transfer
+        self.ledger[sender_id].amount -= amount
+        self.ledger[receiver_id].amount += amount
+
+        # Firm revenue bookkeeping (cashflow)
+        self.record_firm_income(receiver_id, amount)
+        self.record_firm_monthly_income(receiver_id, month, amount)
+
+        # Transaction asset payload (quantity = purchased quantity)
+        if unit_price <= 0 and quantity and float(quantity) > 0:
+            unit_price = float(amount) / float(quantity)
+        if unit_price <= 0:
+            unit_price = 0.01
+
+        product_kwargs = dict(
+            asset_type="products",
+            product_id=str(product_id),
+            name=str(product_name),
+            owner_id=str(receiver_id),
+            amount=float(quantity or 0.0),
+            price=float(unit_price),
+            classification=str(product_classification or "Unknown"),
+        )
+        product_kwargs = inject_product_attributes(product_kwargs, str(product_id))
+        product_asset = Product(**product_kwargs)
+
+        tx = Transaction(
+            id=str(uuid4()),
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=float(amount or 0.0),
+            assets=[product_asset],
+            type="government_procurement",
+            month=month,
+        )
+        self.tx_history.append(tx)
+        return tx.id
+    
+
+    # =========================================================================
+    # Inventory & Pricing Management
+    # =========================================================================
+    def get_product_inventory(self, owner_id: str, product_id: str) -> float:
+        """
+        获取指定商品的当前库存数量
+        """
+        if owner_id not in self.products:
+            return 0.0
+        
+        for product in self.products[owner_id]:
+            if product.product_id == product_id:
+                return product.amount
+        return 0.0
+    
+    def get_all_product_inventory(self) -> Dict[tuple, float]:
+        """
+        批量获取所有商品的库存信息
+        
+        Returns:
+            Dict[tuple, float]: {(product_id, owner_id): amount} 字典
+        """
+        inventory_dict = {}
+        for owner_id, products in self.products.items():
+            for product in products:
+                key = (product.product_id, owner_id)
+                inventory_dict[key] = product.amount
+        return inventory_dict
+    
+    async def sync_product_inventory_to_market(self, product_market):
+        """
+        将EconomicCenter的库存信息同步到ProductMarket
+        这个方法可以定期调用以保持两边数据一致
+        """
+        try:
+            # 收集所有有库存的商品
+            all_products = []
+            for owner_id, products in self.products.items():
+                if owner_id in self.company_id:
+                    for product in products:
+                        if product.amount > 0:  # 只同步有库存的商品
+                            all_products.append(product)
+            
+            # 更新ProductMarket的商品列表
+            await product_market.update_products_from_economic_center.remote(all_products)
+            logger.info(f"已同步 {len(all_products)} 个商品到ProductMarket")
+            return True
+        except Exception as e:
+            logger.error(f"同步库存到ProductMarket失败: {e}")
+            return False
+    
+    def update_product_prices_based_on_sales(
+        self,
+        sales_data: Dict[tuple, Dict],
+        price_adjustment_rate: float = 0.1,
+        unmet_demand_lambda: float = 1.0,
+    ) -> Dict[str, float]:
+        """
+        根据销量数据更新商品价格（包含库存信息）
+        sales_data: {(product_id, seller_id): {"quantity_sold": float, "revenue": float, "demand_level": str}}
+        price_adjustment_rate: 价格调整幅度 (0.1 = 10%)
+        返回: {product_id: new_price}
+        
+        注意：使用 (product_id, seller_id) 作为key，支持竞争市场模式下同一商品由多个企业销售
+        """
+        price_changes = {}
+        
+        # 🔍 调试信息：检查 company_id 列表
+        logger.info(f"📋 已注册的企业数量: {len(self.company_id)}")
+        logger.info(f"📦 商品所有者数量: {len(self.products)}")
+        
+        processed_owners = 0
+        skipped_owners = 0
+        price_increase_count = 0
+        price_decrease_count = 0
+        
+        for owner_id, products in self.products.items():
+            if owner_id in self.company_id:  # 只处理真正的公司
+                processed_owners += 1
+                for product in products:
+                    product_id = product.product_id
+                    sales_key = (product_id, owner_id)
+                    
+                    # 使用 (product_id, owner_id) 作为key查找销量数据
+                    if sales_key in sales_data:
+                        sales_info = sales_data[sales_key]
+                        # ⚠️ 固有市场若“出清库存”，会让 quantity_sold 变成“产量”，从而误判“全部供不应求”。
+                        # 修正：
+                        # - 需求侧：以家庭需求为主，并加上未满足需求（缺货）加权
+                        # - 供给侧：把固有市场购买量视作“月末剩余/过剩供给”信号（近似）
+                        household_qty = float(sales_info.get("household_quantity", 0.0) or 0.0)
+                        household_revenue = float(sales_info.get("household_revenue", 0.0) or 0.0)
+                        inherent_qty = float(sales_info.get("inherent_market_quantity", 0.0) or 0.0)
+                        gov_qty = float(sales_info.get("government_procurement_quantity", 0.0) or 0.0)
+                        unmet_short = float(sales_info.get("unmet_qty_short", 0.0) or 0.0)
+
+                        try:
+                            lam = float(unmet_demand_lambda or 0.0)
+                        except Exception:
+                            lam = 0.0
+                        lam = max(0.0, min(10.0, lam))
+
+                        quantity_sold = household_qty + lam * unmet_short
+                        revenue = household_revenue
+                        demand_level = sales_info.get("demand_level", "normal")
+                        # 价格调节希望看到“月内可供给规模”，而不是“出清后剩余库存”：
+                        # - inherent_market 与 government_procurement 都可能把库存清到0（类似出清通道）
+                        # - 这里把它们的购买数量加回去，近似恢复到“出清前库存水平”
+                        current_inventory = float(getattr(product, "amount", 0.0) or 0.0) + inherent_qty + gov_qty
+                        
+                        # 计算价格调整（传入库存信息）
+                        old_price = product.price
+                        new_price = self._calculate_new_price(
+                            old_price, quantity_sold, revenue, demand_level,
+                            price_adjustment_rate, current_inventory
+                        )
+                        
+                        # 更新价格
+                        product.price = new_price
+                        price_changes[product_id] = new_price
+                        
+                        # 统计涨价和降价商品数
+                        if new_price > old_price:
+                            price_increase_count += 1
+                        elif new_price < old_price:
+                            price_decrease_count += 1
+                        
+                        # 打印价格变化
+                        price_change_pct = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0
+                        supply_demand_ratio = current_inventory / quantity_sold if quantity_sold > 0 else float('inf')
+                        
+                        if abs(price_change_pct) > 5:  # 只打印变化超过5%的
+                            print(f"💹 {product.name[:40]:40} | "
+                                  f"${old_price:6.2f} → ${new_price:6.2f} ({price_change_pct:+6.1f}%) | "
+                                  f"销量:{quantity_sold:5.1f} | 库存:{current_inventory:5.1f} | "
+                                  f"供需比:{supply_demand_ratio:5.2f} | {demand_level}")
+            else:
+                skipped_owners += 1
+        
+        logger.info(f"✅ 处理了 {processed_owners} 个企业的商品，跳过了 {skipped_owners} 个非企业所有者")
+        print(f"\n📊 价格调整汇总: 涨价 {price_increase_count} 种商品, 降价 {price_decrease_count} 种商品")
+        
+        if skipped_owners > 0:
+            logger.warning(f"⚠️ 跳过的所有者示例: {list(self.products.keys())[:5]}")
+            logger.warning(f"⚠️ 已注册企业ID示例: {self.company_id[:5] if self.company_id else '空列表'}")
+        
+        return price_changes
+    
+    def _calculate_new_price(self, current_price: float, quantity_sold: float, revenue: float,
+                           demand_level: str, adjustment_rate: float, current_inventory: float = None) -> float:
+        """
+        ✨ 优化版价格调整算法 - 让供不应求的商品更明显涨价
+        
+        考虑因素：
+        1. 销量水平（绝对值）
+        2. 需求水平（high/normal/low）
+        3. 供需比（库存与销量的比例）- 新增
+        4. 收入效率
+        """
+        # 基础价格调整因子
+        base_adjustment = 0.0
+        
+        # 1. 根据销量调整（更激进的调整）
+        if quantity_sold > 100:  # 超高销量
+            base_adjustment += 0.15  # 涨价15%
+        elif quantity_sold > 50:  # 高销量
+            base_adjustment += 0.10  # 涨价10%
+        elif quantity_sold > 30:  # 中等销量
+            base_adjustment += 0.05  # 涨价5%
+        elif quantity_sold < 5:  # 极低销量
+            base_adjustment -= 0.08  # 降价8%
+        elif quantity_sold < 15:  # 低销量
+            base_adjustment -= 0.05  # 降价5%
+        
+        # 2. 根据需求水平调整（更激进）
+        demand_multipliers = {
+            "high": 0.20,      # 高需求涨价20%
+            "normal": 0.0,     # 正常需求不变
+            "low": -0.12       # 低需求降价12%
+        }
+        base_adjustment += demand_multipliers.get(demand_level, 0.0)
+        
+        # 3. ✨ 新增：根据供需比调整（库存与销量的比例）
+        # 这是关键的供不应求判断指标
+        if current_inventory is not None and quantity_sold > 0:
+            supply_demand_ratio = current_inventory / quantity_sold
+            
+            if supply_demand_ratio < 0.5:
+                # 库存不足销量的一半 - 严重供不应求
+                base_adjustment += 0.25  # 大幅涨价25%
+                logger.debug(f"🔥 严重供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+            elif supply_demand_ratio < 1.0:
+                # 库存不足一个周期的销量 - 供不应求
+                base_adjustment += 0.15  # 涨价15%
+                logger.debug(f"📈 供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+            elif supply_demand_ratio < 2.0:
+                # 库存略高于销量 - 供需平衡
+                base_adjustment += 0.02  # 小幅涨价2%
+            elif supply_demand_ratio < 5.0:
+                # 库存明显高于销量 - 供过于求
+                base_adjustment -= 0.08  # 降价8%
+                logger.debug(f"📉 供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+            else:
+                # 库存严重过剩 - 严重供过于求
+                base_adjustment -= 0.15  # 大幅降价15%
+                logger.debug(f"⚠️ 严重供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+        
+        # 4. 根据收入效率调整
+        if revenue > 0 and quantity_sold > 0:
+            avg_revenue_per_unit = revenue / quantity_sold
+            if avg_revenue_per_unit > current_price * 1.15:  # 收入效率高（提高阈值）
+                base_adjustment += 0.05
+            elif avg_revenue_per_unit < current_price * 0.85:  # 收入效率低（降低阈值）
+                base_adjustment -= 0.05
+        
+        # 5. 应用调整率（增大调整幅度，让价格变化更明显）
+        # 原来是直接乘以adjustment_rate，现在增加系数让变化更明显
+        price_change = current_price * base_adjustment * adjustment_rate * 1.5  # 放大1.5倍
+        
+        # 6. 计算新价格，放宽价格变动范围
+        new_price = current_price + price_change
+        min_price = current_price * 0.3   # 最低可降至原价的30%（原来是50%）
+        max_price = current_price * 3.0   # 最高可涨至原价的300%（原来是200%）
+        
+        # 7. 确保价格合理性（不能低于成本的80%）
+        absolute_min_price = current_price * 0.4  # 绝对最低价
+        
+        final_price = max(absolute_min_price, min(new_price, max_price))
+        
+        # 记录显著的价格变化
+        if abs(final_price - current_price) / current_price > 0.1:  # 变化超过10%
+            inv_str = "N/A" if current_inventory is None else f"{float(current_inventory):.1f}"
+            logger.info(f"💹 显著价格变动: ${current_price:.2f} → ${final_price:.2f} "
+                       f"({((final_price - current_price) / current_price * 100):+.1f}%) | "
+                       f"销量:{quantity_sold:.1f} | 库存:{inv_str} | "
+                       f"需求:{demand_level}")
+        
+        return final_price
+    
+    async def sync_price_changes_to_market(self, product_market, price_changes: Dict[str, float]) -> bool:
+        """
+        将价格变更同步到ProductMarket
+        """
+        try:
+            success = await product_market.update_product_prices.remote(price_changes)
+            logger.info(f"已同步 {len(price_changes)} 个商品的价格变更到ProductMarket")
+            return success
+        except Exception as e:
+            logger.error(f"同步价格变更到ProductMarket失败: {e}")
+            return False
+    
+
+    # =========================================================================
+    # Sales Statistics & Market Analysis
+    # =========================================================================
+    def collect_sales_statistics(self, month: int) -> Dict[tuple, Dict]:
+        """
+        收集指定月份的销售统计数据
+        返回: {(product_id, seller_id): {
+            "product_id": str,
+            "seller_id": str,
+            "quantity_sold": float,
+            "revenue": float,
+            "demand_level": str,
+            "household_quantity": float,  # 家庭购买数量
+            "household_revenue": float,  # 家庭购买收入
+            "inherent_market_quantity": float,  # 固定市场消耗数量
+            "inherent_market_revenue": float,  # 固有市场收入
+            "government_procurement_quantity": float,  # 政府采购数量（不含税）
+            "government_procurement_revenue": float,  # 政府采购收入（不含税）
+        }}
+        
+        注意：使用 (product_id, seller_id) 作为key，支持竞争市场模式下同一商品由多个企业销售
+        """
+        sales_stats = {}
+        
+        # 从交易历史中收集销售数据
+        for tx in self.tx_history:
+            if tx.month == month:
+                seller_id = tx.receiver_id
+                
+                # 处理家庭购买（purchase类型）
+                if tx.type == 'purchase':
+                    for asset in tx.assets:
+                        if hasattr(asset, 'product_id') and asset.product_id:
+                            product_id = asset.product_id
+                            key = (product_id, seller_id)
+                            
+                            if key not in sales_stats:
+                                sales_stats[key] = {
+                                    "product_id": product_id,
+                                    "seller_id": seller_id,
+                                    "quantity_sold": 0.0,
+                                    "revenue": 0.0,
+                                    "demand_level": "normal",
+                                    "household_quantity": 0.0,
+                                    "household_revenue": 0.0,  # 新增：家庭购买收入
+                                    "inherent_market_quantity": 0.0,
+                                    "inherent_market_revenue": 0.0,  # 新增：固有市场收入
+                                    "government_procurement_quantity": 0.0,
+                                    "government_procurement_revenue": 0.0,
+                                }
+                            
+                            # 累计家庭销量和收入
+                            household_revenue = asset.price * asset.amount
+                            sales_stats[key]["quantity_sold"] += asset.amount
+                            sales_stats[key]["household_quantity"] += asset.amount
+                            sales_stats[key]["revenue"] += household_revenue
+                            sales_stats[key]["household_revenue"] += household_revenue
+
+                
+                # 处理固定市场消耗（inherent_market类型）
+                elif tx.type == 'inherent_market':
+                    for asset in tx.assets:
+                        if hasattr(asset, 'product_id') and asset.product_id:
+                            product_id = asset.product_id
+                            key = (product_id, seller_id)
+                            
+                            if key not in sales_stats:
+                                sales_stats[key] = {
+                                    "product_id": product_id,
+                                    "seller_id": seller_id,
+                                    "quantity_sold": 0.0,
+                                    "revenue": 0.0,
+                                    "demand_level": "normal",
+                                    "household_quantity": 0.0,
+                                    "household_revenue": 0.0,  # 新增：家庭购买收入
+                                    "inherent_market_quantity": 0.0,
+                                    "inherent_market_revenue": 0.0,  # 新增：固有市场收入
+                                    "government_procurement_quantity": 0.0,
+                                    "government_procurement_revenue": 0.0,
+                                }
+                            
+                            # 累计固定市场销量和收入
+                            inherent_revenue = tx.amount  # 固定市场交易的总金额
+                            sales_stats[key]["quantity_sold"] += asset.amount
+                            sales_stats[key]["inherent_market_quantity"] += asset.amount
+                            sales_stats[key]["revenue"] += inherent_revenue
+                            sales_stats[key]["inherent_market_revenue"] += inherent_revenue
+
+                # 处理政府采购（government_procurement类型，不含税）
+                elif tx.type == 'government_procurement':
+                    for asset in tx.assets:
+                        if hasattr(asset, 'product_id') and asset.product_id:
+                            product_id = asset.product_id
+                            key = (product_id, seller_id)
+
+                            if key not in sales_stats:
+                                sales_stats[key] = {
+                                    "product_id": product_id,
+                                    "seller_id": seller_id,
+                                    "quantity_sold": 0.0,
+                                    "revenue": 0.0,
+                                    "demand_level": "normal",
+                                    "household_quantity": 0.0,
+                                    "household_revenue": 0.0,
+                                    "inherent_market_quantity": 0.0,
+                                    "inherent_market_revenue": 0.0,
+                                    "government_procurement_quantity": 0.0,
+                                    "government_procurement_revenue": 0.0,
+                                }
+
+                            gp_revenue = asset.price * asset.amount
+                            sales_stats[key]["quantity_sold"] += asset.amount
+                            sales_stats[key]["government_procurement_quantity"] += asset.amount
+                            sales_stats[key]["revenue"] += gp_revenue
+                            sales_stats[key]["government_procurement_revenue"] += gp_revenue
+        
+        # 根据销量确定需求水平
+        # ===== Unmet Demand Tracking =====
+        unmet_month = dict(self.unmet_demand_by_month.get(month, {}) or {})
+        for key, stats in sales_stats.items():
+            try:
+                unmet_key = self._unmet_key(stats.get("product_id"), stats.get("seller_id"))
+                rec = unmet_month.get(unmet_key, {}) if unmet_month else {}
+                stats["unmet_attempts"] = float((rec or {}).get("attempts", 0.0) or 0.0)
+                stats["unmet_qty_short"] = float((rec or {}).get("qty_short", 0.0) or 0.0)
+            except Exception:
+                stats["unmet_attempts"] = 0.0
+                stats["unmet_qty_short"] = 0.0
+
+            quantity = stats["quantity_sold"]
+            if quantity > 100:
+                stats["demand_level"] = "high"
+            elif quantity < 10:
+                stats["demand_level"] = "low"
+            else:
+                stats["demand_level"] = "normal"
+        
+        print(f"📊 销售数据收集: 月份{month}, 交易记录{len(self.tx_history)}条, 销售商品-企业组合{len(sales_stats)}种")
+        
+        # 计算总收入统计
+        total_revenue = sum(s['revenue'] for s in sales_stats.values())
+        total_household_revenue = sum(s.get('household_revenue', 0) for s in sales_stats.values())
+        total_inherent_revenue = sum(s.get('inherent_market_revenue', 0) for s in sales_stats.values())
+        total_gp_revenue = sum(s.get('government_procurement_revenue', 0) for s in sales_stats.values())
+        
+        if total_revenue > 0:
+            household_ratio = (total_household_revenue / total_revenue) * 100
+            inherent_ratio = (total_inherent_revenue / total_revenue) * 100
+            gp_ratio = (total_gp_revenue / total_revenue) * 100
+            print(f"💰 收入统计: 总收入${total_revenue:.2f} | "
+                  f"家庭购买${total_household_revenue:.2f} ({household_ratio:.1f}%) | "
+                  f"政府采购${total_gp_revenue:.2f} ({gp_ratio:.1f}%) | "
+                  f"固有市场${total_inherent_revenue:.2f} ({inherent_ratio:.1f}%)")
+        
+        if sales_stats:
+            # 显示销量最高的3个商品-企业组合，并区分家庭和固定市场
+            top_sales = sorted(sales_stats.items(), key=lambda x: x[1]['quantity_sold'], reverse=True)[:3]
+            for (product_id, seller_id), stats in top_sales:
+                household_rev = stats.get('household_revenue', 0)
+                inherent_rev = stats.get('inherent_market_revenue', 0)
+                gp_rev = stats.get('government_procurement_revenue', 0)
+                total_rev = stats['revenue']
+                hh_ratio = (household_rev / total_rev * 100) if total_rev > 0 else 0
+                in_ratio = (inherent_rev / total_rev * 100) if total_rev > 0 else 0
+                gp_ratio = (gp_rev / total_rev * 100) if total_rev > 0 else 0
+                
+                print(f"   - {product_id}@{seller_id}: 总销量{stats['quantity_sold']:.1f} "
+                      f"(家庭:{stats['household_quantity']:.1f} | 政府采购:{stats.get('government_procurement_quantity', 0.0):.1f} | 固有市场:{stats['inherent_market_quantity']:.1f}), "
+                      f"总收入${total_rev:.2f} (家庭:${household_rev:.2f} {hh_ratio:.1f}% | "
+                      f"政府:${gp_rev:.2f} {gp_ratio:.1f}% | 固有:${inherent_rev:.2f} {in_ratio:.1f}%)")
+        return sales_stats
+
+    async def initialize_month1_inventory_by_market_target(
+        self,
+        month: int,
+        firms: List[Any],
+        product_market,
+        market_total_value_target_ex_tax: float,
+        sector_revenue_weights: Dict[str, float],
+        powerlaw_alpha: float = 1.15,
+        random_state: int = 42,
+    ) -> Dict[str, Any]:
+        """
+        月初初始化（第一个月）：按“市场总价值目标 + 行业销售额权重”分配预算；
+        对每家企业的 SKU，用幂律分配预算到各SKU，再按价格换算件数（库存数量）。
+
+        设计意图：
+        - 替代旧的“固定商品数、固定数量”初始化方式。
+        - SKU 的选择/缩减应在仿真侧完成（例如按 sector_sku_weights 缩减 new_map），
+          此处只负责把“预算→件数→库存”落到账本与库存。
+        - 产出价值以“售价估值”（ex tax）计入 production_stats；
+        - 当前版本：不再把“按毛利率估算的单位成本”作为企业当月现金支出扣除（利润口径改为 工资+折旧）。
+        """
+        market_total_value_target_ex_tax = float(market_total_value_target_ex_tax or 0.0)
+        if market_total_value_target_ex_tax <= 0:
+            raise ValueError("market_total_value_target_ex_tax 必须为正数（不含税，按售价估值）")
+
+        # 行业口径统一：把 sector_revenue_weights 先按 IO 口径行业名归并（避免“权重key与企业行业名不一致”）
+        from agentsociety_ecosim.config.simulation_init_config import normalize_industry
+
+        merged_weights: Dict[str, float] = defaultdict(float)
+        for k, v in (sector_revenue_weights or {}).items():
+            try:
+                w = float(v or 0.0)
+            except Exception:
+                w = 0.0
+            if w <= 0:
+                continue
+            merged_weights[normalize_industry(str(k))] += w
+
+        revenue_weights = {k: float(v or 0.0) for k, v in merged_weights.items() if float(v or 0.0) > 0}
+        if not revenue_weights:
+            raise ValueError("sector_revenue_weights 为空或全为0")
+        total_w = sum(revenue_weights.values())
+        if total_w <= 0:
+            raise ValueError("sector_revenue_weights 权重之和必须>0")
+        revenue_weights = {k: v / total_w for k, v in revenue_weights.items()}
+
+        # firm_id -> sector（统一用 IO 口径行业名）
+        firm_sector: Dict[str, str] = {}
+        for f in firms or []:
+            try:
+                cid = str(getattr(f, "company_id"))
+                sector = normalize_industry(str(getattr(f, "main_business", "") or getattr(f, "industry", "") or ""))
+                if cid:
+                    firm_sector[cid] = sector
+            except Exception:
+                continue
+
+        sector_to_firms: Dict[str, List[str]] = defaultdict(list)
+        for cid, sector in firm_sector.items():
+            if cid in self.company_id:
+                sector_to_firms[sector].append(cid)
+
+        rng = np.random.default_rng(int(random_state))
+
+        total_output_qty = 0.0
+        total_cost_spent = 0.0
+        firm_production_qty: Dict[str, float] = {}
+        firm_production_cost: Dict[str, float] = {}
+        firm_production_value: Dict[str, float] = {}
+        products_initialized = 0
+
+        for sector, w in revenue_weights.items():
+            firms_in_sector = sector_to_firms.get(sector, [])
+            if not firms_in_sector:
+                continue
+
+            sector_budget = market_total_value_target_ex_tax * w  # 售价估值（不含税）
+            firm_budget = sector_budget / float(len(firms_in_sector))
+
+            for cid in firms_in_sector:
+                prods = self.products.get(cid, []) or []
+                if not prods:
+                    continue
+
+                n = len(prods)
+                order = list(range(n))
+                rng.shuffle(order)
+
+                ranks = np.arange(1, n + 1, dtype=float)
+                weights = 1.0 / np.power(ranks, float(powerlaw_alpha))
+                weights = weights / max(weights.sum(), 1e-12)
+
+                firm_qty = 0.0
+                firm_cost = 0.0
+                firm_value = 0.0
+
+                for i, idx in enumerate(order):
+                    p = prods[idx]
+                    price = float(getattr(p, "price", 0.0) or 0.0)
+                    if price <= 0:
+                        continue
+
+                    alloc_value = firm_budget * float(weights[i])
+                    qty = alloc_value / price
+                    if qty <= 0:
+                        continue
+
+                    # 初始化库存：覆盖为目标件数
+                    p.amount = qty
+                    products_initialized += 1
+
+                    category = getattr(p, "classification", None) or sector or "Unknown"
+                    margin_pct = float(self.category_profit_margins.get(category, 25.0) or 25.0)
+                    margin_pct = max(0.0, min(80.0, margin_pct))
+                    # 固定单位成本：由“最初价格(base_price) + 行业毛利率”推导，后续不随 price 变动
+                    if getattr(p, "base_price", None) is None or float(getattr(p, "base_price", 0.0) or 0.0) <= 0:
+                        p.base_price = float(price)
+                    unit_cost = float(getattr(p, "unit_cost", 0.0) or 0.0)
+                    if unit_cost <= 1e-6:
+                        unit_cost = float(p.base_price) * (1.0 - margin_pct / 100.0)
+                    if unit_cost <= 1e-9:
+                        unit_cost = max(0.01, price * 0.2)
+                    p.unit_cost = float(unit_cost)
+
+                    firm_qty += qty
+                    firm_value += qty * price
+                    # 不再把 unit_cost 记为当月现金支出
+                    # firm_cost 保留为0，仅用于兼容旧字段
+                    firm_cost += 0.0
+
+                if cid not in self.ledger:
+                    self.ledger[cid] = Ledger.create(cid, 0.0)
+
+                firm_production_qty[cid] = firm_qty
+                firm_production_cost[cid] = firm_cost
+                firm_production_value[cid] = firm_value
+
+                total_output_qty += firm_qty
+                total_cost_spent += firm_cost
+
+        await self.sync_product_inventory_to_market(product_market)
+
+        if not hasattr(self, "production_stats_by_month"):
+            self.production_stats_by_month = {}
+        # 月1初始化阶段：用“期初库存初始化”代表当月供给（按售价估值记入生产侧统计）。
+        # 同时统计“当时是否已有雇佣”（便于报表解释）。
+        companies_with_workers = 0
+        try:
+            for f in firms or []:
+                if getattr(f, "get_employees", None) and callable(getattr(f, "get_employees")):
+                    if int(f.get_employees() or 0) > 0:
+                        companies_with_workers += 1
+        except Exception:
+            companies_with_workers = 0
+
+        total_output_value = 0.0
+        try:
+            total_output_value = float(sum(float(v or 0.0) for v in firm_production_value.values()) or 0.0)
+        except Exception:
+            total_output_value = 0.0
+
+        production_stats = {
+            "total_companies": len([cid for cid in firm_production_qty.keys()]),
+            "companies_with_workers": int(companies_with_workers),
+            "base_production_total": total_output_qty,
+            "labor_production_total": 0.0,
+            "products_restocked": int(products_initialized),
+            "firm_base_production": firm_production_qty,
+            "firm_production_cost": firm_production_cost,
+            "firm_production_value": firm_production_value,
+            "total_production_cost": total_cost_spent,
+            "total_output_value": total_output_value,
+            "init_market_target_ex_tax": market_total_value_target_ex_tax,
+            "init_powerlaw_alpha": float(powerlaw_alpha),
+        }
+        self.production_stats_by_month[month] = production_stats
+
+        logger.info(
+            f"✅ Month {month} 初始化完成: 市场目标(不含税)=${market_total_value_target_ex_tax:,.2f}, "
+            f"初始化SKU数={products_initialized}, 产出(件数)={total_output_qty:,.2f}, 成本支出=${total_cost_spent:,.2f}"
+        )
+        return production_stats
+    
+    async def execute_monthly_production_cycle(self, month: int, labor_market, product_market, std_jobs, firms: List = None, production_config: Dict = None, innovation_config: Dict = None) -> Dict[str, Any]:
+        """
+        执行月度生产周期
+        1. 所有公司基础生产
+        2. 有工人的公司额外生产
+        3. 根据销量调整产出
+        
+        Args:
+            production_config: 生产配置参数字典，包含:
+                - base_production_rate: 基础补货量
+                - high_demand_multiplier: 高需求倍数
+                - low_demand_multiplier: 低需求倍数
+                - labor_productivity_factor: 劳动力生产率
+                - labor_elasticity: 劳动力弹性
+        """
+        logger.info(f"🏭 开始第 {month} 月生产周期（月初生产）...")
+
+        # ========= 月1：仅期初库存初始化（不走生产函数） =========
+        # 说明：用户要求 month=1 只使用初始值（没有 month=0 的参考数据），不使用生产函数产出。
+        if month == 1 and isinstance(production_config, dict) and production_config.get("enable_market_target_initial_production", False):
+            production_stats = await self.initialize_month1_inventory_by_market_target(
+                month=month,
+                firms=firms or [],
+                product_market=product_market,
+                market_total_value_target_ex_tax=float(production_config.get("market_total_value_target_ex_tax", 0.0) or 0.0),
+                sector_revenue_weights=dict(production_config.get("sector_revenue_weights", {}) or {}),
+                powerlaw_alpha=float(production_config.get("powerlaw_alpha", 1.15) or 1.15),
+                random_state=int(production_config.get("random_state", 42) or 42),
+            )
+            # month=1：不执行CD生产（不依赖reference_month），但“初始化库存”本身已计入 production_stats 的 total_output_value。
+            # 同时统计“雇佣情况”（companies_with_workers）与有效劳动力（仅用于报表解释）。
+            companies_with_workers = 0
+            firm_labor_efficiency = {}
+            try:
+                for f in firms or []:
+                    cid = str(getattr(f, "company_id", "") or "")
+                    if not cid:
+                        continue
+                    emp = int(f.get_employees() or 0) if getattr(f, "get_employees", None) else 0
+                    if emp > 0:
+                        companies_with_workers += 1
+                    # 仅统计有效劳动力，不用于生产
+                    try:
+                        firm_labor_efficiency[cid] = await self._calculate_effective_labor_force(f, month, std_jobs)
+                    except Exception:
+                        continue
+            except Exception:
+                companies_with_workers = 0
+                firm_labor_efficiency = {}
+
+            production_stats["companies_with_workers"] = int(companies_with_workers)
+            production_stats["firm_labor_efficiency"] = firm_labor_efficiency
+            production_stats["labor_production_total"] = 0.0
+            # 确保月1有 total_output_value（用于生产侧GDP口径）
+            if "total_output_value" not in production_stats:
+                try:
+                    pv = production_stats.get("firm_production_value", {}) or {}
+                    production_stats["total_output_value"] = float(sum(float(v or 0.0) for v in pv.values()) or 0.0)
+                except Exception:
+                    production_stats["total_output_value"] = 0.0
+            return production_stats
+
+        # ✨ 同步本月“是否启用创新模块”开关（由仿真侧传入）
+        try:
+            self.enable_innovation_module = bool(innovation_config.get("enable_innovation_module", False)) if isinstance(innovation_config, dict) else False
+        except Exception:
+            self.enable_innovation_module = False
+
+        # 兼容旧实例：如果早期创建的 EconomicCenter 没有该属性，这里动态补上，避免 AttributeError
+        if not hasattr(self, "production_stats_by_month"):
+            self.production_stats_by_month = {}
+        production_stats = {
+            "total_companies": 0,
+            "companies_with_workers": 0,
+            "base_production_total": 0.0,
+            "labor_production_total": 0.0,
+            "products_restocked": 0
+        }
+        
+        # 根据self.company_id统计总公司数（只统计真正的公司）
+        for owner_id in self.company_id:
+            if owner_id in self.products and self.products[owner_id]:
+                production_stats["total_companies"] += 1
+        
+        # ========= 月2+：统一CD生产（输出价值V，再换算件数入库） =========
+        reference_month = month - 1
+        sales_data = self.collect_sales_statistics(reference_month) if reference_month >= 1 else {}
+
+        try:
+            # 1.5 企业税结算：结算上个月（用于上月现金流/税基），发生在本月生产之前
+            if reference_month >= 1:
+                self.settle_monthly_corporate_tax(reference_month)
+
+            # ---------- 统一CD生产参数 ----------
+            # 默认 Cobb–Douglas 指数（可由仿真侧传入 production_config 覆盖）
+            try:
+                alpha = float((production_config or {}).get("cd_alpha_labor", 0.7) or 0.7)
+            except Exception:
+                alpha = 0.7
+            try:
+                beta = float((production_config or {}).get("cd_beta_capital", 0.3) or 0.3)
+            except Exception:
+                beta = 0.3
+            alpha = max(0.0, min(1.0, alpha))
+            beta = max(0.0, min(1.0, beta))
+            rho = 0.5  # 规模弹性（用于K_floor按员工规模缩放）
+            u = float((production_config or {}).get("production_budget_utilization_rate", 0.6) or 0.6)
+            from agentsociety_ecosim.config.simulation_init_config import normalize_industry
+
+            # 合并到 IO 口径行业权重
+            sector_weights_raw = dict((production_config or {}).get("sector_revenue_weights", {}) or {})
+            merged_sector_weights: Dict[str, float] = defaultdict(float)
+            for k, v in (sector_weights_raw or {}).items():
+                try:
+                    w = float(v or 0.0)
+                except Exception:
+                    w = 0.0
+                if w <= 0:
+                    continue
+                merged_sector_weights[normalize_industry(str(k))] += w
+            sector_weights = dict(merged_sector_weights)
+            market_total_value_target_ex_tax = float((production_config or {}).get("market_total_value_target_ex_tax", 0.0) or 0.0)
+            cd_floor_total_ratio = float((production_config or {}).get("cd_floor_total_ratio", 0.02) or 0.02)
+            cd_target_output_value_ratio = float((production_config or {}).get("cd_target_output_value_ratio", 1.0) or 1.0)
+            max_skus_per_firm = int((production_config or {}).get("cd_max_skus_per_firm", 200) or 200)
+            min_qty_per_sku = float((production_config or {}).get("min_production_per_product", 0.0) or 0.0)
+
+            # firm_id -> sector（统一用 IO 口径行业名）
+            firm_sector: Dict[str, str] = {}
+            for f in firms or []:
+                try:
+                    cid = str(getattr(f, "company_id"))
+                    sector = normalize_industry(str(getattr(f, "main_business", "") or getattr(f, "industry", "") or ""))
+                    if cid:
+                        firm_sector[cid] = sector
+                except Exception:
+                    continue
+
+            # ---------- 计算有效劳动力（L） ----------
+            firm_labor_efficiency: Dict[str, Any] = {}
+            L_by_firm: Dict[str, float] = {}
+            emp_by_firm: Dict[str, int] = {}
+            for f in firms or []:
+                cid = str(getattr(f, "company_id", "") or "")
+                if not cid:
+                    continue
+                try:
+                    labor_info = await self._calculate_effective_labor_force(f, month, std_jobs)
+                except Exception:
+                    labor_info = {"total_employees": 0, "production_effective_labor": 0.0, "effective_labor": 0.0, "avg_match_score": 0.0, "skill_details": []}
+                firm_labor_efficiency[cid] = labor_info
+                emp = int(labor_info.get("total_employees", 0) or 0)
+                emp_by_firm[cid] = emp
+                # 使用“生产有效劳动力”（已扣除研发占比）
+                L_by_firm[cid] = float(labor_info.get("production_effective_labor", 0.0) or 0.0)
+
+            avg_emp = (sum(emp_by_firm.values()) / max(1, len(emp_by_firm))) if emp_by_firm else 1.0
+
+            # ---------- 计算K（可投入预算） ----------
+            # K = K_floor(行业权重*规模) + u*income_{t-1}
+            income_prev_by_firm: Dict[str, float] = {}
+            total_income_prev = 0.0
+            for cid in list(self.company_id):
+                inc = float(self.firm_monthly_financials.get(cid, {}).get(reference_month, {}).get("income", 0.0) or 0.0)
+                income_prev_by_firm[cid] = inc
+                total_income_prev += inc
+
+            # 总保底投入规模：优先用 market_total_value_target_ex_tax 作为基准，否则退化到上月总收入
+            baseline = market_total_value_target_ex_tax if market_total_value_target_ex_tax > 0 else max(1.0, total_income_prev)
+            total_floor_budget = baseline * cd_floor_total_ratio
+
+            def _sector_w(cid: str) -> float:
+                sector = firm_sector.get(cid, "") or ""
+                sector = normalize_industry(sector)
+                w = float(sector_weights.get(sector, 0.0) or 0.0)
+                return w if w > 0 else 1.0
+
+            raw_weights: Dict[str, float] = {}
+            for cid in list(self.company_id):
+                emp = max(1, int(emp_by_firm.get(cid, 0) or 0))
+                scale = (emp / max(1e-9, float(avg_emp))) ** rho
+                raw_weights[cid] = _sector_w(cid) * scale
+            sum_raw = sum(raw_weights.values()) if raw_weights else 1.0
+
+            K_by_firm: Dict[str, float] = {}
+            for cid in list(self.company_id):
+                k_floor = total_floor_budget * (raw_weights.get(cid, 1.0) / max(1e-12, sum_raw))
+                k_var = u * float(income_prev_by_firm.get(cid, 0.0) or 0.0)
+                K_by_firm[cid] = max(1e-9, k_floor + k_var)
+
+            # ---------- 读取 Month1 CD 校准参数（若存在则优先使用，且后续月份不再变化） ----------
+            use_fixed_cd = bool(getattr(self, "_cd_industry_A", None)) and bool(getattr(self, "_cd_firm_K", None))
+
+            # ---------- A 的弱反馈更新（方案2：限幅慢变，避免“每月强行校准”） ----------
+            # 思路：
+            # - 维护跨月的 A_prev（全局技术水平）
+            # - 仅在初次需要时（通常 month=2）给一个合理初值（可用目标/基准反推一次）
+            # - 之后每月根据 gap 做小幅更新：A_t = A_{t-1} * clip(1 + gamma*gap, 1-delta, 1+delta)
+            # 其中 gap = (target/base_sum - 1)，delta 控制“每月最大调整幅度”，gamma 控制反馈强度
+            cd_A_max_step = float((production_config or {}).get("cd_A_max_step", 0.02) or 0.02)  # 每月最多±2%
+            cd_A_feedback_gamma = float((production_config or {}).get("cd_A_feedback_gamma", 0.1) or 0.1)
+
+            base_sum = 0.0
+            for cid in list(self.company_id):
+                L = max(0.0, float(L_by_firm.get(cid, 0.0) or 0.0))
+                # base_sum 只用于“全局A弱反馈”的估算；若使用固定CD，则全局A不参与生产但仍可保留统计
+                K_cap = None
+                try:
+                    k_bs = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+                    if k_bs > 0:
+                        K_cap = k_bs
+                except Exception:
+                    K_cap = None
+                if K_cap is None and use_fixed_cd:
+                    try:
+                        K_cap = float(self._cd_firm_K.get(cid, 0.0) or 0.0)
+                    except Exception:
+                        K_cap = None
+                K = max(1e-9, float(K_cap if (K_cap is not None and K_cap > 0) else (K_by_firm.get(cid, 1e-9) or 1e-9)))
+                if L <= 0:
+                    continue
+                base_sum += (L ** alpha) * (K ** beta)
+            target_total_V = max(1.0, total_income_prev) * cd_target_output_value_ratio
+
+            # 1) 初始化 A_prev（首次进入CD生产时）
+            if not hasattr(self, "_cd_global_A") or getattr(self, "_cd_global_A") is None:
+                # 给一个合理初值：若 base_sum 可用，则用一次性反推；否则用1
+                self._cd_global_A = (target_total_V / base_sum) if base_sum > 1e-12 else 1.0
+
+            A_prev = float(getattr(self, "_cd_global_A") or 1.0)
+
+            # 2) 弱反馈更新（限幅慢变）
+            if base_sum > 1e-12 and A_prev > 0:
+                ratio = target_total_V / base_sum
+                gap = ratio - 1.0
+                # 限幅：每月最多按±cd_A_max_step调整
+                step = 1.0 + cd_A_feedback_gamma * gap
+                step = max(1.0 - cd_A_max_step, min(1.0 + cd_A_max_step, step))
+                A = A_prev * step
+            else:
+                # base_sum不可用或A_prev异常时，不更新
+                A = max(0.0, A_prev)
+
+            # 写回缓存，供下月继续使用
+            self._cd_global_A = float(A)
+            print('==============================================')
+            print(f'初始设置的A: {A}')
+            print('==============================================')
+            # ---------- 计算每企业产出价值V并分配到SKU ----------
+            total_qty = 0.0
+            total_output_value = 0.0
+            total_cost_spent = 0.0
+            products_restocked = 0
+            companies_with_workers = sum(1 for cid, emp in emp_by_firm.items() if emp > 0)
+
+            firm_production_qty: Dict[str, float] = {}
+            firm_production_cost: Dict[str, float] = {}
+            firm_production_value: Dict[str, float] = {}
+
+            # 预计算每个 firm 的“上月总销量”（用于库存目标的粗略缺口）
+            firm_sales_qty_prev: Dict[str, float] = {}
+            for (pid, seller_id), info in (sales_data or {}).items():
+                try:
+                    firm_sales_qty_prev[str(seller_id)] = firm_sales_qty_prev.get(str(seller_id), 0.0) + float(info.get("quantity_sold", 0.0) or 0.0)
+                except Exception:
+                    continue
+
+            for cid in list(self.company_id):
+                prods = self.products.get(cid, []) or []
+                if not prods:
+                    firm_production_qty[cid] = 0.0
+                    firm_production_cost[cid] = 0.0
+                    firm_production_value[cid] = 0.0
+                    continue
+
+                L = max(0.0, float(L_by_firm.get(cid, 0.0) or 0.0))
+                # 生产的“资本输入K_capital”优先使用企业资本存量（firm_capital_stock，用作CD-K）
+                K_capital = None
+                try:
+                    k_bs = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+                    if k_bs > 0:
+                        K_capital = k_bs
+                except Exception:
+                    K_capital = None
+                if K_capital is None and use_fixed_cd:
+                    try:
+                        K_capital = float(self._cd_firm_K.get(cid, 0.0) or 0.0)
+                    except Exception:
+                        K_capital = None
+                K_cap = max(1e-9, float(K_capital if (K_capital is not None and K_capital > 0) else (K_by_firm.get(cid, 1e-9) or 1e-9)))
+
+                # 生产率A：优先使用企业固化 A_i（若有）；否则用行业固化 A_s；否则回退全局 A
+                if use_fixed_cd:
+                    A_use = 0.0
+                    try:
+                        a_i = float(getattr(self, "_cd_firm_A", {}).get(cid, 0.0) or 0.0)
+                        if a_i > 0:
+                            A_use = a_i
+                    except Exception:
+                        A_use = 0.0
+
+                    if A_use <= 0:
+                        sector = firm_sector.get(cid, "") or ""
+                        try:
+                            a_s = float(self._cd_industry_A.get(sector, 0.0) or 0.0)
+                            if a_s > 0:
+                                A_use = a_s
+                        except Exception:
+                            A_use = 0.0
+
+                    if A_use <= 0:
+                        A_use = float(A)
+                else:
+                    A_use = float(A)
+
+                V = float(A_use) * (L ** alpha) * (K_cap ** beta) if (A_use > 0 and L > 0) else 0.0
+
+                # 若没有劳动力，仍允许用K_floor产生少量供给（可选）；这里按用户设定：L=0则V=0
+                if V <= 1e-12:
+                    firm_production_qty[cid] = 0.0
+                    firm_production_cost[cid] = 0.0
+                    firm_production_value[cid] = 0.0
+                    continue
+
+                # SKU权重：销量 + 库存缺口（目标库存=上月销量*(1+buffer)+1）
+                buffer_ratio = 0.5
+                weights = []
+                for p in prods:
+                    price = float(getattr(p, "price", 0.0) or 0.0)
+                    if price <= 0:
+                        continue
+                    pid = getattr(p, "product_id", None)
+                    sold = 0.0
+                    if pid:
+                        info = (sales_data.get((pid, cid), {}) or {})
+                        # ✅ 需求信号：家庭销量 + λ*未满足需求（避免“固有市场出清”把销量变成产量）
+                        hh_sold = float(info.get("household_quantity", info.get("quantity_sold", 0.0)) or 0.0)
+                        unmet_short = float(info.get("unmet_qty_short", 0.0) or 0.0)
+                        try:
+                            unmet_lambda = float((production_config or {}).get("unmet_demand_lambda", 1.0) or 1.0)
+                        except Exception:
+                            unmet_lambda = 1.0
+                        unmet_lambda = max(0.0, min(10.0, unmet_lambda))
+                        sold = hh_sold + unmet_lambda * unmet_short
+                    stock = float(getattr(p, "amount", 0.0) or 0.0)
+                    target_stock = sold * (1.0 + buffer_ratio) + 1.0
+                    gap = max(0.0, target_stock - stock)
+                    w = 1.0 + sold + gap
+                    weights.append((p, w, sold, gap))
+
+                if not weights:
+                    firm_production_qty[cid] = 0.0
+                    firm_production_cost[cid] = 0.0
+                    firm_production_value[cid] = 0.0
+                    continue
+
+                # 限制参与补货的SKU数量，避免价值被稀释到过多SKU导致“每个SKU都太小”
+                weights.sort(key=lambda x: x[1], reverse=True)
+                weights = weights[:max_skus_per_firm]
+                sum_w = sum(w for _, w, _, _ in weights) or 1.0
+
+                # 先按价值分配（v_alloc），再换算件数：qty = v_alloc / price
+                planned = []
+                for p, w, _, _ in weights:
+                    price = float(getattr(p, "price", 0.0) or 0.0)
+                    if price <= 0:
+                        continue
+                    v_alloc = V * (w / sum_w)
+                    qty = v_alloc / price
+                    if min_qty_per_sku > 0 and qty < min_qty_per_sku:
+                        continue
+                    # 当前版本：生产不再需要额外“中间投入成本/现金预算”，利润口径改为 工资+折旧
+                    planned.append((p, qty, v_alloc))
+
+                if not planned:
+                    firm_production_qty[cid] = 0.0
+                    firm_production_cost[cid] = 0.0
+                    firm_production_value[cid] = 0.0
+                    continue
+
+                scale = 1.0
+
+                firm_qty = 0.0
+                firm_value = 0.0
+                firm_cost = 0.0
+                for p, qty, v_alloc in planned:
+                    qty2 = qty * scale
+                    if qty2 <= 1e-9:
+                        continue
+                    p.amount += qty2
+                    firm_qty += qty2
+                    firm_value += v_alloc * scale
+                    firm_cost += 0.0
+                    products_restocked += 1
+
+                firm_production_qty[cid] = firm_qty
+                firm_production_cost[cid] = firm_cost
+                firm_production_value[cid] = firm_value
+
+                total_qty += firm_qty
+                total_output_value += firm_value
+                total_cost_spent += firm_cost
+
+            # 写入production_stats（统一口径：CD产出=base_production_total，劳动力产出=0）
+            production_stats["companies_with_workers"] = companies_with_workers
+            production_stats["firm_labor_efficiency"] = firm_labor_efficiency
+            production_stats["base_production_total"] = total_qty
+            production_stats["labor_production_total"] = 0.0
+            production_stats["products_restocked"] = int(products_restocked)
+            production_stats["firm_base_production"] = firm_production_qty
+            production_stats["firm_production_cost"] = firm_production_cost
+            production_stats["firm_production_value"] = firm_production_value
+            production_stats["total_production_cost"] = float(total_cost_spent)
+            # 新增：统一CD生产口径的“产出总价值”（用于生产侧GDP）
+            production_stats["total_output_value"] = float(total_output_value)
+            production_stats["cd_params"] = {
+                "alpha": alpha,
+                "beta": beta,
+                "rho": rho,
+                "u": u,
+                "A": float(A),
+                "target_total_output_value": float(target_total_V),
+                "total_floor_budget": float(total_floor_budget),
+                "floor_total_ratio": float(cd_floor_total_ratio),
+                "target_output_value_ratio": float(cd_target_output_value_ratio),
+                "max_skus_per_firm": int(max_skus_per_firm),
+                # 弱反馈参数（方案2）
+                "A_prev": float(A_prev) if "A_prev" in locals() else float(A),
+                "A_max_step": float(cd_A_max_step),
+                "A_feedback_gamma": float(cd_A_feedback_gamma),
+            }
+
+            # 5. 同步库存到ProductMarket
+            await self.sync_product_inventory_to_market(product_market)
+
+            logger.info(f"✅ 第 {month} 月生产周期完成（统一CD）")
+            logger.info(f"   CD产出(件数): {total_qty:.2f} | CD产出价值: ${total_output_value:,.2f} | 成本支出: ${total_cost_spent:,.2f}")
+
+            # 缓存本月生产统计
+            self.production_stats_by_month[month] = production_stats
+            return production_stats
+            
+        except Exception as e:
+            logger.error(f"❌ 第 {month} 月生产周期失败: {e}")
+            # 失败也缓存，便于后续诊断
+            self.production_stats_by_month[month] = production_stats
+            return production_stats
+
+
+    # =========================================================================
+    # Corporate Tax & Financial Settlement
+    # =========================================================================
+    def settle_monthly_corporate_tax(self, month: int) -> Dict[str, float]:
+        """
+        月度企业所得税结算（按净利润计税）。
+
+        结算时点：应在“工资发放完成后、生产补货开始前”执行，以便生产预算上限为：
+        income - corporate_tax - wages。
+
+        税基口径（现金流/费用发生制，与你当前“当月成本K在生产阶段记支出”的记账一致）：
+        - 税前利润 = 当月总收入 − 当月总支出（工资/生产成本/其它费用，不含企业税）
+        - 税额 = max(0, 税前利润) × corporate_tax_rate
+
+        注意：如果你希望把“未售出库存的生产成本”资本化（用 COGS/库存变动来核算利润），
+        这里的税基也应同步切换为“收入−销货成本−工资…”的口径。
+        """
+        if month in self._corporate_tax_settled_months:
+            return {}
+
+        results: Dict[str, float] = {}
+        gov_id = "gov_main_simulation"
+        if gov_id not in self.ledger:
+            # 若政府账本未初始化，直接跳过（避免崩溃）
+            self._corporate_tax_settled_months.add(month)
+            return results
+
+        for company_id in list(self.company_id):
+            if company_id not in self.ledger:
+                self.ledger[company_id] = Ledger.create(company_id, 0.0)
+
+            income = float(self.firm_monthly_financials.get(company_id, {}).get(month, {}).get("income", 0.0) or 0.0)
+            expenses_pre_tax = float(self.firm_monthly_financials.get(company_id, {}).get(month, {}).get("expenses", 0.0) or 0.0)
+            taxable_profit = max(0.0, income - expenses_pre_tax)
+            corporate_tax = taxable_profit * float(self.corporate_tax_rate or 0.0)
+
+            if corporate_tax <= 1e-9:
+                results[company_id] = 0.0
+                continue
+
+            # 🔧 修改：允许企业负债缴税，即使余额为负也要扣税
+            # 这样可以模拟企业即使亏损也需要缴纳企业所得税的情况
+            if self.ledger[company_id].amount < corporate_tax:
+                logger.info(f"💳 Company {company_id} paying tax with insufficient balance: "
+                          f"${self.ledger[company_id].amount:.2f} → ${self.ledger[company_id].amount - corporate_tax:.2f}")
+            
+            # 直接扣税，允许余额变为负数
+            # 如果企业原本就是负债，会进一步增加负债
+            self.ledger[company_id].amount -= corporate_tax
+            self.ledger[gov_id].amount += corporate_tax
+
+            # 账务记录
+            self.record_firm_expense(company_id, corporate_tax)
+            self.record_firm_monthly_expense(company_id, month, corporate_tax)
+            self.firm_monthly_corporate_tax[company_id][month] += corporate_tax
+
+            corp_tax_tx = Transaction(
+                id=str(uuid4()),
+                sender_id=company_id,
+                receiver_id=gov_id,
+                amount=corporate_tax,
+                type='corporate_tax',
+                month=month
+            )
+            self.tx_history.append(corp_tax_tx)
+            results[company_id] = corporate_tax
+
+        self._corporate_tax_settled_months.add(month)
+        return results
+
+    async def _execute_base_production_for_all_firms(
+        self,
+        production_month: int,
+        reference_month: int,
+        sales_data: Dict,
+        firms: List = None,
+        std_jobs=None,
+        production_config: Dict = None,
+    ) -> Dict[str, Any]:
+        """
+        ✨ 简化版生产系统：直接根据利润金额生产
+
+        核心逻辑：
+        1. 区分两类商品：家庭市场商品 vs 固有市场商品
+        2. 家庭销售获得的利润100%用于家庭商品生产
+        3. 固有市场获得的利润100%用于固有市场商品生产
+        4. 生产件数 = 利润 / (售价 × (1 - 毛利率))
+           例如：利润100，售价10，毛利率0.4 → 成本=10×0.6=6 → 生产件数 = 100 / 6 ≈ 16.67件
+        5. 按商品利润优先级分配生产
+
+        Args:
+            production_month: 本次生产发生的月份（成本记账月份）
+            reference_month: 用于指导生产预算的参考月份（通常为上个月；month=1 时为 0）
+        """
+        total_output = 0.0
+        products_restocked = 0
+        firm_production = {}  # 实际生产数量（件数/单位）
+        firm_production_cost = {}  # 本月生产成本支出（现金）
+        firm_production_value = {}  # 本月生产产出按售价估值的总价值
+
+        min_production_per_product = 0.0
+        if isinstance(production_config, dict):
+            try:
+                min_production_per_product = float(production_config.get("min_production_per_product", 0.0) or 0.0)
+            except Exception:
+                min_production_per_product = 0.0
+
+        total_cost_spent = 0.0
+
+        # 遍历所有公司
+        for owner_id, products in self.products.items():
+            if not products:
+                continue
+            if owner_id not in self.company_id:
+                continue
+
+            # 1) 生产预算上限：参考月收入 - 参考月企业税 - 参考月工资支出
+            #    （月初生产：用上个月利润/现金流指导本月补货）
+            if reference_month >= 1:
+                monthly_income = float(self.firm_monthly_financials.get(owner_id, {}).get(reference_month, {}).get("income", 0.0) or 0.0)
+                monthly_corp_tax = float(self.firm_monthly_corporate_tax.get(owner_id, {}).get(reference_month, 0.0) or 0.0)
+                monthly_wages = float(self.firm_monthly_wage_expenses.get(owner_id, {}).get(reference_month, 0.0) or 0.0)
+            else:
+                monthly_income = 0.0
+                monthly_corp_tax = 0.0
+                monthly_wages = 0.0
+
+            budget_upper_raw = max(0.0, monthly_income - monthly_corp_tax - monthly_wages)
+            # 🆕 应用生产预算使用率（默认80%，留20%作为利润）
+            production_budget_rate = float(production_config.get('production_budget_utilization_rate', 0.8) if production_config else 0.8)
+            budget_upper = budget_upper_raw * production_budget_rate
+            # 🔧 大修：允许企业负债经营时，生产成本也允许让余额为负
+            # 生产预算 = 上月利润预算上限（不再受当前现金余额限制）
+            production_budget = budget_upper
+
+            if production_budget <= 1e-6:
+                firm_production[owner_id] = 0.0
+                firm_production_cost[owner_id] = 0.0
+                firm_production_value[owner_id] = 0.0
+                continue
+
+            # 2) 按“销量权重”分配生产预算（销量越高权重越大；无销量也保底1）
+            #    🆕 加入“未满足需求”闭环：w ~ sold_qty + λ * unmet_qty_short
+            unmet_lambda = 1.0
+            if isinstance(production_config, dict):
+                try:
+                    unmet_lambda = float(production_config.get("unmet_demand_lambda", 1.0) or 1.0)
+                except Exception:
+                    unmet_lambda = 1.0
+            unmet_lambda = max(0.0, float(unmet_lambda))
+
+            unmet_month = {}
+            try:
+        # ===== Unmet Demand Tracking =====
+                unmet_month = dict(self.unmet_demand_by_month.get(int(reference_month), {}) or {})
+            except Exception:
+                unmet_month = {}
+
+            weights = {}
+            total_weight = 0.0
+            for p in products:
+                try:
+                    sales_key = (p.product_id, owner_id)
+                    qty_sold = float((sales_data.get(sales_key, {}) or {}).get("quantity_sold", 0.0) or 0.0)
+                except Exception:
+                    qty_sold = 0.0
+                unmet_key = self._unmet_key(getattr(p, "product_id", ""), owner_id)
+                try:
+                    unmet_short = float((unmet_month.get(unmet_key, {}) or {}).get("qty_short", 0.0) or 0.0)
+                except Exception:
+                    unmet_short = 0.0
+                effective_demand = max(0.0, qty_sold) + unmet_lambda * max(0.0, unmet_short)
+                w = max(1.0, effective_demand)
+                weights[p.product_id] = w
+                total_weight += w
+
+            if total_weight <= 0:
+                total_weight = float(len(products))
+
+            # 3) 生产：用预算购买“下月库存”（本月记 production_cost 支出）
+            firm_qty = 0.0
+            firm_cost = 0.0
+            firm_value = 0.0
+
+            for p in products:
+                if not getattr(p, "price", None) or p.price <= 0:
+                    continue
+                # 使用稳定单位成本（base_price 推导），避免价格调整导致“成本随售价变动”
+                self._ensure_product_cost_fields(p)
+                unit_cost = float(getattr(p, "unit_cost", 0.0) or 0.0)
+                if unit_cost <= 1e-6:
+                    unit_cost = max(0.01, float(getattr(p, "base_price", p.price) or p.price) * 0.2)
+
+                alloc_budget = production_budget * (weights.get(p.product_id, 1.0) / total_weight)
+                # 避免对超多商品做极小补货：只有分配预算足够覆盖“最小生产量成本”才生产
+                if min_production_per_product > 0 and alloc_budget < unit_cost * min_production_per_product:
+                    continue
+
+                qty = alloc_budget / unit_cost
+                if qty <= 1e-6:
+                    continue
+
+                p.amount += qty
+                firm_qty += qty
+                firm_cost += qty * unit_cost
+                firm_value += qty * p.price
+                products_restocked += 1
+
+            # 4) 生产成本记为“生产发生月”的企业支出（现金流口径）
+            #    注：销售侧不再扣“成本”，成本发生在生产补货时。
+            if firm_cost > 1e-6:
+                self.ledger[owner_id].amount -= firm_cost
+                self.record_firm_expense(owner_id, firm_cost)
+                self.record_firm_monthly_expense(owner_id, production_month, firm_cost)
+                self.firm_monthly_production_cost[owner_id][production_month] += firm_cost
+
+            firm_production[owner_id] = firm_qty
+            firm_production_cost[owner_id] = firm_cost
+            firm_production_value[owner_id] = firm_value
+
+            total_output += firm_qty
+            total_cost_spent += firm_cost
+
+        return {
+            "total_output": total_output,
+            "products_restocked": products_restocked,
+            "firm_production": firm_production,
+            "firm_production_cost": firm_production_cost,
+            "firm_production_value": firm_production_value,
+            "total_production_cost": total_cost_spent,
+        }
+
+    async def _decide_research_share_with_llm(
+        self, firm, month: int, llm_client=None, model: str = "deepseek-chat"
+    ) -> float:
+        """
+        使用大模型动态决策企业的研发投入比例 ρ
+
+        输入信息：
+        - 公司行业（industry）
+        - 当月利润（monthly_profit）
+        - 毛利率（profit_margin）
+        - 政策信号（policy_encourage_innovation）
+        - 销量情况（sales_trend）
+
+        Returns:
+            float: 研发投入比例 ρ ∈ [0, 1]
+        """
+        try:
+            # 1. 检查创新策略：抑制创新也允许LLM决策，但限制较低上限
+            config = self.firm_innovation_config.get(firm.company_id)
+            if not config:
+                logger.warning(f"企业 {firm.company_id} 没有创新配置，使用默认值")
+                return 0.0
+            
+            strategy = config.innovation_strategy
+            is_suppressed = strategy == "suppressed"
+            max_research_share = 0.05 if is_suppressed else 0.3
+
+            # 2. 收集企业信息
+            industry = getattr(firm, 'main_business', 'Unknown')
+
+            # 获取当月财务数据
+            current_financials = self.firm_monthly_financials.get(firm.company_id, {}).get(month, {})
+            monthly_income = current_financials.get("income", 0.0)
+            monthly_expenses = current_financials.get("expenses", 0.0)
+            monthly_profit = monthly_income - monthly_expenses
+
+            # 获取毛利率（优先从配置中获取，否则从行业映射获取）
+            profit_margin = config.profit_margin if config.profit_margin is not None else self.category_profit_margins.get(industry, 25.0)
+
+            # 获取政策信号
+            policy_signal = strategy == "encouraged"
+
+            # 获取销量趋势（对比上月）
+            prev_month = month - 1
+            if prev_month > 0:
+                prev_financials = self.firm_monthly_financials.get(firm.company_id, {}).get(prev_month, {})
+                prev_income = prev_financials.get("income", 0.0)
+                if prev_income > 0:
+                    sales_trend = ((monthly_income - prev_income) / prev_income) * 100
+                else:
+                    sales_trend = 0.0
+            else:
+                sales_trend = 0.0
+
+            # 3. 构建 Prompt
+            innovation_status = "suppressed (keep R&D share very small, ideally ≤ 0.05)" if is_suppressed else "encouraged/flexible"
+            prompt = f"""You are a strategic advisor for a company making R&D investment decisions.
+
+Company Information:
+- Industry: {industry}
+- Monthly Profit: ${monthly_profit:.2f}
+- Profit Margin: {profit_margin:.1f}%
+- Policy Encouragement: {'Yes' if policy_signal else 'No'}
+- Innovation Status: {innovation_status}
+- Sales Trend (vs last month): {sales_trend:+.1f}%
+- Current Month: {month}
+
+Task: Decide what proportion (ρ) of the company's workforce should be allocated to R&D instead of production.
+
+Important Constraints:
+- Allocating ρ of workers to R&D reduces current production capacity by the same proportion.
+- Successful R&D increases future production capacity, but only probabilistically and with uncertain magnitude.
+- Excessively high ρ may severely hurt current output and destabilize the company.
+- Too low ρ slows innovation and can cause long-term competitiveness loss.
+- You must choose ρ such that the trade-off between short-term production loss and potential long-term gains remains reasonable and sustainable for the company.
+
+Considerations:
+1. If profit is negative or very low, prioritize production (low ρ).
+2. If policy encourages innovation, consider higher ρ.
+3. If sales are declining, innovation may help regain market share.
+4. If profit margin is high, the company can afford more R&D.
+5. Different industries have different innovation needs.
+6. If innovation status is "suppressed", keep ρ extremely small (≤ 0.05) but not zero.
+7. Always ensure ρ does not compromise baseline operational production.
+
+Output Format:
+Provide ONLY a single number between 0.0 and 1.0 representing the R&D workforce proportion.
+Example valid outputs: 0.0, 0.05, 0.1, 0.15, 0.2
+Do NOT output any explanation, just the number.
+"""
+
+            # 4. 调用大模型（如果提供了client）
+            try:
+                from openai import AsyncOpenAI
+                llm_client = AsyncOpenAI(
+                    api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+                    base_url=os.getenv("BASE_URL", ""),
+                    timeout=60.0  # 设置60秒超时
+                )
+                model = os.getenv("MODEL", "")
+                response = await llm_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a strategic business advisor."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                # 解析响应
+                content = response.choices[0].message.content.strip()
+                research_share = float(content)
+
+                # 限制在合理范围内，根据策略调整上限
+                research_share = max(0.0, min(max_research_share, research_share))
+
+                print(f"🤖 企业 {firm.company_id} LLM决策: 研发比例={research_share:.1%} "
+                            f"(利润=${monthly_profit:.0f}, 趋势={sales_trend:+.1f}%)")
+
+                return research_share
+
+            except Exception as e:
+                logger.warning(f"LLM决策失败 {firm.company_id}: {e}, 使用默认规则")
+
+            # 5. 回退方案：基于规则的决策
+            print(f"🔍 企业 {firm.company_id} 规则决策: 利润={monthly_profit:.0f}, 毛利率={profit_margin:.1f}%，政策信号={policy_signal}, 销量趋势={sales_trend:+.1f}%")
+            research_share = self._decide_research_share_rule_based(
+                monthly_profit, profit_margin, policy_signal, sales_trend
+            )
+
+            logger.debug(f"📊 企业 {firm.company_id} 规则决策: 研发比例={research_share:.1%}")
+
+            research_share = max(0.0, min(max_research_share, research_share))
+            return research_share
+
+        except Exception as e:
+            logger.error(f"决策研发比例失败 {firm.company_id}: {e}")
+            return 0.0
+
+    def _decide_research_share_rule_based(
+        self, monthly_profit: float, profit_margin: float,
+        policy_signal: bool, sales_trend: float
+    ) -> float:
+        """
+        基于规则的研发投入决策（LLM的回退方案）
+
+        Returns:
+            float: 研发投入比例 ρ ∈ [0, 1]
+        """
+        # 基础研发比例
+        base_share = 0.0
+
+        # 1. 利润足够才考虑研发
+        if monthly_profit <= 0:
+            return 0.0
+
+        # 2. 政策鼓励创新
+        if policy_signal:
+            base_share = 0.1  # 10%基础
+
+        # 3. 销量下降，增加研发投入抢市场
+        if sales_trend < -5:  # 销量下降超过5%
+            base_share += 0.05
+
+        # 4. 高毛利率行业可以承担更多研发
+        if profit_margin > 35:
+            base_share += 0.03
+        elif profit_margin > 25:
+            base_share += 0.01
+
+        # 5. 利润很高，可以多投研发
+        if monthly_profit > 10000:
+            base_share += 0.02
+
+        # 限制在合理范围
+        return max(0.0, min(0.25, base_share))
+
+    async def _calculate_effective_labor_force(self, firm, month:int = 0, std_jobs = None) -> Dict[str, float]:
+        """
+        计算企业的有效劳动力
+        根据员工技能与工作要求的匹配度计算有效劳动力系数
+        
+        Args:
+            firm: 企业对象
+            month: 月份
+        Returns:
+            Dict: 包含总员工数、有效劳动力、平均匹配分数等信息
+        """
+        try:
+            # 获取企业所有活跃员工
+            employees = firm.get_all_employees()
+            if not employees:
+                return {
+                    "total_employees": 0,
+                    "effective_labor": 0.0,
+                    "avg_match_score": 0.0,
+                    "skill_details": []
+                }
+            
+            total_match_score = 0.0
+            skill_details = []
+            
+            # 计算每个员工的技能匹配度 (针对其具体职位)
+            for employee in employees:
+                employee_skills = employee.get("skills", {})
+                employee_abilities = employee.get("abilities", {})
+                job_title = employee.get("job_title", "")
+                job_soc = employee.get("job_soc", "")
+                
+                # 为该员工获取其具体职位的技能要求
+                job_requirements = self._get_job_requirements_by_soc(job_soc, std_jobs)
+                
+                # 计算该员工与其职位要求的匹配分数
+                job_skills = job_requirements.get("skills", {})
+                job_abilities = job_requirements.get("abilities", {})
+                
+                
+                match_score = self._calculate_skill_match_score(
+                    employee_skills,
+                    employee_abilities,
+                    job_skills,
+                    job_abilities
+                )
+                
+                total_match_score += match_score
+                skill_details.append({
+                    "employee": f"{employee.get('household_id')}_{employee.get('lh_type')}",
+                    "job_title": job_title,
+                    "job_soc": job_soc,
+                    "match_score": match_score,
+                    "skills_count": len(employee_skills),
+                    "abilities_count": len(employee_abilities)
+                })
+                
+                logger.debug(f"员工 {employee.get('household_id')}_{employee.get('lh_type')} ({job_soc}) 技能匹配度: {match_score:.3f}")
+            
+            # 计算平均匹配分数和有效劳动力
+            avg_match_score = total_match_score / len(employees)
+            effective_labor = total_match_score  # 有效劳动力 = 所有员工匹配分数之和
+
+            # 研发占比：仅在启用创新模块时才调用LLM，避免在常规模式下引入额外不确定性与开销
+            research_share = 0.0
+            if bool(getattr(self, "enable_innovation_module", False)):
+                try:
+                    research_share = await self._decide_research_share_with_llm(firm, month)
+                    self.firm_research_share.append({firm.company_id: [research_share, month]})
+                except Exception as e:
+                    logger.error(f"计算企业 {firm.company_id} 研发比例失败: {e}")
+                    research_share = 0.0
+
+            research_share = max(0.0, min(1.0, research_share))
+            production_effective_labor = effective_labor * (1 - research_share)
+            research_effective_labor = effective_labor - production_effective_labor
+
+            return {
+                "total_employees": len(employees),
+                "effective_labor": effective_labor,
+                "production_effective_labor": production_effective_labor,
+                "research_effective_labor": research_effective_labor,
+                "research_share": research_share,
+                "avg_match_score": avg_match_score,
+                "skill_details": skill_details
+            }
+            
+        except Exception as e:
+            logger.error(f"计算企业 {firm.company_id} 有效劳动力失败: {e}")
+            return {
+                "total_employees": 0,
+                "effective_labor": 0.0,
+                "avg_match_score": 0.0,
+                "skill_details": []
+            }
+
+
+    # =========================================================================
+    # Firm Production & Labor Efficiency
+    # =========================================================================
+    def estimate_firm_labor_efficiency_no_llm(self, firms: List[Any], std_jobs=None) -> Dict[str, Dict[str, float]]:
+        """
+        估算企业有效劳动力（不调用LLM，research_share=0）。
+
+        用途：
+        - Month1 预就业后立刻做“GDP→K→A”的CD校准，避免依赖月末销量与LLM决策。
+        - 也可用于调试/离线口径对齐。
+        """
+        results: Dict[str, Dict[str, float]] = {}
+        for firm in (firms or []):
+            try:
+                cid = str(getattr(firm, "company_id", "") or "")
+            except Exception:
+                cid = ""
+            if not cid:
+                continue
+            try:
+                employees = firm.get_all_employees()
+            except Exception:
+                employees = []
+            if not employees:
+                results[cid] = {
+                    "total_employees": 0,
+                    "effective_labor": 0.0,
+                    "production_effective_labor": 0.0,
+                    "avg_match_score": 0.0,
+                    "research_share": 0.0,
+                }
+                continue
+
+            total_match_score = 0.0
+            for employee in employees:
+                try:
+                    employee_skills = employee.get("skills", {}) or {}
+                    employee_abilities = employee.get("abilities", {}) or {}
+                    job_soc = employee.get("job_soc", "") or ""
+                except Exception:
+                    employee_skills = {}
+                    employee_abilities = {}
+                    job_soc = ""
+
+                job_requirements = self._get_job_requirements_by_soc(job_soc, std_jobs)
+                job_skills = (job_requirements or {}).get("skills", {}) or {}
+                job_abilities = (job_requirements or {}).get("abilities", {}) or {}
+                try:
+                    match_score = float(
+                        self._calculate_skill_match_score(
+                            employee_skills, employee_abilities, job_skills, job_abilities
+                        )
+                    )
+                except Exception:
+                    match_score = 0.0
+                total_match_score += max(0.0, match_score)
+
+            n = max(1, len(employees))
+            avg_match = total_match_score / float(n)
+            effective_labor = float(total_match_score)
+            results[cid] = {
+                "total_employees": int(len(employees)),
+                "effective_labor": float(effective_labor),
+                "production_effective_labor": float(effective_labor),
+                "avg_match_score": float(avg_match),
+                "research_share": 0.0,
+            }
+        return results
+    
+    def _get_job_requirements_by_soc(self, soc_code: str, std_jobs = None) -> Dict:
+        """
+        根据单个SOC Code获取具体职位的技能要求
+        
+        Args:
+            soc_code: O*NET-SOC Code
+            std_jobs: 标准工作数据
+            
+        Returns:
+            Dict: 包含skills和abilities要求的字典
+        """
+        try:
+            if std_jobs is None or std_jobs.empty or not soc_code:
+                return self._get_default_job_requirements()
+            
+            # 在std_jobs中查找匹配的工作
+            matching_jobs = std_jobs[std_jobs['O*NET-SOC Code'] == soc_code]
+            if not matching_jobs.empty:
+                job_info = matching_jobs.iloc[0]
+                job_skills = job_info.get('skills', {})
+                job_abilities = job_info.get('abilities', {})
+                
+                logger.debug(f"找到SOC {soc_code}的工作要求: {job_info.get('Title', 'Unknown')}")
+                
+                return {
+                    "skills": job_skills if isinstance(job_skills, dict) else {},
+                    "abilities": job_abilities if isinstance(job_abilities, dict) else {}
+                }
+            else:
+                logger.debug(f"未找到SOC {soc_code}的工作要求，使用默认要求")
+                
+        except Exception as e:
+            logger.error(f"获取SOC {soc_code}工作要求失败: {e}")
+
+
+    def _calculate_skill_match_score(self, worker_skills: Dict, worker_abilities: Dict,
+                                   job_skills: Dict, job_abilities: Dict) -> float:
+        """
+        计算工人技能与工作要求的匹配分数
+        返回 0-1 之间的分数，表示匹配度
+        """
+        total_score = 0
+        total_weight = 0
+        
+        # 计算技能匹配分数
+        for skill_name, skill_req in job_skills.items():
+            if skill_name in worker_skills:
+                required_mean = skill_req.get('mean', 50)
+                required_std = skill_req.get('std', 10)
+                importance = skill_req.get('importance', 1.0)
+
+                worker_value = worker_skills[skill_name]
+
+                # 计算匹配度，防止除零错误
+                if required_std > 0 and required_mean > 0:
+                    # 使用标准化距离计算匹配度（类似于jobmarket.py的算法）
+                    distance = abs(worker_value - required_mean) / required_std
+                    skill_score = max(0, 1 - distance / 3)  # 3个标准差外为0分
+                else:
+                    # 如果std或mean为0，使用简单比较
+                    if required_mean > 0:
+                        skill_score = min(worker_value / required_mean, 1.0)
+                    else:
+                        # 如果要求值为0，使用默认匹配分数
+                        skill_score = 0.5
+
+                # 如果importance为0，跳过这个技能
+                if importance > 0:
+                    total_score += skill_score * importance
+                    total_weight += importance
+            else:
+                # 缺少技能的惩罚
+                importance = skill_req.get('importance', 1.0)
+                if importance > 0:
+                    total_score += 0.3 * importance  # 给予30%的基础分
+                    total_weight += importance
+        
+        # 计算能力匹配分数
+        for ability_name, ability_req in job_abilities.items():
+            if ability_name in worker_abilities:
+                required_mean = ability_req.get('mean', 50)
+                required_std = ability_req.get('std', 10)
+                importance = ability_req.get('importance', 1.0)
+
+                worker_value = worker_abilities[ability_name]
+
+                # 计算匹配度，防止除零错误
+                if required_std > 0 and required_mean > 0:
+                    # 使用标准化距离计算匹配度
+                    distance = abs(worker_value - required_mean) / required_std
+                    ability_score = max(0, 1 - distance / 3)  # 3个标准差外为0分
+                else:
+                    # 如果std或mean为0，使用简单比较
+                    if required_mean > 0:
+                        ability_score = min(worker_value / required_mean, 1.0)
+                    else:
+                        # 如果要求值为0，使用默认匹配分数
+                        ability_score = 0.5
+
+                # 如果importance为0，跳过这个能力
+                if importance > 0:
+                    total_score += ability_score * importance
+                    total_weight += importance
+            else:
+                # 缺少能力的惩罚
+                importance = ability_req.get('importance', 1.0)
+                if importance > 0:
+                    total_score += 0.3 * importance  # 给予30%的基础分
+                    total_weight += importance
+        
+        # 返回加权平均分数
+        return total_score / total_weight if total_weight > 0 else 0.5
+
+    async def _execute_labor_based_production(
+        self, month: int, sales_data: Dict, labor_market, product_market=None, firms: List = None, std_jobs = None, production_config: Dict = None, innovation_config: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        为有工人的公司执行基于劳动力的额外生产
+        考虑员工技能匹配度计算有效劳动力
+        """
+        total_output = 0.0
+        companies_with_workers = 0
+        firm_labor_efficiency = {}  # 记录每家企业的劳动效率
+        firm_labor_production = {}  # 记录每家企业的劳动力生产量
+        firm_labor_production_value = {}  # 记录每家企业劳动力生产的总价值（按售价估值）
+
+        firm_research_labor = {}
+        total_research_effective_labor = 0.0
+        policy_signal = None if innovation_config is None else innovation_config.get("policy_signal", None)
+        
+        # 创新模块：记录每家企业创新到达率和到达次数
+        firm_innovation_arrival_rate = {}  # Λ_t = λ * (research_effective_labor)^beta
+        firm_innovation_arrivals = {}  # 泊松采样得到的创新到达次数
+        try:
+            # 计算每家企业的有效劳动力
+            if firms:
+                for firm in firms:
+                    if firm.get_employees() > 0:  # 只处理有员工的企业
+                        try:
+                            effective_labor = await self._calculate_effective_labor_force(firm, month, std_jobs)
+                            firm_labor_efficiency[firm.company_id] = effective_labor
+                            # jiaju_add_4 start 计算创新到达率和次数 核心代码
+                            if self.enable_innovation_module:
+                                if policy_signal is not None:
+                                    effective_labor['policy_signal'] = policy_signal
+                                research_eff = effective_labor.get('research_effective_labor', 0.0)
+                                firm_research_labor[firm.company_id] = research_eff
+                                total_research_effective_labor += research_eff
+                                
+                                # 计算创新到达率 Λ_t = λ * (research_effective_labor)^beta
+                                if innovation_config and innovation_config.get('enable_innovation_module', False):
+                                    innovation_lambda = innovation_config.get('innovation_lambda', 0.05)
+                                    innovation_beta = innovation_config.get('innovation_concavity_beta', 0.6)
+                                    
+                                    # Λ_t = λ * (effective_research_labor)^beta
+                                    if research_eff > 0:
+                                        innovation_arrival_rate = innovation_lambda * (research_eff ** innovation_beta)
+                                    else:
+                                        innovation_arrival_rate = 0.0
+                                    
+                                    # 限制到达率在合理范围内（避免过大）
+                                    innovation_arrival_rate = min(innovation_arrival_rate, 10.0)  # 最大每月10次
+                                    
+                                    firm_innovation_arrival_rate[firm.company_id] = innovation_arrival_rate
+                                    
+                                    # 泊松采样：从泊松分布中采样创新到达次数
+                                    # 泊松分布的参数为 Λ_t，采样结果表示本月创新发生的次数（非负整数）
+                                    # 注：P(至少发生1次) = 1 - exp(-Λ_t)，但这里我们直接采样次数（innovation_arrivals为非负整数）
+                                    if innovation_arrival_rate > 0:
+                                        innovation_arrivals = np.random.poisson(innovation_arrival_rate)
+                                    else:
+                                        innovation_arrivals = 0
+                                    
+                                    firm_innovation_arrivals[firm.company_id] = innovation_arrivals
+                                    
+                                    print(
+                                        f"🔬 企业 {firm.company_id} 创新: 研发有效劳动力={research_eff:.2f}, "
+                                        f"到达率Λ_t={innovation_arrival_rate:.4f}, 本月到达次数={innovation_arrivals}"
+                                    )
+                                # jiaju_add_4 end
+                                print(f"🏭 企业 {firm.company_id} 有效劳动力: {effective_labor['effective_labor']:.2f} (员工数: {firm.get_employees()})")
+                        except Exception as e:
+                            logger.error(f"计算企业 {firm.company_id} 劳动效率失败: {e}")
+                            firm_labor_efficiency[firm.company_id] = {"total_employees": 0, "effective_labor": 0.0, "avg_match_score": 0.0}
+                            # 初始化创新到达次数为0，避免后续访问时出现KeyError
+                            firm_innovation_arrivals[firm.company_id] = 0
+            
+            # 获取所有有工人的公司
+            companies_with_employees = await self._get_companies_with_employees(labor_market)
+            
+            for company_id, employee_count in companies_with_employees.items():
+                if employee_count == 0:
+                    continue
+                    
+                companies_with_workers += 1
+                # jiaju_add_5 start 获取信息
+                # 获取该企业的有效劳动力信息
+                labor_info = firm_labor_efficiency.get(
+                    company_id, {"effective_labor": employee_count, "avg_match_score": 1.0}
+                )
+                production_labor = labor_info.get("production_effective_labor", labor_info.get("effective_labor", employee_count))
+                research_share = labor_info.get("research_share", 0.0)
+
+                # 获取该企业的创新到达次数，如果不存在则默认为0
+                innovation_arrivals = firm_innovation_arrivals.get(company_id, 0)
+
+                # 如果有创新到达，先处理创新到达（更新 labor_productivity_factor），以便影响本月生产
+                if innovation_arrivals > 0 and innovation_config and innovation_config.get('enable_innovation_module', False):
+                    await self.handle_innovation_arrival(company_id, month, innovation_arrivals, innovation_config, product_market)
+                
+                # 计算该公司的劳动力产出 (使用有效劳动力而不是员工数量)
+                # 注意：如果有创新到达，这里会使用更新后的 labor_productivity_factor
+                company_output, company_output_value = await self._calculate_company_labor_production(
+                    company_id, production_labor * (1 - research_share), sales_data, production_config
+                )
+
+                total_output += company_output
+                firm_labor_production[company_id] = company_output  # 记录该企业的劳动力生产量
+
+                # 精确价值：由 _calculate_company_labor_production 按“产品维度增量×售价”累加得到
+                firm_labor_production_value[company_id] = float(company_output_value)
+                # 同步到月度统计容器（供外部导出/汇总）
+                self.firm_monthly_labor_production_value[company_id][month] += float(company_output_value)
+
+                logger.debug(
+                    f"劳动力生产: 公司 {company_id} 员工 {employee_count} 人，产出 {company_output:.2f} | 研发份额 {research_share:.2f} | 创新到达 {innovation_arrivals}"
+                )
+
+        except Exception as e:
+            logger.warning(f"劳动力生产计算失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return {
+            "total_output": total_output,
+            "companies_count": companies_with_workers,
+            "firm_labor_efficiency": firm_labor_efficiency,
+            "firm_labor_production": firm_labor_production,  # 新增：每个企业的劳动力生产量
+            "firm_labor_production_value": firm_labor_production_value,
+            "total_labor_production_value": sum(firm_labor_production_value.values()) if firm_labor_production_value else 0.0,
+            "firm_research_labor": firm_research_labor,
+            "total_research_effective_labor": total_research_effective_labor,
+            "firm_innovation_arrival_rate": firm_innovation_arrival_rate,  # 创新到达率 Λ_t
+            "firm_innovation_arrivals": firm_innovation_arrivals  # 泊松采样的创新到达次数
+        }
+        # jiaju_add_5 end
+
+    async def handle_innovation_arrival(self, company_id: str, month: int, innovation_arrivals: int, innovation_config: Dict = None, product_market=None):
+        """
+        处理创新到达 随机选择三种方式
+        1. 降价+提高产量（原先的update_prices_innovation_arrival方法）
+        2. 涨价+提升商品属性
+        3. 提高毛利率
+        
+        Args:
+            company_id: 公司ID
+            month: 月份
+            innovation_arrivals: 创新到达次数
+            innovation_config: 创新配置
+            product_market: 商品市场对象（可选，用于同步更新）
+        """
+        # 防御：未开启创新模块时，直接忽略
+        if (not self.enable_innovation_module) or (not isinstance(innovation_config, dict)) or (not innovation_config.get("enable_innovation_module", False)):
+            return
+
+        if innovation_arrivals > 0:
+            for i in range(innovation_arrivals):
+                innovation_type = random.choice([1, 2, 3])
+                if innovation_type == 1:
+                    await self.update_prices_innovation_arrival(company_id, innovation_config.get('innovation_gamma', 1.2), month)
+                elif innovation_type == 2:
+                    await self.update_product_attributes_innovation_arrival(company_id, innovation_config.get('innovation_gamma', 1.2), month)
+                elif innovation_type == 3:
+                    await self.update_profit_margin_innovation_arrival(company_id, innovation_config.get('innovation_gamma', 1.2), month)
+            
+            # 创新到达后，同步更新到商品市场
+            if product_market is not None:
+                try:
+                    # 收集该公司所有更新的商品
+                    if company_id in self.products:
+                        company_products = [p for p in self.products[company_id] if p.amount > 0]
+                        if company_products:
+                            await product_market.update_products_from_economic_center.remote(company_products)
+                            logger.info(f"已同步公司 {company_id} 的创新更新到商品市场（{len(company_products)} 个商品）")
+                except Exception as e:
+                    logger.warning(f"同步创新更新到商品市场失败: {e}")
+
+    async def update_prices_innovation_arrival(self, company_id: str, gamma: float = 1.2, month: int = 0):
+        """
+        更新公司价格和创新到达次数
+        """
+        if company_id not in self.products or not self.products[company_id]:
+            return
+        price_change = np.sqrt(gamma)
+        for product in self.products[company_id]:
+            product.price = product.price * (1/price_change)
+        print(f"🔬 公司 {company_id} {month}月价格变化 {price_change}")
+
+        if company_id not in self.firm_innovation_config:
+            logger.warning(f"公司 {company_id} 没有创新配置，无法更新劳动力因素")
+            return
+        
+        config = self.firm_innovation_config[company_id]
+        old_labor_production = config.labor_productivity_factor
+        new_labor_production = old_labor_production * gamma
+        print(f"🔬 公司 {company_id} {month}月劳动力因素变化 {old_labor_production} -> {new_labor_production}")
+        
+        # 直接更新字典中存储的对象属性，确保修改立即生效
+        self.firm_innovation_config[company_id].labor_productivity_factor = new_labor_production
+
+        self.add_innovation_event(
+            company_id=company_id,
+            month=month,
+            innovation_type='price',
+            price_change=price_change
+        )
+        self.add_innovation_event(
+            company_id=company_id,
+            month=month,
+            innovation_type='labor_productivity_factor',
+            old_value=old_labor_production,
+            new_value=new_labor_production
+        )
+
+    async def update_product_attributes_innovation_arrival(self, company_id: str, gamma: float = 1.2, month: int = 0):
+        """
+        更新公司商品属性
+        """
+        if company_id not in self.products or not self.products[company_id]:
+            return
+        
+        def _scale_numeric_fields(payload: Any, multiplier: float):
+            """
+            递归放大字典/列表中的数值字段，保持其余结构不变。
+            """
+            if isinstance(payload, dict):
+                return {k: _scale_numeric_fields(v, multiplier) for k, v in payload.items()}
+            if isinstance(payload, list):
+                return [_scale_numeric_fields(v, multiplier) for v in payload]
+            if isinstance(payload, (int, float)):
+                return payload * multiplier
+            return payload
+
+        updated_products = 0
+        for product in self.products[company_id]:
+            before_snapshot = {
+                "attributes": copy.deepcopy(product.attributes) if isinstance(product.attributes, (dict, list)) else product.attributes,
+                "nutrition": copy.deepcopy(product.nutrition_supply) if isinstance(product.nutrition_supply, (dict, list)) else product.nutrition_supply,
+                "satisfaction": copy.deepcopy(product.satisfaction_attributes) if isinstance(product.satisfaction_attributes, (dict, list)) else product.satisfaction_attributes,
+            }
+
+            if product.attributes:
+                product.attributes = _scale_numeric_fields(product.attributes, gamma)
+            if product.nutrition_supply:
+                product.nutrition_supply = _scale_numeric_fields(product.nutrition_supply, gamma)
+            if product.satisfaction_attributes:
+                product.satisfaction_attributes = _scale_numeric_fields(product.satisfaction_attributes, gamma)
+
+            # 如果有任何字段发生变化，则记录
+            if before_snapshot["attributes"] != product.attributes or \
+               before_snapshot["nutrition"] != product.nutrition_supply or \
+               before_snapshot["satisfaction"] != product.satisfaction_attributes:
+                updated_products += 1
+
+        if updated_products > 0:
+            print(f"🔬 公司 {company_id} {month}月商品属性提升: 放大系数={gamma}, 受影响商品={updated_products} 件")
+            self.add_innovation_event(
+                company_id=company_id,
+                month=month,
+                innovation_type='attribute',
+                attribute_change=gamma
+            )
+
+    async def update_profit_margin_innovation_arrival(self, company_id: str, gamma: float = 1.2, month: int = 0):
+        """
+        更新公司毛利率
+        """
+        if company_id not in self.firm_innovation_config:
+            logger.warning(f"公司 {company_id} 没有创新配置，无法更新毛利率")
+            return
+        
+        config = self.firm_innovation_config[company_id]
+        if config.profit_margin is None:
+            logger.warning(f"公司 {company_id} 毛利率为None，无法更新")
+            return
+        
+        old_profit_margin = config.profit_margin
+        new_profit_margin = old_profit_margin * gamma
+        print(f"🔬 公司 {company_id} {month}月毛利率变化 {old_profit_margin} -> {new_profit_margin}")
+        
+        # 直接更新字典中存储的对象属性，确保修改立即生效
+        self.firm_innovation_config[company_id].profit_margin = new_profit_margin
+
+        self.add_innovation_event(
+            company_id=company_id,
+            month=month,
+            innovation_type='profit_margin',
+            old_value=old_profit_margin,
+            new_value=new_profit_margin
+        )
+
+    async def _get_companies_with_employees(self, labor_market) -> Dict[str, int]:
+        """
+        获取所有有员工的公司及其员工数量
+        """
+        companies_employees = {}
+        
+        try:
+            # 从劳动力市场获取所有匹配的工作
+            matched_jobs = await labor_market.query_matched_jobs.remote()
+            
+            # 统计每个公司的员工数量
+            for job in matched_jobs:
+                company_id = job.company_id
+                companies_employees[company_id] = companies_employees.get(company_id, 0) + 1
+        
+        except Exception as e:
+            logger.warning(f"获取公司员工数据失败: {e}")
+        
+        return companies_employees
+
+    async def _calculate_company_labor_production(
+        self, company_id: str, employee_count: int, sales_data: Dict, production_config: Dict = None
+    ) -> Tuple[float, float]:
+        """
+        计算单个公司基于劳动力的产出
+        使用简化的柯布-道格拉斯生产函数（价值口径）: V = A × L^α
+        - V: 劳动力生产的“产出总价值”（按售价估值，不含税），用于与工资支出对齐校准 A
+        - 将 V 按商品优先级分配到具体SKU，再按当前售价换算为件数并增加库存
+        
+        Args:
+            employee_count: 有效劳动力数量
+            production_config: 生产配置参数
+        """
+        if company_id not in self.products or not self.products[company_id]:
+            return 0.0, 0.0
+        
+        labor_elasticity = production_config.get('labor_elasticity', 0.7) if production_config else 0.7
+        # 读取 A（优先 company->industry->firm_config->global）
+        firm_productivity_factor = None
+        if isinstance(production_config, dict):
+            company_factors = production_config.get("company_labor_productivity_factors") or {}
+            if isinstance(company_factors, dict):
+                try:
+                    v = float(company_factors.get(company_id, 0.0) or 0.0)
+                    if v > 0:
+                        firm_productivity_factor = v
+                except Exception:
+                    firm_productivity_factor = None
+
+            if firm_productivity_factor is None:
+                industry_factors = production_config.get("industry_labor_productivity_factors") or {}
+                company_industries = production_config.get("company_industries") or {}
+                industry = None
+                if isinstance(company_industries, dict):
+                    industry = company_industries.get(company_id)
+                if not industry:
+                    # 回退：用企业商品的主分类猜测行业
+                    try:
+                        industry = getattr(self.products[company_id][0], "classification", None)
+                    except Exception:
+                        industry = None
+                if isinstance(industry_factors, dict) and industry:
+                    try:
+                        v = float(industry_factors.get(industry, 0.0) or 0.0)
+                        if v > 0:
+                            firm_productivity_factor = v
+                    except Exception:
+                        firm_productivity_factor = None
+
+        if firm_productivity_factor is None:
+            config = self.firm_innovation_config.get(company_id)
+            try:
+                v = float(getattr(config, "labor_productivity_factor", 0.0) or 0.0) if config else 0.0
+                if v > 0:
+                    firm_productivity_factor = v
+            except Exception:
+                firm_productivity_factor = None
+
+        if firm_productivity_factor is None:
+            firm_productivity_factor = production_config.get('labor_productivity_factor', 30.0) if production_config else 30.0
+
+        # 计算总的劳动力产出总价值: V = A × L^α
+        try:
+            effective_labor = float(employee_count or 0.0)
+        except Exception:
+            effective_labor = 0.0
+        effective_labor = max(0.0, effective_labor)
+        total_labor_output_value = float(firm_productivity_factor) * (effective_labor ** float(labor_elasticity))
+        
+        # 根据销量情况分配产出到不同产品
+        # 🔧 优先按照"家庭购买过的商品"的销量占比进行分配；
+        #    若当月无任何家庭购买记录，则回退到原有的销量/库存优先级规则。
+        company_products = self.products[company_id]
+        product_priorities = {}
+        household_sum = 0.0
+        
+        # 计算每个产品的优先级（仅对可定价商品分配）
+        for product in company_products:
+            price = float(getattr(product, "price", 0.0) or 0.0)
+            if price <= 0:
+                continue
+            product_id = product.product_id
+            sales_key = (product_id, company_id)
+            
+            # 计算优先级分数（基于销量和库存水平）
+            # 使用 (product_id, company_id) 作为key查找销量数据
+            if sales_key in sales_data:
+                # 有销售记录：基于销量计算优先级
+                sales_info = sales_data[sales_key]
+                quantity_sold = sales_info.get("quantity_sold", 0)
+                demand_level = sales_info.get("demand_level", "normal")
+                
+                # 计算优先级分数
+                priority_score = quantity_sold
+                if demand_level == "high":
+                    priority_score *= 2.0
+                elif demand_level == "low":
+                    priority_score *= 0.5
+                
+                product_priorities[product_id] = priority_score
+                hh_qty = float(sales_info.get("household_quantity", 0.0) or 0.0)
+                household_sum += hh_qty
+            else:
+                # 🔧 修改：无销售记录的商品也参与劳动力生产（可能是库存为0）
+                # 基于库存水平计算优先级
+                if product.amount == 0:
+                    # 库存为0的商品，给予中等优先级（相当于销量10）
+                    priority_score = 10.0
+                elif product.amount < 50:
+                    # 低库存商品，给予较低优先级（相当于销量5）
+                    priority_score = 5.0
+                else:
+                    # 高库存商品，给予最低优先级（相当于销量1）
+                    priority_score = 1.0
+                
+                product_priorities[product_id] = priority_score
+                logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
+        
+        # 若有家庭购买记录，则按家庭销量占比分配；
+        # 否则回退到基于销量/库存的优先级逻辑。
+        if household_sum == 0.0:
+            product_priorities = {}
+            for product in company_products:
+                price = float(getattr(product, "price", 0.0) or 0.0)
+                if price <= 0:
+                    continue
+                product_id = product.product_id
+                sales_key = (product_id, company_id)
+                if sales_key in sales_data:
+                    sales_info = sales_data[sales_key]
+                    quantity_sold = sales_info.get("quantity_sold", 0)
+                    demand_level = sales_info.get("demand_level", "normal")
+                    priority_score = quantity_sold
+                    if demand_level == "high":
+                        priority_score *= 2.0
+                    elif demand_level == "low":
+                        priority_score *= 0.5
+                    product_priorities[product_id] = priority_score
+                else:
+                    if product.amount == 0:
+                        priority_score = 10.0
+                    elif product.amount < 50:
+                        priority_score = 5.0
+                    else:
+                        priority_score = 1.0
+                    product_priorities[product_id] = priority_score
+                    logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
+        
+        # 按优先级分配产出
+        total_priority = sum(product_priorities.values())
+        actual_output = 0.0
+        actual_output_value = 0.0
+        
+        if total_priority > 0:
+            for product in company_products:
+                product_id = product.product_id
+                
+                # 只处理有优先级的产品（现在所有产品都有优先级）
+                if product_id not in product_priorities:
+                    continue
+                
+                priority = product_priorities[product_id]
+                
+                price = float(getattr(product, "price", 0.0) or 0.0)
+                if price <= 0:
+                    continue
+
+                # 计算该产品应得的产出（价值 → 件数）
+                product_value = total_labor_output_value * (priority / total_priority)
+                product_output = product_value / price if product_value > 0 else 0.0
+                if product_output <= 0:
+                    continue
+                
+                # 增加库存
+                old_amount = product.amount
+                product.amount += product_output
+                actual_output += product_output
+                actual_output_value += product_value
+                
+                logger.debug(f"劳动力产出: {product.name} 优先级 {priority:.2f}, 增加 {product_output:.2f}")
+        else:
+            # 这种情况理论上不应该发生，因为所有产品都会有优先级
+            logger.warning(f"公司 {company_id} 没有产品可以分配劳动力产出")
+        
+        return actual_output, actual_output_value
+
+
+    # =========================================================================
+    # Production Statistics & GDP Calculation
+    # =========================================================================
+    def get_production_statistics(self, month: int) -> Dict[str, Any]:
+        """
+        获取生产统计数据
+        """
+        stats = {
+            "total_companies": len([owner_id for owner_id in self.company_id if owner_id in self.products and self.products[owner_id]]),
+            "total_products": sum(len(products) for products in self.products.values()),
+            "total_inventory": 0.0,
+            "products_by_category": {},
+            "low_stock_products": [],
+            "high_stock_products": []
+        }
+        
+        # 统计库存情况
+        for owner_id, products in self.products.items():
+            if owner_id in self.company_id:
+                for product in products:
+                    stats["total_inventory"] += product.amount
+                    
+                    # 按分类统计
+                    category = product.classification or "other"
+                    if category not in stats["products_by_category"]:
+                        stats["products_by_category"][category] = {"count": 0, "inventory": 0.0}
+                    
+                    stats["products_by_category"][category]["count"] += 1
+                    stats["products_by_category"][category]["inventory"] += product.amount
+                    
+                    # 识别库存异常的产品
+                    if product.amount < 5:
+                        stats["low_stock_products"].append({
+                            "name": product.name,
+                            "amount": product.amount,
+                            "owner": owner_id
+                        })
+                    elif product.amount > 80:
+                        stats["high_stock_products"].append({
+                            "name": product.name,
+                            "amount": product.amount,
+                            "owner": owner_id
+                        })
+        
+        return stats
+
+    async def update_tax_rates(self, income_tax_rate: float = None, vat_rate: float = None, corporate_tax_rate: float = None):
+        """
+        更新税率
+        """
+        if income_tax_rate is not None:
+            self.income_tax_rate = income_tax_rate
+        if vat_rate is not None:
+            self.vat_rate = vat_rate
+        if corporate_tax_rate is not None:
+            self.corporate_tax_rate = corporate_tax_rate
+
+        logger.info(f"税率已更新: income_tax_rate={self.income_tax_rate:.1%}, vat_rate={self.vat_rate:.1%}, corporate_tax_rate={self.corporate_tax_rate:.1%}")
+
+# ======================== 创新系统相关方法 ========================
+
+
+    # =========================================================================
+    # Innovation System
+    # =========================================================================
+    def register_firm_innovation_config(self, firm, strategy: str, labor_productivity_factor: float, fund_share: float = 0.0):
+        """
+        注册企业的创新策略
+
+        Args:
+            company_id: 企业ID
+            strategy: 创新策略 ("encouraged" 或 "suppressed")
+            research_share: 研发投入比例（0-1之间的浮点数）
+        """
+        # 根据企业的行业（main_business）设置毛利率
+        # main_business 通常对应商品分类（daily_cate）
+        profit_margin = self._get_profit_margin(firm.main_business)
+        
+        self.firm_innovation_config[firm.company_id] = FirmInnovationConfig(
+            company_id=firm.company_id,
+            innovation_strategy=strategy,
+            labor_productivity_factor=labor_productivity_factor,
+            profit_margin=profit_margin,
+            fund_share=fund_share
+        )
+        
+        logger.info(f"✅ 企业 {firm.company_id} 创新策略: {strategy}, 研发比例: {fund_share:.1%}, 毛利率: {profit_margin:.1f}%")
+
+    def query_firm_innovation_config(self, company_id: str) -> FirmInnovationConfig:
+        """
+        查询企业的创新策略
+
+        Returns:
+            FirmInnovationConfig: FirmInnovationConfig对象
+        """
+        if not self.enable_innovation_module:
+            return None
+        return self.firm_innovation_config.get(company_id)
+
+    def add_innovation_event(self, **kwargs):
+        """
+        添加创新事件记录
+
+        Args:
+            **kwargs: 创新事件数据
+        """
+        if not self.enable_innovation_module:
+            return
+        self.firm_innovation_events.append(FirmInnovationEvent.create(**kwargs))
+
+
+    def query_all_firm_innovation_events(self) -> List[FirmInnovationEvent]:
+        """
+        查询所有创新事件
+
+        Returns:
+            List: 创新事件列表
+        """
+        if not self.enable_innovation_module:
+            return []
+        return self.firm_innovation_events
+
+
+    def query_production_stats_by_month(self, month: int) -> Dict[str, Any]:
+        """查询并返回某个月份的生产统计（包含劳动与创新细节）。若无则返回空字典。"""
+        return self.production_stats_by_month.get(month, {})
+
+    # ======================== GDP 核算（生产法/支出法/收入法） ========================
+    def _infer_firm_category(self, company_id: str) -> Optional[str]:
+        """
+        尝试从企业库存中推断企业所属大类（用于毛利率）。
+        规则：取该企业库存中第一个带 classification 的商品。
+        """
+        try:
+            for p in (self.products.get(company_id, []) or []):
+                cate = getattr(p, "classification", None)
+                if cate:
+                    return cate
+        except Exception:
+            pass
+        return None
+
+    def _get_firm_margin_rate(self, company_id: str) -> float:
+        """
+        获取企业毛利率（rate），默认 25%。
+        注意：毛利率定义为 (售价-成本)/售价，因此 售价 = 成本 / (1-毛利率)。
+        """
+        try:
+            cate = self._infer_firm_category(company_id) or "Unknown"
+            margin_pct = float(self.category_profit_margins.get(cate, 25.0) or 25.0)
+            margin_pct = max(0.0, min(80.0, margin_pct))
+            return margin_pct / 100.0
+        except Exception:
+            return 0.25
+
+    def calculate_nominal_gdp_and_health(self, month: int) -> Dict[str, Any]:
+        """
+        计算"名义GDP"及系统健康度指标
+        
+        名义GDP定义：家庭消费 + 固有市场销售（含税，反映实际交易规模）
+        同时输出生产总值作为对比指标
+        
+        这不是严格的国民核算GDP，而是系统活跃度/规模的代理指标。
+        同时提供多个维度的健康度指标用于诊断系统运行状态。
+        """
+        # 1) 主指标：名义GDP（交易总额法）
+        sales_stats = self.collect_sales_statistics(month)
+        household_sales_ex_tax = float(sum((s.get("household_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        gov_sales_ex_tax = float(sum((s.get("government_procurement_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        total_sales_ex_tax = household_sales_ex_tax + inherent_sales_ex_tax + gov_sales_ex_tax
+        
+        # VAT
+        vat_collected = 0.0
+        for tx in self.tx_history:
+            if tx.month == month and tx.type == "consume_tax":
+                vat_collected += float(tx.amount or 0.0)
+        
+        # 名义GDP（主指标）= 总消费（含税）
+        nominal_gdp_transaction = total_sales_ex_tax + vat_collected
+        
+        # 2) 对比指标：名义GDP（生产总值法/生产侧口径）
+        # ✅ 统一CD生产后，生产统计会直接给出 total_output_value（按售价估值的产出总价值）。
+        ps = self.production_stats_by_month.get(month, {}) if hasattr(self, "production_stats_by_month") else {}
+        total_production_cost = float(ps.get("total_production_cost", 0.0) or 0.0)
+
+        total_output_value = float(ps.get("total_output_value", 0.0) or 0.0)
+        if total_output_value > 0:
+            nominal_gdp_production = total_output_value
+            total_cost_based_production_value = total_output_value  # 保持字段含义：生产侧总价值
+            total_labor_production_value = 0.0
+        else:
+            # 兼容旧统计：若没有 total_output_value，则回退到“成本推算 + 劳动力价值”
+            total_labor_production_value = float(ps.get("total_labor_production_value", 0.0) or 0.0)
+            total_cost_based_production_value = total_production_cost / (1 - 0.2) if total_production_cost > 0 else 0.0  # 旧：假设平均毛利率20%
+            nominal_gdp_production = total_cost_based_production_value + total_labor_production_value
+        
+        # 供需匹配度：交易额 / 生产总值（理想值接近1.0）
+        supply_demand_ratio = (nominal_gdp_transaction / nominal_gdp_production) if nominal_gdp_production > 0 else 0.0
+        
+        # 3) 收入分配
+        total_wages = 0.0
+        for tx in self.tx_history:
+            if tx.month == month and tx.type == "labor_payment":
+                total_wages += float(tx.amount or 0.0)
+        
+        total_firm_revenue = total_sales_ex_tax
+        total_firm_profit = total_firm_revenue - total_production_cost - total_wages  # 简化估算
+        
+        # 4) 库存健康
+        total_inventory_value = 0.0
+        for owner_id, products in self.products.items():
+            for p in products:
+                total_inventory_value += float(getattr(p, "amount", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
+        inventory_to_gdp_ratio = (total_inventory_value / nominal_gdp_transaction) if nominal_gdp_transaction > 0 else 0.0
+        
+        # 5) 财政健康
+        labor_tax_collected = 0.0
+        fica_tax_collected = 0.0
+        corporate_tax_collected = 0.0
+        for tx in self.tx_history:
+            if tx.month == month:
+                if tx.type == "labor_tax":
+                    labor_tax_collected += float(tx.amount or 0.0)
+                elif tx.type == "fica_tax":
+                    fica_tax_collected += float(tx.amount or 0.0)
+                elif tx.type == "corporate_tax":
+                    corporate_tax_collected += float(tx.amount or 0.0)
+        
+        total_tax_revenue = vat_collected + labor_tax_collected + fica_tax_collected + corporate_tax_collected
+        gov_balance = self.ledger.get("gov_main_simulation", type('obj', (), {'amount': 0.0})()).amount
+        
+        # 6) 就业市场
+        # ✅ 不依赖 self.households.employment_status（并行消费/轻量对象场景会缺失），改用交易与 laborhour 存量推断
+        employed_count = 0
+        for tx in self.tx_history:
+            if tx.month == month and tx.type == "labor_payment":
+                employed_count += 1  # 每笔 labor_payment 近似对应一个劳动力单元（head/spouse）
+
+        total_labor_force_units = 0
+        try:
+            for _hid, lhs in (self.laborhour or {}).items():
+                total_labor_force_units += len(lhs or [])
+        except Exception:
+            total_labor_force_units = 0
+
+        unemployed_count = max(0, int(total_labor_force_units) - int(employed_count))
+        employment_rate = (float(employed_count) / float(total_labor_force_units)) if total_labor_force_units > 0 else 0.0
+        average_wage = (total_wages / employed_count) if employed_count > 0 else 0.0
+        
+        # 7) 价格水平（简化：所有产品的加权平均价格）
+        total_price_weighted = 0.0
+        total_quantity = 0.0
+        for owner_id, products in self.products.items():
+            for p in products:
+                qty = float(getattr(p, "amount", 0.0) or 0.0)
+                price = float(getattr(p, "price", 0.0) or 0.0)
+                total_price_weighted += price * qty
+                total_quantity += qty
+        average_price_level = (total_price_weighted / total_quantity) if total_quantity > 0 else 0.0
+        
+        return {
+            "month": month,
+            "nominal_gdp": nominal_gdp_transaction,  # 主指标：交易总额法
+            "nominal_gdp_alternative": nominal_gdp_production,  # 对比指标：生产总值法
+            "supply_demand_ratio": supply_demand_ratio,  # 供需匹配度（理想值~1.0）
+            "gdp_components": {
+                "household_consumption": household_sales_ex_tax + (household_sales_ex_tax * self.vat_rate),
+                "government_procurement": gov_sales_ex_tax,  # 不含税（政府采购不缴VAT）
+                "inherent_market_sales": inherent_sales_ex_tax + (inherent_sales_ex_tax * self.vat_rate),
+                "vat_collected": vat_collected
+            },
+            "production_metrics": {
+                "total_production_value": nominal_gdp_production,  # 生产总值法的GDP
+                "cost_based_production_value": total_cost_based_production_value,  # 成本生产部分
+                "total_production_cost": total_production_cost,
+                "total_labor_production": total_labor_production_value
+            },
+            "income_distribution": {
+                "total_wages": total_wages,
+                "total_firm_profit": total_firm_profit,
+                "wage_share": (total_wages / nominal_gdp_transaction) if nominal_gdp_transaction > 0 else 0.0,
+                "profit_share": (total_firm_profit / nominal_gdp_transaction) if nominal_gdp_transaction > 0 else 0.0
+            },
+            "inventory_health": {
+                "total_inventory_value": total_inventory_value,
+                "inventory_to_gdp_ratio": inventory_to_gdp_ratio
+            },
+            "fiscal_health": {
+                "total_tax_revenue": total_tax_revenue,
+                "vat_revenue": vat_collected,
+                "labor_tax_revenue": labor_tax_collected,
+                "fica_tax_revenue": fica_tax_collected,
+                "corporate_tax_revenue": corporate_tax_collected,
+                "government_balance": gov_balance
+            },
+            "labor_market": {
+                "employment_rate": employment_rate,
+                "employed": employed_count,
+                "unemployed": unemployed_count,
+                "average_monthly_wage": average_wage
+            },
+            "price_level": {
+                "average_price": average_price_level
+            }
+        }
+
+    def calculate_monthly_gdp(self, month: int, production_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        计算月度 GDP（生产法 / 支出法 / 收入法），并给出分项。
+        
+        ⚠️ 注意：此方法计算的三种GDP方法在数学上是恒等的（由于采用同一套数据源），
+        不代表真实的国民核算。如需系统健康度指标，建议使用 calculate_nominal_gdp_and_health()
+
+        - 产品税：按"总消费（家庭+固有市场/政府等购买，均为不含税金额）× VAT税率"估算；
+                 同时也会尝试从 tx_history 的 consume_tax 取"实际VAT"，若存在则优先使用。
+        - 生产总价值（output）：优先使用生产阶段直接统计的“产出总价值”（例如统一CD生产的 total_output_value / firm_production_value）；
+          若缺失才回退用"投入成本/ (1-毛利率)"粗略估算（仅用于兼容旧统计）。
+        - 中间消耗：基础生产投入成本（production_cost）。
+        - 库存投资：output - sales（sales 为不含税销售额，含家庭+固有市场等）。
+        - 收入法：税金 + 工资 + 营业盈余，其中营业盈余 = (output - 中间消耗) - 工资。
+        """
+        ps = production_stats
+        if ps is None:
+            ps = self.production_stats_by_month.get(month, {}) if hasattr(self, "production_stats_by_month") else {}
+        ps = ps or {}
+
+        # 1) 销售/消费（不含税）
+        sales_stats = self.collect_sales_statistics(month)
+        total_sales_ex_tax = float(sum((s.get("revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        household_sales_ex_tax = float(sum((s.get("household_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+
+        # 2) VAT（产品税）
+        vat_rate = float(self.vat_rate or 0.0)
+        vat_estimated = total_sales_ex_tax * vat_rate
+        vat_actual = 0.0
+        try:
+            for tx in self.tx_history:
+                if tx.month == month and tx.type == "consume_tax":
+                    vat_actual += float(tx.amount or 0.0)
+        except Exception:
+            vat_actual = 0.0
+        product_taxes_vat = vat_actual if vat_actual > 0 else vat_estimated
+
+        # 3) 生产：基础生产成本、基础生产总价值
+        firm_cost = (ps.get("firm_production_cost", {}) or {})
+        firm_value_reported = (ps.get("firm_production_value", {}) or {})
+        total_base_cost = float(ps.get("total_production_cost", 0.0) or sum((float(v or 0.0) for v in firm_cost.values())) or 0.0)
+
+        # 优先：统一CD生产会提供 total_output_value；否则用 firm_production_value 聚合
+        total_output_value_reported = float(ps.get("total_output_value", 0.0) or 0.0)
+        total_base_value_reported = (
+            total_output_value_reported
+            if total_output_value_reported > 0
+            else float(sum((float(v or 0.0) for v in firm_value_reported.values())) or 0.0)
+        )
+
+        # 兼容旧统计：若缺失产出价值，再用“成本/(1-margin)”估算（最后兜底）
+        base_value_inferred_from_cost_margin = {}
+        total_base_value_inferred_from_cost_margin = 0.0
+        if total_base_value_reported <= 1e-12:
+            try:
+                for cid, c in firm_cost.items():
+                    cost = float(c or 0.0)
+                    m = self._get_firm_margin_rate(str(cid))
+                    denom = 1.0 - float(m)
+                    value = (cost / denom) if denom > 1e-9 else 0.0
+                    base_value_inferred_from_cost_margin[str(cid)] = value
+                    total_base_value_inferred_from_cost_margin += value
+            except Exception:
+                total_base_value_inferred_from_cost_margin = 0.0
+
+        total_base_value_used = total_base_value_reported if total_base_value_reported > 0 else total_base_value_inferred_from_cost_margin
+
+        # 4) 劳动力生产总价值（保持现有逻辑，不改）
+        total_labor_value = float(ps.get("total_labor_production_value", 0.0) or 0.0)
+        if total_labor_value <= 0:
+            # 兜底：按 firm 维度累加
+            try:
+                total_labor_value = float(sum((float(v or 0.0) for v in (ps.get("firm_labor_production_value", {}) or {}).values())) or 0.0)
+            except Exception:
+                total_labor_value = 0.0
+
+        # 5) Output / 中间消耗 / 增加值
+        output_value_total = float(total_base_value_used + total_labor_value)
+        intermediate_consumption = float(total_base_cost)  # 你的设定：中间消耗=生产投入成本
+        gross_value_added = float(output_value_total - intermediate_consumption)
+
+        # 6) 库存投资（你的设定：产出总价值 - 销售额）
+        inventory_investment = float(output_value_total - total_sales_ex_tax)
+
+        # 7) 工资（优先用 tx_history 的 labor_payment；否则用生产统计里的 total_wage_expenses）
+        wages_from_stats = float(ps.get("total_wage_expenses", 0.0) or 0.0) # 税前
+        wages_from_tx = 0.0
+        try:
+            for tx in self.tx_history:
+                if tx.month == month and tx.type == "labor_payment":
+                    wages_from_tx += float(tx.amount or 0.0) # 税后
+        except Exception:
+            wages_from_tx = 0.0
+        wages_used = wages_from_tx if wages_from_tx > 0 else wages_from_stats
+
+        # 8) 营业盈余（Operating surplus）
+        operating_surplus = float(gross_value_added - wages_used)
+
+        # 9) 三种 GDP（按同一套分项构造，理论上应一致，仅有浮点/口径差）
+        gdp_production = float(gross_value_added + product_taxes_vat)
+        gdp_expenditure = float((total_sales_ex_tax + product_taxes_vat) + inventory_investment - intermediate_consumption)
+        gdp_income = float(product_taxes_vat + wages_used + operating_surplus)
+
+        # 10) 统计误差
+        max_gdp = max(gdp_production, gdp_expenditure, gdp_income)
+        min_gdp = min(gdp_production, gdp_expenditure, gdp_income)
+
+        return {
+            "month": month,
+            "rates": {
+                "vat_rate": vat_rate,
+            },
+            "consumption": {
+                "total_sales_ex_tax": total_sales_ex_tax,
+                "household_sales_ex_tax": household_sales_ex_tax,
+                "inherent_market_sales_ex_tax": inherent_sales_ex_tax,
+            },
+            "taxes": {
+                "vat_estimated_from_sales": vat_estimated,
+                "vat_actual_from_tx": vat_actual,
+                "vat_used": product_taxes_vat,
+            },
+            "production": {
+                "base_production_cost": total_base_cost,
+                "base_production_value_by_margin": total_base_value_used,
+                "base_production_value_reported": total_base_value_reported,
+                "base_production_value_inferred_from_cost_margin": total_base_value_inferred_from_cost_margin,
+                "base_production_value_source": (
+                    "reported" if total_base_value_reported > 0 else "inferred_from_cost_margin"
+                ),
+                "labor_production_value": total_labor_value,
+                "output_value_total": output_value_total,
+            },
+            "accounts": {
+                "intermediate_consumption": intermediate_consumption,
+                "gross_value_added": gross_value_added,
+                "inventory_investment": inventory_investment,
+                "wages_from_stats": wages_from_stats,
+                "wages_from_tx": wages_from_tx,
+                "wages_used": wages_used,
+                "operating_surplus": operating_surplus,
+            },
+            "gdp": {
+                "production_approach": gdp_production,
+                "expenditure_approach": gdp_expenditure,
+                "income_approach": gdp_income,
+                "statistical_discrepancy": {
+                    "max_minus_min": float(max_gdp - min_gdp),
+                    "production_minus_expenditure": float(gdp_production - gdp_expenditure),
+                    "production_minus_income": float(gdp_production - gdp_income),
+                    "expenditure_minus_income": float(gdp_expenditure - gdp_income),
+                },
+            },
+        }
+
