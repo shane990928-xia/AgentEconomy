@@ -176,7 +176,7 @@ class Bank:
                 amount=amount
             )
             
-            # 更新储蓄账户余额
+            # Update savings account balance
             account.balance -= amount
             self.total_deposits -= amount
             
@@ -189,28 +189,28 @@ class Bank:
     
     async def calculate_and_pay_monthly_interest(self, month: int) -> float:
         """
-        计算并发放月度利息
-        年利率0.5%，按月计算：月利率 = 0.5% / 12 ≈ 0.0417%
+        Calculate and distribute monthly interest
+        Annual interest rate 0.5%, calculated monthly: monthly rate = 0.5% / 12 ≈ 0.0417%
         
         Args:
-            month: 当前月份
+            month: Current month
             
         Returns:
-            float: 总利息支付金额
+            float: Total interest payment amount
         """
-        monthly_interest_rate = 0.005 / 12  # 年利率0.5%转换为月利率
+        monthly_interest_rate = 0.005 / 12  # Convert annual rate 0.5% to monthly rate
         total_interest_paid = 0.0
         
         for household_id, account in self.savings_accounts.items():
             if account.balance <= 0:
                 continue
             
-            # 计算利息
+            # Calculate interest
             interest_amount = account.balance * monthly_interest_rate
             
             if interest_amount > 0:
                 try:
-                    # 银行支付利息给家庭
+                    # Bank pays interest to household
                     tx_id = await self.economic_center.add_interest_tx.remote(
                         month=month,
                         sender_id=self.bank_id,
@@ -220,7 +220,7 @@ class Bank:
   
                     total_interest_paid += interest_amount
                     
-                    # 记录利息历史
+                    # Record interest history
                     self.interest_history.append({
                         "month": month,
                         "household_id": household_id,
@@ -242,13 +242,13 @@ class Bank:
     
     def get_account_summary(self, household_id: str) -> Optional[Dict]:
         """
-        获取家庭储蓄账户摘要
+        Get household savings account summary
         
         Args:
-            household_id: 家庭ID
+            household_id: Household ID
             
         Returns:
-            Dict: 账户摘要信息
+            Dict: Account summary information
         """
         if household_id not in self.savings_accounts:
             return None
@@ -265,10 +265,10 @@ class Bank:
     
     def get_bank_summary(self) -> Dict:
         """
-        获取银行整体摘要信息
+        Get overall bank summary information
         
         Returns:
-            Dict: 银行摘要
+            Dict: Bank summary
         """
         active_accounts = len([a for a in self.savings_accounts.values() if a.balance > 0])
         return {
