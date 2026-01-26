@@ -8,7 +8,7 @@ import os
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
-model = AutoModel.from_pretrained(os.getenv("MODEL_PATH"))
+model = AutoModel.from_pretrained(os.getenv("MODEL_PATH")).to(device)
 
 def embedding(text: str) -> np.ndarray:
     """

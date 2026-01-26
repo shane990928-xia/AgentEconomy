@@ -616,33 +616,179 @@ class Wage(BaseModel):
 # Transaction Models
 # =============================================================================
 
+class TransactionStatus:
+    """
+    Enumeration of possible transaction states.
+    
+    Tracks the lifecycle of a transaction from creation to completion or failure.
+    """
+    PENDING: str = "pending"
+    COMPLETED: str = "completed"
+    FAILED: str = "failed"
+    CANCELLED: str = "cancelled"
+
+
 class Transaction(BaseModel):
     """
     Represents any economic transaction between agents.
     
-    Includes monetary transfers, asset exchanges, and various tax payments.
+    Includes monetary transfers, asset exchanges, labor payments, and various tax payments.
+    Supports full transaction lifecycle tracking with status, timestamps, and metadata.
     """
-    id: str = Field(..., description="Unique transaction ID")
-    sender_id: str = Field(..., description="ID of the sender")
-    receiver_id: str = Field(..., description="ID of the receiver")
+    # === Core Transaction Fields ===
+    id: str = Field(default_factory=lambda: str(uuid4()), description="Unique transaction ID")
+    sender_id: str = Field(..., description="ID of the sender/payer")
+    receiver_id: str = Field(..., description="ID of the receiver/payee")
     amount: float = Field(..., description="Monetary amount transferred")
-    assets: Optional[List[Any]] = Field(default_factory=list, description="Assets exchanged")
+    
+    # === Asset and Labor Exchange ===
+    assets: Optional[List[Any]] = Field(default_factory=list, description="Assets exchanged (e.g., Products)")
     labor_hours: List[LaborHour] = Field(default_factory=list, description="Labor hours exchanged")
+    
+    # === Transaction Type ===
     type: Literal[
-        'purchase',
-        'interest',
-        'service',
-        'redistribution',
-        'consume_tax',
-        'labor_tax',
-        'fica_tax',
-        'corporate_tax',
-        'labor_payment',
-        'inherent_market',
-        'government_procurement',
+        'purchase',           # Product purchase
+        'interest',           # Interest payment
+        'service',            # Service payment
+        'redistribution',     # Government redistribution
+        'consume_tax',        # Consumption/VAT tax
+        'labor_tax',          # Labor income tax
+        'fica_tax',           # FICA/social security tax
+        'corporate_tax',      # Corporate income tax
+        'labor_payment',      # Wage payment
+        'inherent_market',    # Internal market transaction
+        'government_procurement',  # Government purchase
+        'transfer',           # Simple money transfer
+        'product_sale',       # Product sale (manufacturer/retailer)
+        'resource_purchase',  # Resource/input purchase
+        'tax_collection',     # General tax collection
+        'financial',          # Financial transaction
     ] = Field(default='purchase', description="Type of transaction")
+    
+    # === Lifecycle Tracking ===
+    timestamp: datetime = Field(default_factory=datetime.now, description="When transaction was created")
+    status: str = Field(default=TransactionStatus.PENDING, description="Current transaction status")
+    error_message: Optional[str] = Field(None, description="Error message if transaction failed")
+    
+    # === Temporal Context ===
     month: Optional[int] = Field(default=0, description="Month number when transaction occurred")
-
+    
+    # === Extensibility ===
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional transaction metadata (product_id, quantity, price_per_unit, etc.)"
+    )
+    related_transaction_id: Optional[str] = Field(
+        None,
+        description="ID of related transaction (e.g., refund references original purchase)"
+    )
+    
+    @classmethod
+    def create_transfer(
+        cls,
+        sender_id: str,
+        receiver_id: str,
+        amount: float,
+        month: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> 'Transaction':
+        """Create a simple money transfer transaction."""
+        return cls(
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            amount=amount,
+            type='transfer',
+            month=month,
+            metadata=metadata or {},
+            status=TransactionStatus.PENDING
+        )
+    
+    @classmethod
+    def create_product_transaction(
+        cls,
+        buyer_id: str,
+        seller_id: str,
+        amount: float,
+        products: List[Any],
+        month: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> 'Transaction':
+        """Create a product purchase transaction."""
+        return cls(
+            sender_id=buyer_id,
+            receiver_id=seller_id,
+            amount=amount,
+            assets=products,
+            type='purchase',
+            month=month,
+            metadata=metadata or {},
+            status=TransactionStatus.PENDING
+        )
+    
+    @classmethod
+    def create_wage_payment(
+        cls,
+        employer_id: str,
+        employee_id: str,
+        amount: float,
+        labor_hours: List[LaborHour],
+        month: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> 'Transaction':
+        """Create a wage payment transaction."""
+        return cls(
+            sender_id=employer_id,
+            receiver_id=employee_id,
+            amount=amount,
+            labor_hours=labor_hours,
+            type='labor_payment',
+            month=month,
+            metadata=metadata or {},
+            status=TransactionStatus.PENDING
+        )
+    
+    @classmethod
+    def create_tax_transaction(
+        cls,
+        payer_id: str,
+        government_id: str,
+        amount: float,
+        tax_type: Literal['consume_tax', 'labor_tax', 'fica_tax', 'corporate_tax', 'tax_collection'],
+        month: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> 'Transaction':
+        """Create a tax payment transaction."""
+        return cls(
+            sender_id=payer_id,
+            receiver_id=government_id,
+            amount=amount,
+            type=tax_type,
+            month=month,
+            metadata=metadata or {},
+            status=TransactionStatus.PENDING
+        )
+    
+    @classmethod
+    def create_resource_transaction(
+        cls,
+        buyer_id: str,
+        seller_id: str,
+        amount: float,
+        resources: List[Any],
+        month: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> 'Transaction':
+        """Create a resource/input purchase transaction."""
+        return cls(
+            sender_id=buyer_id,
+            receiver_id=seller_id,
+            amount=amount,
+            assets=resources,
+            type='resource_purchase',
+            month=month,
+            metadata=metadata or {},
+            status=TransactionStatus.PENDING
+        )
 
 class PurchaseRecord(BaseModel):
     """

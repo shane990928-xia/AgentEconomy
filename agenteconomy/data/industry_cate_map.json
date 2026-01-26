@@ -1,0 +1,107 @@
+{
+    "category_1_manufacturers": {
+      "role": "SKU Producers (Goods)",
+      "description": "实体商品生产者。消耗第三类资源，产出具体的 SKU 库存。拥有定价权。",
+      "industries": {
+        "111CA": "Farms",
+        "113FF": "Forestry, fishing, and related activities",
+        "311FT": "Food and beverage and tobacco products",
+        "313TT": "Textile mills and textile product mills",
+        "315AL": "Apparel and leather and allied products",
+        "321": "Wood products",
+        "322": "Paper products",
+        "324": "Petroleum and coal products",
+        "325": "Chemical products",
+        "326": "Plastics and rubber products",
+        "327": "Nonmetallic mineral products",
+        "332": "Fabricated metal products",
+        "333": "Machinery",
+        "334": "Computer and electronic products",
+        "335": "Electrical equipment, appliances, and components",
+        "3361MV": "Motor vehicles, bodies and trailers, and parts",
+        "3364OT": "Other transportation equipment",
+        "337": "Furniture and related products",
+        "339": "Miscellaneous manufacturing",
+        "511": "Publishing industries, except internet (includes software)"
+      }
+    },
+    "category_2_retailers": {
+      "role": "SKU Sellers (Channels)",
+      "description": "实体商品销售渠道。向第一类进货，面向家庭销售。拥有渠道毛利。",
+      "industries": {
+        "441": "Motor vehicle and parts dealers",
+        "445": "Food and beverage stores",
+        "452": "General merchandise stores",
+        "4A0": "Other retail",
+        "722": "Food services and drinking places"
+      }
+    },
+    "category_3_cost_drivers": {
+      "role": "Abstract Resource Providers",
+      "description": "虚拟资源与服务提供商。不生产 SKU，只提供抽象单位（元/单位）。需要雇佣劳动力。",
+      "subgroups": {
+        "raw_materials": {
+          "description": "基础原材料与上游投入。通常也是全系统的价格锚点。",
+          "industries": {
+            "211": "Oil and gas extraction",
+            "212": "Mining, except oil and gas",
+            "213": "Support activities for mining",
+            "331": "Primary metals"
+          }
+        },
+        "infrastructure_and_services": {
+          "description": "运营服务、物流、金融与房地产。作为企业运行的必需成本。",
+          "industries": {
+            "22": "Utilities",
+            "23": "Construction",
+            "323": "Printing and related support activities",
+            "42": "Wholesale trade",
+            "481": "Air transportation",
+            "482": "Rail transportation",
+            "483": "Water transportation",
+            "484": "Truck transportation",
+            "485": "Transit and ground passenger transportation",
+            "486": "Pipeline transportation",
+            "487OS": "Other transportation and support activities",
+            "493": "Warehousing and storage",
+            "512": "Motion picture and sound recording industries",
+            "513": "Broadcasting and telecommunications",
+            "514": "Data processing, internet publishing, and other information services",
+            "521CI": "Federal Reserve banks, credit intermediation, and related activities",
+            "523": "Securities, commodity contracts, and investments",
+            "524": "Insurance carriers and related activities",
+            "525": "Funds, trusts, and other financial vehicles",
+            "HS": "Housing",
+            "ORE": "Other real estate",
+            "532RL": "Rental and leasing services and lessors of intangible assets",
+            "5411": "Legal services",
+            "5415": "Computer systems design and related services",
+            "5412OP": "Miscellaneous professional, scientific, and technical services",
+            "55": "Management of companies and enterprises",
+            "561": "Administrative and support services",
+            "562": "Waste management and remediation services",
+            "61": "Educational services",
+            "621": "Ambulatory health care services",
+            "622": "Hospitals",
+            "623": "Nursing and residential care facilities",
+            "624": "Social assistance",
+            "711AS": "Performing arts, spectator sports, museums, and related activities",
+            "713": "Amusements, gambling, and recreation industries",
+            "721": "Accommodation",
+            "81": "Other services, except government"
+          }
+        },
+        "government_sectors": {
+          "description": "政府服务性收费通道",
+          "handling_rule": "注意：这些行业代码仅代表企业/家庭向政府支付的【非税服务费】（如规费、牌照费、公立企业服务费）。资金流向政府 Agent 的账户。真正的【税收】（Tax）和【转移支付】（Redistribution）不通过这些代码，而是由政府 Agent 的税率逻辑独立控制。",
+          "industries": {
+            "GFGD": "Federal general government (defense)",
+            "GFGN": "Federal general government (nondefense)",
+            "GFE": "Federal government enterprises",
+            "GSLG": "State and local general government",
+            "GSLE": "State and local government enterprises"
+          }
+        }
+      }
+    }
+  }

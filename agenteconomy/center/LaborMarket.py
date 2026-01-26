@@ -1,20 +1,23 @@
 import ray
 from typing import List, Dict, Optional
-from agenteconomy.center.Model import Job, MatchedJob, LaborHour
+from agenteconomy.center.Model import Job, MatchedJob, LaborHour, Wage
 from agenteconomy.utils.logger import get_logger
-
+from agenteconomy.center.Ecocenter import EconomicCenter
 @ray.remote
 class LaborMarket:
-    def __init__(self):
+    def __init__(self, economic_center: EconomicCenter):
         self.job_openings: List[Job] = [] # Store all job openings
         self.matched_jobs: List[MatchedJob] = []
         self.labor_hours: List[LaborHour] = [] # Store all labor hours
         self.job_applications:Dict[str, List[LaborHour]] = {} # job_id -> List[JobApplication]
         self.backup_candidates:Dict[str, List[Dict]] = {} # job_id -> List[backup_candidate_info]
-
+        self.economic_center: EconomicCenter = economic_center
         self.logger = get_logger(name="LaborMarket")
         self.logger.info(f"LaborMarket initialized")
 
+        # records
+        self.wage_history: List[Wage] = []
+        
     def post_job(self, job: Job):
         """
         Post a job opening to the labor market.
@@ -192,3 +195,19 @@ class LaborMarket:
 
                 total_loss += loss
         return total_loss
+
+    async def step(self, month: int):
+        """
+        Handle wages and summary.
+        """
+        # Handle wages
+        for matched in self.matched_jobs:
+            wage = matched.wage
+            household_id = matched.household_id
+            lh_type = matched.lh_type
+            firm_id = matched.firm_id
+            wage_record = Wage.create(agent_id=household_id, amount=wage, month=month)
+            self.wage_history.append(wage_record)
+
+            # EconomicCenter handle wage
+            await self.economic_center.process_wage.remote(month=month, wage_hour=wage, household_id=household_id, firm_id=firm_id, lh_type=lh_type)
