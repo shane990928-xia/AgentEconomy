@@ -58,7 +58,8 @@ class Simulator:
                 category_profit_margins=self.config.category_profit_margins
             )
             self.product_market = ProductMarket.remote()
-            self.labor_market = LaborMarket.remote()
+            # LaborMarket needs economic_center for wage transfers
+            self.labor_market = LaborMarket.remote(economic_center=self.economic_center)
             
             self.government = Government(
                     government_id="gov_main_simulation",
@@ -108,8 +109,19 @@ class Simulator:
 
     def _create_firms(self):
         """Create firms"""
-        abstract_resource_market = AbstractResourceMarket()
-        self.firms = create_firms(economic_center=self.economic_center, labor_market=self.labor_market, product_market=self.product_market, abstract_resource_market=abstract_resource_market)
+        # 初始化抽象资源市场
+        # 传入 EconomicCenter 以记录所有交易
+        # 传入政府 ID 以将政府服务费路由到政府账户
+        abstract_resource_market = AbstractResourceMarket(
+            economic_center=self.economic_center,
+            government_id=self.government.government_id
+        )
+        self.firms = create_firms(
+            economic_center=self.economic_center, 
+            labor_market=self.labor_market, 
+            product_market=self.product_market, 
+            abstract_resource_market=abstract_resource_market
+        )
         
     async def run_simulation(self):
         """Run simulation"""

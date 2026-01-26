@@ -397,12 +397,28 @@ class ManufactureFirm(Firm):
         """
         计算劳动成本（基于实际雇佣的员工）
         
+        从 LaborMarket 获取本企业的工资支出总额
+        
         Returns:
-            劳动成本
+            劳动成本（月度工资总额）
         """
-        # TODO: 实现基于实际员工工资的计算
-        # 目前返回0，等待劳动力市场集成
-        return 0.0
+        if self.labor_market is None:
+            logger.warning(f"Firm {self.firm_id}: No labor market available for labor cost calculation")
+            return 0.0
+        
+        try:
+            # 调用 LaborMarket 获取本企业的劳动成本
+            if 'ActorHandle' in str(type(self.labor_market)):
+                labor_cost = ray.get(self.labor_market.get_firm_labor_cost.remote(self.firm_id))
+            else:
+                labor_cost = self.labor_market.get_firm_labor_cost(self.firm_id)
+            
+            logger.info(f"Firm {self.firm_id} labor cost: ${labor_cost:.2f}")
+            return labor_cost
+            
+        except Exception as e:
+            logger.error(f"Firm {self.firm_id} failed to calculate labor cost: {e}")
+            return 0.0
     
     def calculate_tax_cost(self, revenue: float = 0.0, tax_rate: float = 0.0) -> float:
         """

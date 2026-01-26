@@ -1,22 +1,32 @@
 import ray
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from agenteconomy.center.Model import Job, MatchedJob, LaborHour, Wage
 from agenteconomy.utils.logger import get_logger
-from agenteconomy.center.Ecocenter import EconomicCenter
+
 @ray.remote
 class LaborMarket:
-    def __init__(self, economic_center: EconomicCenter):
+    def __init__(self, economic_center=None):
+        """
+        Initialize LaborMarket
+        
+        Args:
+            economic_center: Optional EconomicCenter Ray Actor for wage transfers
+        """
         self.job_openings: List[Job] = [] # Store all job openings
         self.matched_jobs: List[MatchedJob] = []
         self.labor_hours: List[LaborHour] = [] # Store all labor hours
-        self.job_applications:Dict[str, List[LaborHour]] = {} # job_id -> List[JobApplication]
-        self.backup_candidates:Dict[str, List[Dict]] = {} # job_id -> List[backup_candidate_info]
-        self.economic_center: EconomicCenter = economic_center
+        self.job_applications: Dict[str, List[LaborHour]] = {} # job_id -> List[JobApplication]
+        self.backup_candidates: Dict[str, List[Dict]] = {} # job_id -> List[backup_candidate_info]
+        self.economic_center = economic_center
         self.logger = get_logger(name="LaborMarket")
         self.logger.info(f"LaborMarket initialized")
 
-        # records
+        # Records
         self.wage_history: List[Wage] = []
+        
+        # Default work parameters
+        self.default_hours_per_week: float = 40.0
+        self.default_weeks_per_month: float = 4.0
         
     def post_job(self, job: Job):
         """
@@ -196,18 +206,239 @@ class LaborMarket:
                 total_loss += loss
         return total_loss
 
-    async def step(self, month: int):
+    # =========================================================================
+    # Wage Calculation Methods
+    # =========================================================================
+    
+    def set_economic_center(self, economic_center):
         """
-        Handle wages and summary.
+        Set or update the economic center reference.
+        
+        Args:
+            economic_center: EconomicCenter Ray Actor handle
         """
-        # Handle wages
-        for matched in self.matched_jobs:
-            wage = matched.wage
-            household_id = matched.household_id
-            lh_type = matched.lh_type
-            firm_id = matched.firm_id
-            wage_record = Wage.create(agent_id=household_id, amount=wage, month=month)
-            self.wage_history.append(wage_record)
+        self.economic_center = economic_center
+        self.logger.info("EconomicCenter reference updated")
+    
+    def calculate_monthly_wage(
+        self, 
+        wage_per_hour: float, 
+        hours_per_week: float = None,
+        weeks_per_month: float = None
+    ) -> float:
+        """
+        Calculate monthly wage from hourly wage.
+        
+        Args:
+            wage_per_hour: Hourly wage rate
+            hours_per_week: Work hours per week (default: 40)
+            weeks_per_month: Work weeks per month (default: 4)
+            
+        Returns:
+            Monthly gross wage
+        """
+        hours = hours_per_week if hours_per_week is not None else self.default_hours_per_week
+        weeks = weeks_per_month if weeks_per_month is not None else self.default_weeks_per_month
+        return wage_per_hour * hours * weeks
+    
+    def calculate_wage_for_matched_job(self, matched_job: MatchedJob) -> Dict:
+        """
+        Calculate wage details for a single matched job.
+        
+        Args:
+            matched_job: MatchedJob instance
+            
+        Returns:
+            Dict with wage details:
+            {
+                'household_id': str,
+                'firm_id': str,
+                'lh_type': str,
+                'wage_per_hour': float,
+                'hours_per_period': float,
+                'monthly_gross_wage': float,
+                'job_title': str,
+                'soc': str
+            }
+        """
+        job = matched_job.job
+        hours_per_period = job.hours_per_period if job.hours_per_period else self.default_hours_per_week
+        
+        monthly_wage = self.calculate_monthly_wage(
+            wage_per_hour=matched_job.average_wage,
+            hours_per_week=hours_per_period
+        )
+        
+        return {
+            'household_id': matched_job.household_id,
+            'firm_id': matched_job.firm_id,
+            'lh_type': matched_job.lh_type,
+            'wage_per_hour': matched_job.average_wage,
+            'hours_per_period': hours_per_period,
+            'monthly_gross_wage': monthly_wage,
+            'job_title': job.title,
+            'soc': job.SOC,
+        }
+    
+    def calculate_all_wages(self) -> Tuple[List[Dict], Dict[str, float]]:
+        """
+        Calculate wages for all matched jobs.
+        
+        Returns:
+            Tuple of:
+            - List of wage details for each matched job
+            - Dict of firm_id -> total wage expense
+        """
+        wage_details = []
+        firm_wage_totals: Dict[str, float] = {}
+        
+        for matched_job in self.matched_jobs:
+            wage_info = self.calculate_wage_for_matched_job(matched_job)
+            wage_details.append(wage_info)
+            
+            # Aggregate by firm
+            firm_id = wage_info['firm_id']
+            if firm_id not in firm_wage_totals:
+                firm_wage_totals[firm_id] = 0.0
+            firm_wage_totals[firm_id] += wage_info['monthly_gross_wage']
+        
+        return wage_details, firm_wage_totals
+    
+    def get_firm_labor_cost(self, firm_id: str) -> float:
+        """
+        Get total labor cost for a specific firm.
+        
+        Args:
+            firm_id: Firm identifier
+            
+        Returns:
+            Total monthly gross wage expense for the firm
+        """
+        total_cost = 0.0
+        for matched_job in self.matched_jobs:
+            if matched_job.firm_id == firm_id:
+                wage_info = self.calculate_wage_for_matched_job(matched_job)
+                total_cost += wage_info['monthly_gross_wage']
+        return total_cost
+    
+    def get_firm_employees(self, firm_id: str) -> List[Dict]:
+        """
+        Get all employees (matched jobs) for a specific firm.
+        
+        Args:
+            firm_id: Firm identifier
+            
+        Returns:
+            List of wage details for each employee
+        """
+        employees = []
+        for matched_job in self.matched_jobs:
+            if matched_job.firm_id == firm_id:
+                wage_info = self.calculate_wage_for_matched_job(matched_job)
+                employees.append(wage_info)
+        return employees
+    
+    def get_household_income(self, household_id: str) -> Dict:
+        """
+        Get total income for a specific household.
+        
+        Args:
+            household_id: Household identifier
+            
+        Returns:
+            Dict with household income details
+        """
+        total_income = 0.0
+        jobs = []
+        
+        for matched_job in self.matched_jobs:
+            if matched_job.household_id == household_id:
+                wage_info = self.calculate_wage_for_matched_job(matched_job)
+                total_income += wage_info['monthly_gross_wage']
+                jobs.append(wage_info)
+        
+        return {
+            'household_id': household_id,
+            'total_monthly_income': total_income,
+            'jobs': jobs,
+            'job_count': len(jobs)
+        }
 
-            # EconomicCenter handle wage
-            await self.economic_center.process_wage.remote(month=month, wage_hour=wage, household_id=household_id, firm_id=firm_id, lh_type=lh_type)
+    def process_monthly_wages(self, month: int) -> Dict:
+        """
+        Process wage payments for all matched jobs in a month.
+        This method calculates wages and delegates actual transfers to EconomicCenter.
+        
+        Args:
+            month: Current simulation month
+            
+        Returns:
+            Dict with processing summary:
+            {
+                'month': int,
+                'total_wages_paid': float,
+                'total_employees': int,
+                'wages_by_firm': {firm_id: total},
+                'success': bool,
+                'errors': List[str]
+            }
+        """
+        wage_details, firm_totals = self.calculate_all_wages()
+        
+        total_paid = 0.0
+        errors = []
+        
+        for wage_info in wage_details:
+            try:
+                # Record wage history in LaborMarket
+                wage_record = Wage.create(
+                    agent_id=wage_info['household_id'],
+                    amount=wage_info['monthly_gross_wage'],
+                    month=month
+                )
+                self.wage_history.append(wage_record)
+                
+                # Delegate actual transfer to EconomicCenter
+                if self.economic_center is not None:
+                    # Call EconomicCenter to process wage (handles taxes and ledger updates)
+                    ray.get(self.economic_center.process_wage.remote(
+                        month=month,
+                        wage_hour=wage_info['wage_per_hour'],
+                        household_id=wage_info['household_id'],
+                        firm_id=wage_info['firm_id'],
+                        hours_per_period=wage_info['hours_per_period'],
+                        periods_per_month=self.default_weeks_per_month
+                    ))
+                
+                total_paid += wage_info['monthly_gross_wage']
+                
+            except Exception as e:
+                error_msg = f"Failed to process wage for {wage_info['household_id']}: {e}"
+                self.logger.error(error_msg)
+                errors.append(error_msg)
+        
+        self.logger.info(
+            f"Month {month}: Processed {len(wage_details)} wage payments, "
+            f"total ${total_paid:.2f}"
+        )
+        
+        return {
+            'month': month,
+            'total_wages_paid': total_paid,
+            'total_employees': len(wage_details),
+            'wages_by_firm': firm_totals,
+            'success': len(errors) == 0,
+            'errors': errors
+        }
+
+    async def step(self, month: int) -> Dict:
+        """
+        Execute monthly labor market step: process all wage payments.
+        
+        Args:
+            month: Current simulation month
+            
+        Returns:
+            Processing summary dict
+        """
+        return self.process_monthly_wages(month)

@@ -728,6 +728,51 @@ class EconomicCenter:
             filtered = [tx for tx in filtered if str(getattr(tx, "type", "")) == tx_type]
         return filtered
 
+    def get_transactions_by_receiver(
+        self,
+        receiver_id: str,
+        tx_type: Optional[str] = None,
+        month: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        按接收方查询交易记录
+        
+        Args:
+            receiver_id: 接收方 ID
+            tx_type: 交易类型（可选）
+            month: 月份（可选，None 表示全部）
+            
+        Returns:
+            交易记录列表，每条记录为字典格式
+        """
+        filtered = []
+        
+        for tx in self.tx_history:
+            # 检查接收方
+            if getattr(tx, "receiver_id", None) != receiver_id:
+                continue
+            
+            # 检查交易类型
+            if tx_type is not None and str(getattr(tx, "type", "")) != tx_type:
+                continue
+            
+            # 检查月份
+            if month is not None and int(getattr(tx, "month", 0) or 0) != int(month):
+                continue
+            
+            # 转换为字典格式
+            filtered.append({
+                "id": getattr(tx, "id", ""),
+                "sender_id": getattr(tx, "sender_id", ""),
+                "receiver_id": getattr(tx, "receiver_id", ""),
+                "amount": float(getattr(tx, "amount", 0.0) or 0.0),
+                "type": getattr(tx, "type", ""),
+                "month": int(getattr(tx, "month", 0) or 0),
+                "metadata": getattr(tx, "metadata", {}) or {},
+            })
+        
+        return filtered
+
     def get_period_statistics(self, month: int) -> PeriodStatistics:
         month = int(month)
         if month in self.period_statistics:

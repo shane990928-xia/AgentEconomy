@@ -51,17 +51,38 @@ class ResourceInfo:
     price_history: List[float]  # 价格历史
 
 
+# 政府服务行业代码
+GOVERNMENT_INDUSTRY_CODES = frozenset({"GFGD", "GFGN", "GFE", "GSLG", "GSLE"})
+
+
 class AbstractResourceMarket:
     """
     抽象资源市场
     
     管理第三类行业（Category 3）提供的同质化资源/服务
     这些资源没有具体SKU，按单位交易
+    
+    资金流向规则：
+    - 政府服务行业（GFGD, GFGN, GFE, GSLG, GSLE）→ Government Agent
+    - 其他行业 → 对应的 ServiceFirm（通过 industry_code 查找）
+    - 所有交易通过 EconomicCenter 记录，确保完整的审计轨迹
     """
     
-    def __init__(self):
+    def __init__(self, economic_center=None, government_id: str = None):
+        """
+        初始化抽象资源市场
+        
+        Args:
+            economic_center: EconomicCenter Ray Actor 引用，用于记录交易
+            government_id: 政府 Agent 的 ID，用于接收政府服务费
+        """
         self.resources: Dict[str, ResourceInfo] = {}
-        self.transactions: List[Dict] = []  # 交易记录
+        self.transactions: List[Dict] = []  # 本地交易记录（备份）
+        self.economic_center = economic_center  # EconomicCenter 引用
+        self.government_id = government_id or "gov_main_simulation"  # 政府 ID
+        
+        # 行业代码 → 企业ID 映射（用于将资金路由到真实的 ServiceFirm）
+        self.industry_to_firm: Dict[str, str] = {}
         
         # 行业代码到单位类型的映射
         self.industry_unit_mapping = {
@@ -73,15 +94,61 @@ class AbstractResourceMarket:
             "521CI": ResourceUnit.DOLLAR_SERVICE,  # 金融服务
             "523": ResourceUnit.DOLLAR_SERVICE,  # 证券投资
             "524": ResourceUnit.DOLLAR_SERVICE,  # 保险
+            # 政府服务 - 按服务金额计费
+            "GFGD": ResourceUnit.DOLLAR_SERVICE,  # 联邦政府（国防）
+            "GFGN": ResourceUnit.DOLLAR_SERVICE,  # 联邦政府（非国防）
+            "GFE": ResourceUnit.DOLLAR_SERVICE,  # 联邦政府企业
+            "GSLG": ResourceUnit.DOLLAR_SERVICE,  # 州和地方政府
+            "GSLE": ResourceUnit.DOLLAR_SERVICE,  # 州和地方政府企业
             # 更多映射...
         }
+    
+    def register_firm(self, industry_code: str, firm_id: str):
+        """
+        注册行业对应的企业
+        
+        ServiceFirm 创建后调用此方法，建立 industry_code → firm_id 映射
+        这样当有人采购该行业的资源时，资金会流向真实的企业
+        
+        Args:
+            industry_code: 行业代码（如 "HS", "621" 等）
+            firm_id: 企业ID（如 "svc_HS_abc12345"）
+        """
+        self.industry_to_firm[industry_code] = firm_id
+        logger.info(f"注册行业企业映射: {industry_code} → {firm_id}")
+    
+    def get_receiver_id(self, industry_code: str) -> str:
+        """
+        获取资源采购的资金接收方 ID
+        
+        优先级：
+        1. 政府行业 → government_id
+        2. 已注册的企业 → firm_id
+        3. 兜底 → 虚拟市场账户 market_resource_{industry_code}
+        
+        Args:
+            industry_code: 行业代码
+            
+        Returns:
+            接收方的 agent_id
+        """
+        if industry_code in GOVERNMENT_INDUSTRY_CODES:
+            return self.government_id
+        
+        if industry_code in self.industry_to_firm:
+            return self.industry_to_firm[industry_code]
+        
+        # 兜底：虚拟市场账户（不应该走到这里，说明企业未注册）
+        logger.warning(f"行业 {industry_code} 未注册企业，使用虚拟账户")
+        return f"market_resource_{industry_code}"
     
     def initialize_resource(
         self,
         industry_code: str,
         name: str,
         base_price: float,
-        initial_supply_capacity: float
+        initial_supply_capacity: float,
+        firm_id: Optional[str] = None
     ):
         """
         初始化一个抽象资源
@@ -91,6 +158,7 @@ class AbstractResourceMarket:
             name: 资源名称
             base_price: 基准价格（用于技术计算）
             initial_supply_capacity: 初始供给能力
+            firm_id: 提供该资源的企业ID（可选，用于资金路由）
         """
         unit = self.industry_unit_mapping.get(
             industry_code, 
@@ -108,9 +176,14 @@ class AbstractResourceMarket:
             price_history=[base_price]
         )
         
+        # 如果提供了 firm_id，自动注册映射
+        if firm_id:
+            self.register_firm(industry_code, firm_id)
+        
         logger.info(
             f"初始化资源 {name} ({industry_code}): "
             f"基准价={base_price}, 单位={unit.value}"
+            f"{f', 企业={firm_id}' if firm_id else ''}"
         )
     
     def get_base_price(self, industry_code: str) -> float:
@@ -190,6 +263,11 @@ class AbstractResourceMarket:
         """
         购买抽象资源
         
+        资金流向规则（由 EconomicCenter 执行）：
+        1. 政府服务行业 → Government Agent
+        2. 其他行业 → 对应的 ServiceFirm
+        3. 未注册的行业 → 虚拟市场账户（兜底）
+        
         Args:
             industry_code: 资源行业代码
             buyer_id: 购买者ID
@@ -201,7 +279,9 @@ class AbstractResourceMarket:
                 "quantity": 购买数量,
                 "unit": 单位,
                 "unit_price": 单价,
-                "total_cost": 总成本
+                "total_cost": 总成本,
+                "receiver_id": 资金接收方ID,
+                "is_government_fee": bool  # 是否为政府服务费
             }
         """
         if industry_code not in self.resources:
@@ -216,18 +296,47 @@ class AbstractResourceMarket:
         # 累积需求（用于后续价格调整）
         resource.total_demand += quantity
         
-        # 记录交易
+        # 获取资金接收方（政府/企业/虚拟账户）
+        receiver_id = self.get_receiver_id(industry_code)
+        is_government_fee = industry_code in GOVERNMENT_INDUSTRY_CODES
+        
+        # 记录交易（本地备份）
         transaction = {
             "period": period,
             "resource": industry_code,
             "buyer": buyer_id,
+            "receiver": receiver_id,
             "quantity": quantity,
             "unit": resource.unit.value,
             "unit_price": unit_price,
             "total_cost": total_cost,
-            "base_price": resource.base_price
+            "base_price": resource.base_price,
+            "is_government_fee": is_government_fee
         }
         self.transactions.append(transaction)
+        
+        # 通过 EconomicCenter 记录交易并执行转账
+        # EconomicCenter 负责：1) 扣减买方余额 2) 增加卖方余额 3) 记录交易
+        if self.economic_center is not None:
+            try:
+                import ray
+                ray.get(self.economic_center.record_resource_purchase.remote(
+                    month=period,
+                    buyer_id=buyer_id,
+                    industry_code=industry_code,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_cost=total_cost,
+                    unit=resource.unit.value,
+                    base_price=resource.base_price,
+                    receiver_id=receiver_id  # 资金流向真实的企业或政府
+                ))
+                logger.info(
+                    f"资源采购: {buyer_id} → {receiver_id} ${total_cost:.2f} ({industry_code})"
+                    f"{' [政府服务费]' if is_government_fee else ''}"
+                )
+            except Exception as e:
+                logger.error(f"EconomicCenter 记录交易失败: {e}")
         
         logger.debug(
             f"{buyer_id} 购买 {resource.name}: "

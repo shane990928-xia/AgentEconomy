@@ -64,11 +64,19 @@ def create_firms(
         firms.append(firm)
     
     # Category 3: 服务商（有 subgroups）
+    # 注意：government_sectors 不创建为独立企业，其费用由 Government Agent 收取
     cat3 = industry_cate_map.get("category_3_cost_drivers", {})
+    GOVERNMENT_SUBGROUP = "government_sectors"  # 政府行业子组，跳过不创建企业
+    
     for subgroup_name, subgroup_info in cat3.get("subgroups", {}).items():
+        # 跳过政府行业，这些由 Government Agent 处理
+        if subgroup_name == GOVERNMENT_SUBGROUP:
+            continue
+            
         for industry_code, industry_name in subgroup_info.get("industries", {}).items():
+            firm_id = f"svc_{industry_code}_{uuid4().hex[:8]}"
             firm = ServiceFirm(
-                firm_id=f"svc_{industry_code}_{uuid4().hex[:8]}",
+                firm_id=firm_id,
                 name=industry_name,
                 industry=industry_code,
                 industry_type=f"category_3_{subgroup_name}",
@@ -78,8 +86,36 @@ def create_firms(
                 abstract_resource_market=abstract_resource_market,
             )
             firms.append(firm)
+            
+            # 注册到 AbstractResourceMarket，建立 industry_code → firm_id 映射
+            # 这样当有人采购该行业资源时，资金会流向真实的 ServiceFirm
+            if abstract_resource_market is not None:
+                abstract_resource_market.register_firm(industry_code, firm_id)
     
     return firms
+
+
+# 政府行业代码集合（用于其他模块判断）
+GOVERNMENT_INDUSTRY_CODES = frozenset(
+    industry_cate_map.get("category_3_cost_drivers", {})
+    .get("subgroups", {})
+    .get("government_sectors", {})
+    .get("industries", {})
+    .keys()
+)
+
+
+def is_government_industry(industry_code: str) -> bool:
+    """
+    判断行业代码是否为政府行业
+    
+    Args:
+        industry_code: 行业代码
+        
+    Returns:
+        True if government industry, False otherwise
+    """
+    return industry_code in GOVERNMENT_INDUSTRY_CODES
 
 
 def create_firms_by_category(
