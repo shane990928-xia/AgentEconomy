@@ -60,14 +60,14 @@ class Simulator:
             self.product_market = ProductMarket.remote()
             self.labor_market = LaborMarket.remote()
             
-            self.government = Government.remote(
+            self.government = Government(
                     government_id="gov_main_simulation",
                     initial_budget=10000000.0,
                     tax_policy=tax_policy,
                     economic_center=self.economic_center
                 )
 
-            await self.government.initialize.remote()
+            self.government.initialize()
             
             # Initialize bank
             self.bank = Bank(

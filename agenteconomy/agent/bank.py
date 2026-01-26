@@ -140,7 +140,7 @@ class Bank:
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to process deposit for household {household_id}: {e}")
+            logger.error(f"Failed to process deposit for household {household_id}: {e}")
             return False
     
     async def withdraw(self, household_id: str, amount: float, month: int) -> bool:
@@ -159,12 +159,12 @@ class Bank:
             return False
         
         if household_id not in self.savings_accounts:
-            self.logger.warning(f"No savings account found for household {household_id}")
+            logger.warning(f"No savings account found for household {household_id}")
             return False
         
         account = self.savings_accounts[household_id]
         if account.balance < amount:
-            self.logger.warning(f"Insufficient savings balance for household {household_id}: ${account.balance:.2f} < ${amount:.2f}")
+            logger.warning(f"Insufficient savings balance for household {household_id}: ${account.balance:.2f} < ${amount:.2f}")
             return False
         
         # Transfer funds: bank -> household
@@ -180,11 +180,11 @@ class Bank:
             account.balance -= amount
             self.total_deposits -= amount
             
-            self.logger.info(f"Household {household_id} withdrew ${amount:.2f} from bank")
+            logger.info(f"Household {household_id} withdrew ${amount:.2f} from bank")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to process withdrawal for household {household_id}: {e}")
+            logger.error(f"Failed to process withdrawal for household {household_id}: {e}")
             return False
     
     async def calculate_and_pay_monthly_interest(self, month: int) -> float:
@@ -229,10 +229,10 @@ class Bank:
                         "new_balance": account.balance
                     })
                     
-                    self.logger.debug(f"Paid ${interest_amount:.4f} interest to household {household_id}")
+                    logger.debug(f"Paid ${interest_amount:.4f} interest to household {household_id}")
                     
                 except Exception as e:
-                    self.logger.error(f"Failed to pay interest to household {household_id}: {e}")
+                    logger.error(f"Failed to pay interest to household {household_id}: {e}")
         
         self.total_interest_paid += total_interest_paid
         if total_interest_paid > 0:

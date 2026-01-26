@@ -2,9 +2,8 @@ from typing import Optional
 from agenteconomy.center.Model import *
 from agenteconomy.center.Ecocenter import EconomicCenter
 from agenteconomy.utils.logger import get_logger
-import asyncio
+import ray
 
-logger = get_logger(name="government")
 
 class Government:
     """
@@ -50,16 +49,17 @@ class Government:
         self.initial_budget = initial_budget
         # Store dependencies
         self.economic_center = economic_center
+        self.logger = get_logger(name="government")
 
-    async def initialize(self):
+    def initialize(self):
         """
         ## Initialize Government Agent
         Asynchronously initializes the government agent.
         """
         if self.economic_center:
             try:
-                await asyncio.gather(self.economic_center.init_agent_ledger.remote(self.government_id, self.initial_budget),
-                                     self.economic_center.register_id.remote(self.government_id, 'government')
+                ray.get([self.economic_center.init_agent_ledger.remote(self.government_id, self.initial_budget),
+                                     self.economic_center.register_id.remote(self.government_id, 'government')]
                 )
                 self.logger.info(f"Government {self.government_id} registered in EconomicCenter")
             except Exception as e:

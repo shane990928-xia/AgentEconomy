@@ -30,6 +30,7 @@ import ray
 from dotenv import load_dotenv
 
 from agenteconomy.center.Model import *
+from agenteconomy.center.transaction import PeriodStatistics
 from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.product_attribute_loader import inject_product_attributes
 
@@ -103,6 +104,10 @@ class EconomicCenter:
         
         # ===== Transaction & Financial Tracking =====
         self.tx_history: List[Transaction] = []  # Store transaction history
+        self.tx_by_month: Dict[int, List[Transaction]] = defaultdict(list)
+        self.tx_by_type: Dict[str, List[Transaction]] = defaultdict(list)
+        self.tx_by_party: Dict[str, List[Transaction]] = defaultdict(list)
+        self.period_statistics: Dict[int, PeriodStatistics] = {}
         self.wage_history: List[Wage] = []
         self.firm_financials: Dict[str, Dict[str, float]] = defaultdict(lambda: {"total_income": 0.0, "total_expenses": 0.0})  # 企业财务记录
         self.firm_monthly_financials: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"income": 0.0, "expenses": 0.0}))  # 企业月度财务记录
@@ -518,12 +523,12 @@ class EconomicCenter:
             self._cd_industry_K_tot = dict(calibration.get("industry_K_tot", {}) or {})
             self._cd_firm_K = dict(calibration.get("firm_K", {}) or {})
             self._cd_firm_A = dict(calibration.get("firm_A", {}) or {})
-            logger.info(
+            self.logger.info(
                 f"✅ CD校准结果已写入EconomicCenter: industries={len(self._cd_industry_A)}, firms(K)={len(self._cd_firm_K)}, firms(A)={len(self._cd_firm_A)}"
             )
             return True
         except Exception as e:
-            logger.error(f"写入CD校准结果失败: {e}")
+            self.logger.error(f"写入CD校准结果失败: {e}")
             return False
 
 
@@ -538,7 +543,7 @@ class EconomicCenter:
         if agent_id not in self.ledger:
             ledger = Ledger.create(agent_id, amount=initial_amount)
             self.ledger[agent_id] = ledger
-            # logger.info(f"Initialized ledger for agent {agent_id} with amount {initial_amount}")
+            # self.logger.info(f"Initialized ledger for agent {agent_id} with amount {initial_amount}")
     
     def init_agent_product(self, agent_id: str, product: Optional[Product]=None):
         """
@@ -550,7 +555,7 @@ class EconomicCenter:
         
         if product:
             self._add_or_merge_product(agent_id, product)
-            # logger.info(f"Initialized product {product.name} for agent {agent_id} with amount {product.amount}")
+            # self.logger.info(f"Initialized product {product.name} for agent {agent_id} with amount {product.amount}")
 
     def init_agent_labor(self, agent_id:str, labor:[LaborHour]=[]):
         """
@@ -676,6 +681,65 @@ class EconomicCenter:
         result['total_income'] = self.firm_financials[agent_id].get("total_income", 0.0)
         result['total_expenses'] = self.firm_financials[agent_id].get("total_expenses", 0.0)
         return result
+
+    def get_transactions(
+        self,
+        month: Optional[int] = None,
+        tx_type: Optional[str] = None,
+        party_id: Optional[str] = None,
+    ) -> List[Transaction]:
+        if month is None and tx_type is None and party_id is None:
+            return list(self.tx_history)
+
+        base: List[Transaction]
+        if month is not None:
+            month = int(month)
+            if month in self.tx_by_month:
+                base = self.tx_by_month.get(month, []) or []
+            else:
+                base = self.tx_history
+        elif party_id is not None:
+            party_id = str(party_id)
+            if party_id in self.tx_by_party:
+                base = self.tx_by_party.get(party_id, []) or []
+            else:
+                base = self.tx_history
+        elif tx_type is not None:
+            tx_type = str(tx_type)
+            if tx_type in self.tx_by_type:
+                base = self.tx_by_type.get(tx_type, []) or []
+            else:
+                base = self.tx_history
+        else:
+            base = self.tx_history
+
+        filtered = base
+        if party_id is not None:
+            party_id = str(party_id)
+            filtered = [
+                tx for tx in filtered
+                if getattr(tx, "sender_id", None) == party_id or getattr(tx, "receiver_id", None) == party_id
+            ]
+        if month is not None:
+            month = int(month)
+            filtered = [tx for tx in filtered if int(getattr(tx, "month", 0) or 0) == month]
+        if tx_type is not None:
+            tx_type = str(tx_type)
+            filtered = [tx for tx in filtered if str(getattr(tx, "type", "")) == tx_type]
+        return filtered
+
+    def get_period_statistics(self, month: int) -> PeriodStatistics:
+        month = int(month)
+        if month in self.period_statistics:
+            return self.period_statistics[month]
+
+        self._get_period_stats(month)
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = [tx for tx in self.tx_history if int(getattr(tx, "month", 0) or 0) == month]
+        for tx in transactions:
+            self._update_period_statistics(tx)
+        return self.period_statistics[month]
     
     def record_firm_income(self, firm_id: str, amount: float):
         """记录企业收入"""
@@ -793,7 +857,10 @@ class EconomicCenter:
         """
         total = 0.0
         try:
-            for tx in self.tx_history:
+            transactions = self.tx_by_month.get(int(month))
+            if transactions is None:
+                transactions = self.tx_history
+            for tx in transactions:
                 if int(getattr(tx, "month", 0) or 0) != int(month):
                     continue
                 if getattr(tx, "type", None) != "labor_payment":
@@ -854,20 +921,20 @@ class EconomicCenter:
             bool: 是否成功消耗
         """
         if firm_id not in self.products:
-            logger.warning(f"企业 {firm_id} 没有产品库存")
+            self.logger.warning(f"企业 {firm_id} 没有产品库存")
             return False
         
         for product in self.products[firm_id]:
             if product.product_id == product_id:
                 if product.amount >= quantity:
                     product.amount -= quantity
-                    # logger.info(f"企业 {firm_id} 商品 {product_id} 消耗 {quantity} 单位，剩余 {product.amount}")
+                    # self.logger.info(f"企业 {firm_id} 商品 {product_id} 消耗 {quantity} 单位，剩余 {product.amount}")
                     return True
                 else:
-                    logger.warning(f"企业 {firm_id} 商品 {product_id} 库存不足: {product.amount} < {quantity}")
+                    self.logger.warning(f"企业 {firm_id} 商品 {product_id} 库存不足: {product.amount} < {quantity}")
                     return False
         
-        logger.warning(f"企业 {firm_id} 没有找到商品 {product_id}")
+        self.logger.warning(f"企业 {firm_id} 没有找到商品 {product_id}")
         return False
     
 
@@ -883,7 +950,7 @@ class EconomicCenter:
             self.products[agent_id] = []
         
         self._add_or_merge_product(agent_id, product, product.amount)
-        # logger.info(f"Registered product {product.name} for agent {agent_id} with amount {product.amount}")
+        # self.logger.info(f"Registered product {product.name} for agent {agent_id} with amount {product.amount}")
 
     def _add_or_merge_product(self, agent_id:str, product: Product, quantity: float = 1.0):
 
@@ -929,7 +996,7 @@ class EconomicCenter:
             return self.category_profit_margins[category]
         
         # 如果找不到该大类，返回默认毛利率25%
-        logger.warning(f"未找到大类 '{category}' 的毛利率配置，使用默认值25%")
+        self.logger.warning(f"未找到大类 '{category}' 的毛利率配置，使用默认值25%")
         return 25.0
 
     def _ensure_product_cost_fields(self, product: Product, default_category: Optional[str] = None) -> None:
@@ -1034,7 +1101,7 @@ class EconomicCenter:
         available_stock = self._get_available_stock(seller_id, product_id)
         
         if available_stock < quantity:
-            logger.warning(f"🔒 库存预留失败: {product_name} 可用库存 {available_stock:.2f} < 需求 {quantity:.2f}")
+            self.logger.warning(f"🔒 库存预留失败: {product_name} 可用库存 {available_stock:.2f} < 需求 {quantity:.2f}")
             try:
                 if month is not None:
                     self.record_unmet_demand(
@@ -1066,7 +1133,7 @@ class EconomicCenter:
         # ===== Inventory Reservation System =====
         self.inventory_reservations[reservation.reservation_id] = reservation
         
-        logger.info(f"✅ 库存预留成功: {product_name} × {quantity:.2f} (预留ID: {reservation.reservation_id[:8]}...)")
+        self.logger.info(f"✅ 库存预留成功: {product_name} × {quantity:.2f} (预留ID: {reservation.reservation_id[:8]}...)")
         return reservation.reservation_id
     
     def confirm_reservation(self, reservation_id: str) -> bool:
@@ -1081,7 +1148,7 @@ class EconomicCenter:
         """
         # ===== Inventory Reservation System =====
         if reservation_id not in self.inventory_reservations:
-            logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
+            self.logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
             return False
         
         # ===== Inventory Reservation System =====
@@ -1089,7 +1156,7 @@ class EconomicCenter:
 
         # 只允许确认“活跃”的预留，避免重复确认/错误确认
         if reservation.status != 'active':
-            logger.warning(
+            self.logger.warning(
                 f"⚠️ 预留状态不可确认: {reservation.product_name} status={reservation.status} "
                 f"(预留ID: {reservation_id[:8]}...)"
             )
@@ -1097,13 +1164,13 @@ class EconomicCenter:
         
         # 检查预留是否已过期
         if time.time() > reservation.expires_at:
-            logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
+            self.logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
             reservation.status = 'expired'
             return False
         
         # 标记为已确认
         reservation.status = 'confirmed'
-        logger.info(f"✅ 预留已确认: {reservation.product_name} × {reservation.quantity:.2f}")
+        self.logger.info(f"✅ 预留已确认: {reservation.product_name} × {reservation.quantity:.2f}")
         
         return True
 
@@ -1125,13 +1192,13 @@ class EconomicCenter:
 
         # ===== Inventory Reservation System =====
         if reservation_id not in self.inventory_reservations:
-            logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
+            self.logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
             return False
 
         # ===== Inventory Reservation System =====
         reservation = self.inventory_reservations[reservation_id]
         if reservation.status != 'active':
-            logger.warning(
+            self.logger.warning(
                 f"⚠️ 预留不可用: {reservation.product_name} status={reservation.status} "
                 f"(预留ID: {reservation_id[:8]}...)"
             )
@@ -1139,20 +1206,20 @@ class EconomicCenter:
 
         if time.time() > reservation.expires_at:
             reservation.status = 'expired'
-            logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
+            self.logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
             return False
 
         if buyer_id is not None and reservation.buyer_id != buyer_id:
-            logger.warning(f"⚠️ 预留buyer不匹配: expected={buyer_id} got={reservation.buyer_id}")
+            self.logger.warning(f"⚠️ 预留buyer不匹配: expected={buyer_id} got={reservation.buyer_id}")
             return False
         if seller_id is not None and reservation.seller_id != seller_id:
-            logger.warning(f"⚠️ 预留seller不匹配: expected={seller_id} got={reservation.seller_id}")
+            self.logger.warning(f"⚠️ 预留seller不匹配: expected={seller_id} got={reservation.seller_id}")
             return False
         if product_id is not None and reservation.product_id != product_id:
-            logger.warning(f"⚠️ 预留product不匹配: expected={product_id} got={reservation.product_id}")
+            self.logger.warning(f"⚠️ 预留product不匹配: expected={product_id} got={reservation.product_id}")
             return False
         if quantity is not None and abs(float(reservation.quantity) - float(quantity)) > 1e-6:
-            logger.warning(f"⚠️ 预留quantity不匹配: expected={quantity} got={reservation.quantity}")
+            self.logger.warning(f"⚠️ 预留quantity不匹配: expected={quantity} got={reservation.quantity}")
             return False
 
         return True
@@ -1176,7 +1243,7 @@ class EconomicCenter:
         reservation = self.inventory_reservations[reservation_id]
         reservation.status = 'released'
         
-        logger.info(f"🔓 预留已释放: {reservation.product_name} × {reservation.quantity:.2f} (原因: {reason})")
+        self.logger.info(f"🔓 预留已释放: {reservation.product_name} × {reservation.quantity:.2f} (原因: {reason})")
         return True
     
     def _get_available_stock(self, seller_id: str, product_id: str) -> float:
@@ -1222,7 +1289,7 @@ class EconomicCenter:
                 expired_ids.append(reservation_id)
         
         if expired_ids:
-            logger.info(f"🧹 清理了 {len(expired_ids)} 个过期预留")
+            self.logger.info(f"🧹 清理了 {len(expired_ids)} 个过期预留")
     
     def get_reservation_stats(self) -> Dict[str, int]:
         """获取预留统计信息（用于监控）"""
@@ -1245,6 +1312,202 @@ class EconomicCenter:
     # =========================================================================
     # Transaction Processing
     # =========================================================================
+    def _ensure_ledger_entry(self, agent_id: str, initial_balance: float = 0.0) -> None:
+        if agent_id not in self.ledger:
+            self.ledger[agent_id] = Ledger.create(agent_id, float(initial_balance or 0.0))
+
+    def _get_period_stats(self, month: int) -> PeriodStatistics:
+        if month not in self.period_statistics:
+            self.period_statistics[month] = PeriodStatistics(period=month)
+        return self.period_statistics[month]
+
+    def _index_transaction(self, tx: Transaction) -> None:
+        try:
+            month = int(getattr(tx, "month", 0) or 0)
+        except Exception:
+            month = 0
+
+        self.tx_by_month[month].append(tx)
+        tx_type = str(getattr(tx, "type", "unknown") or "unknown")
+        self.tx_by_type[tx_type].append(tx)
+
+        sender_id = getattr(tx, "sender_id", None)
+        if sender_id:
+            self.tx_by_party[str(sender_id)].append(tx)
+        receiver_id = getattr(tx, "receiver_id", None)
+        if receiver_id:
+            self.tx_by_party[str(receiver_id)].append(tx)
+
+    def _update_period_statistics(self, tx: Transaction) -> None:
+        try:
+            month = int(getattr(tx, "month", 0) or 0)
+        except Exception:
+            month = 0
+
+        stats = self._get_period_stats(month)
+        amount = float(getattr(tx, "amount", 0.0) or 0.0)
+        tx_type = str(getattr(tx, "type", "") or "")
+
+        stats.total_transactions += 1
+        stats.total_volume += amount
+
+        if tx_type in ("purchase", "product_sale", "inherent_market", "government_procurement"):
+            stats.product_volume += amount
+            if tx_type == "purchase" and getattr(tx, "sender_id", None) in self.household_id:
+                stats.total_consumption += amount
+        elif tx_type == "labor_payment":
+            stats.wage_volume += amount
+        elif tx_type == "resource_purchase":
+            stats.resource_volume += amount
+        elif tx_type in ("consume_tax", "labor_tax", "fica_tax", "corporate_tax", "tax_collection"):
+            stats.tax_volume += amount
+
+        if tx_type == "government_procurement":
+            stats.total_government_spending += amount
+
+    def _record_transaction(
+        self,
+        sender_id: str,
+        receiver_id: str,
+        amount: float,
+        tx_type: str,
+        month: int,
+        assets: Optional[List[Any]] = None,
+        labor_hours: Optional[List[LaborHour]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        related_transaction_id: Optional[str] = None,
+        status: str = TransactionStatus.COMPLETED,
+    ) -> Transaction:
+        tx_kwargs = {
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "amount": float(amount or 0.0),
+            "type": tx_type,
+            "month": month,
+            "status": status,
+            "metadata": metadata or {},
+        }
+        if assets is not None:
+            tx_kwargs["assets"] = assets
+        if labor_hours is not None:
+            tx_kwargs["labor_hours"] = labor_hours
+        if related_transaction_id:
+            tx_kwargs["related_transaction_id"] = related_transaction_id
+        tx = Transaction(**tx_kwargs)
+        self.tx_history.append(tx)
+        self._index_transaction(tx)
+        self._update_period_statistics(tx)
+        return tx
+
+    def record_intermediate_goods_purchase(
+        self,
+        month: int,
+        buyer_id: str,
+        total_cost: float,
+        costs_by_industry: Optional[Dict[str, float]] = None,
+        items: Optional[List[Dict[str, Any]]] = None,
+        receiver_id: Optional[str] = None,
+    ) -> Optional[str]:
+        total_cost = float(total_cost or 0.0)
+        if total_cost <= 0:
+            return None
+
+        if receiver_id is None:
+            receiver_id = "market_intermediate_goods"
+
+        self._ensure_ledger_entry(buyer_id)
+        self._ensure_ledger_entry(receiver_id)
+
+        is_company = buyer_id in self.firm_id
+        if not is_company and self.ledger[buyer_id].amount < total_cost:
+            raise ValueError(
+                f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
+            )
+        elif is_company and self.ledger[buyer_id].amount < total_cost:
+            self.self.logger.info(
+                f"💳 Company {buyer_id} intermediate goods purchase with negative balance: "
+                f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
+            )
+
+        self.ledger[buyer_id].amount -= total_cost
+        self.ledger[receiver_id].amount += total_cost
+
+        if is_company:
+            self.record_firm_expense(buyer_id, total_cost)
+            self.record_firm_monthly_expense(buyer_id, month, total_cost)
+            self.firm_monthly_production_cost[buyer_id][month] += total_cost
+
+        tx = self._record_transaction(
+            sender_id=buyer_id,
+            receiver_id=receiver_id,
+            amount=total_cost,
+            tx_type="product_sale",
+            month=month,
+            metadata={
+                "purchase_category": "intermediate_goods",
+                "costs_by_industry": costs_by_industry or {},
+                "items": items or [],
+            },
+        )
+        return tx.id
+
+    def record_resource_purchase(
+        self,
+        month: int,
+        buyer_id: str,
+        industry_code: str,
+        quantity: float,
+        unit_price: float,
+        total_cost: float,
+        unit: Optional[str] = None,
+        base_price: Optional[float] = None,
+        receiver_id: Optional[str] = None,
+    ) -> Optional[str]:
+        total_cost = float(total_cost or 0.0)
+        if total_cost <= 0:
+            return None
+
+        if receiver_id is None:
+            receiver_id = f"market_resource_{industry_code}"
+
+        self._ensure_ledger_entry(buyer_id)
+        self._ensure_ledger_entry(receiver_id)
+
+        is_company = buyer_id in self.firm_id
+        if not is_company and self.ledger[buyer_id].amount < total_cost:
+            raise ValueError(
+                f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
+            )
+        elif is_company and self.ledger[buyer_id].amount < total_cost:
+            self.self.logger.info(
+                f"💳 Company {buyer_id} resource purchase with negative balance: "
+                f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
+            )
+
+        self.ledger[buyer_id].amount -= total_cost
+        self.ledger[receiver_id].amount += total_cost
+
+        if is_company:
+            self.record_firm_expense(buyer_id, total_cost)
+            self.record_firm_monthly_expense(buyer_id, month, total_cost)
+            self.firm_monthly_production_cost[buyer_id][month] += total_cost
+
+        tx = self._record_transaction(
+            sender_id=buyer_id,
+            receiver_id=receiver_id,
+            amount=total_cost,
+            tx_type="resource_purchase",
+            month=month,
+            metadata={
+                "industry_code": industry_code,
+                "quantity": float(quantity or 0.0),
+                "unit_price": float(unit_price or 0.0),
+                "unit": unit,
+                "base_price": base_price,
+            },
+        )
+        return tx.id
+
     def process_batch_purchases(self, month: int, buyer_id: str, purchase_list: List[Dict]) -> List[Optional[str]]:
         """
         批量处理购买，减少Ray远程调用次数
@@ -1311,7 +1574,7 @@ class EconomicCenter:
             ):
                 # 尽量释放无效预留，避免“卡死库存”
                 self.release_reservation(reservation_id, reason="invalid_reservation")
-                logger.warning(f"预留无效，购买失败: {product.name} (预留ID: {reservation_id[:8]}...)")
+                self.logger.warning(f"预留无效，购买失败: {product.name} (预留ID: {reservation_id[:8]}...)")
                 return False
         else:
             # 无预留ID：使用旧的检查方式（向后兼容）
@@ -1322,7 +1585,7 @@ class EconomicCenter:
                     if pro.product_id == product.product_id:
                         current_stock = pro.amount
                         break
-                logger.warning(f"库存不足，购买失败: {product.name} 需要 {quantity}，但库存不足, 剩余库存: {current_stock}")
+                self.logger.warning(f"库存不足，购买失败: {product.name} 需要 {quantity}，但库存不足, 剩余库存: {current_stock}")
                 try:
                     self.record_unmet_demand(
                         month=int(month),
@@ -1343,15 +1606,17 @@ class EconomicCenter:
 
         # 创建消费税交易记录（税收部分）
         tax_amount = base_price * self.vat_rate
-        tax_tx = Transaction(
-            id=str(uuid4()),
+        tax_tx = self._record_transaction(
             sender_id=buyer_id,
             receiver_id="gov_main_simulation",  # 固定政府ID
             amount=tax_amount,
-            type='consume_tax',
-            month=month
+            tx_type='consume_tax',
+            month=month,
+            metadata={
+                "tax_base": base_price,
+                "tax_rate": self.vat_rate,
+            },
         )
-        self.tx_history.append(tax_tx)
         
         # 政府收取消费税
         self.ledger["gov_main_simulation"].amount += tax_amount
@@ -1411,16 +1676,20 @@ class EconomicCenter:
                 unit_cost=getattr(product, "unit_cost", None),
             )
 
-        purchase_tx = Transaction(
-            id=str(uuid4()),
+        purchase_tx = self._record_transaction(
             sender_id=buyer_id,
             receiver_id=seller_id,
             amount=base_price,
             assets=[product_asset],
-            type='purchase',
-            month=month
+            tx_type='purchase',
+            month=month,
+            metadata={
+                "product_id": getattr(product_asset, "product_id", None),
+                "quantity": float(quantity or 0.0),
+                "unit_price": float(getattr(product_asset, "price", 0.0) or 0.0),
+                "reservation_id": reservation_id,
+            },
         )
-        self.tx_history.append(purchase_tx)
 
         # 💰 企业收入（现金流口径）：只记录真实收款额
         # 说明：生产成本应在“生产补货阶段”作为当月支出记录，而不是在销售发生时扣除。
@@ -1490,37 +1759,48 @@ class EconomicCenter:
             net_wage = 0.0
         
         # 创建工资支付交易记录
-        wage_tx = Transaction(
-            id=str(uuid4()),
+        wage_tx = self._record_transaction(
             sender_id=firm_id,
             receiver_id=household_id,
             amount=net_wage,  # 家庭收到税后工资
-            type='labor_payment',
+            tx_type='labor_payment',
             month=month,
+            metadata={
+                "gross_wage": gross_wage,
+                "net_wage": net_wage,
+                "income_tax": income_tax,
+                "fica_tax": fica_tax,
+                "wage_hour": wage_hour,
+                "hours_per_period": hours,
+                "periods_per_month": ppm,
+            },
         )
-        self.tx_history.append(wage_tx)
         
         # 创建个人所得税交易记录
-        tax_tx = Transaction(
-            id=str(uuid4()),
+        tax_tx = self._record_transaction(
             sender_id=household_id,
             receiver_id="gov_main_simulation",
             amount=income_tax,
-            type='labor_tax',
+            tx_type='labor_tax',
             month=month,
+            metadata={
+                "gross_wage": gross_wage,
+                "tax_rate": (income_tax / gross_wage) if gross_wage > 0 else 0.0,
+            },
         )
-        self.tx_history.append(tax_tx)
         
         # 创建 FICA 税交易记录
-        fica_tx = Transaction(
-            id=str(uuid4()),
+        fica_tx = self._record_transaction(
             sender_id=household_id,
             receiver_id="gov_main_simulation",
             amount=fica_tax,
-            type='fica_tax',
+            tx_type='fica_tax',
             month=month,
+            metadata={
+                "gross_wage": gross_wage,
+                "tax_rate": fica_tax_rate,
+            },
         )
-        self.tx_history.append(fica_tx)
 
         # 更新账本
         self.ledger[household_id].amount += net_wage  # 家庭收到税后工资
@@ -1568,24 +1848,27 @@ class EconomicCenter:
         Process household settlement, including asset and labor hour settlement.
         计算家庭累积收入和支出
         """
-        # breakpoint()
+        household_key = str(household_id)
 
         total_income = 0
         total_expense = 0
-        for tx in self.tx_history:
-            if tx.type == 'purchase' and tx.sender_id == household_id:
+        transactions = self.tx_by_party.get(household_key)
+        if transactions is None:
+            transactions = self.tx_history
+        for tx in transactions:
+            if tx.type == 'purchase' and tx.sender_id == household_key:
                 total_expense += tx.amount
 
-            elif tx.type == 'service' and tx.sender_id == household_id:
+            elif tx.type == 'service' and tx.sender_id == household_key:
                 total_expense += tx.amount  # 服务费用直接计入支出，不需要税收调整
 
-            elif tx.type == 'labor_payment' and tx.receiver_id == household_id:
+            elif tx.type == 'labor_payment' and tx.receiver_id == household_key:
                 total_income += tx.amount
 
-            elif tx.type == 'redistribution' and tx.receiver_id == household_id:
+            elif tx.type == 'redistribution' and tx.receiver_id == household_key:
                 total_income += tx.amount
 
-            elif tx.type == 'interest' and tx.receiver_id == household_id:
+            elif tx.type == 'interest' and tx.receiver_id == household_key:
                 total_income += tx.amount
 
         return total_income, total_expense
@@ -1595,26 +1878,30 @@ class EconomicCenter:
         计算家庭月度收入和支出统计(收入不统计再分配)
         如果不指定target_month，返回所有月份的统计
         """
+        household_key = str(household_id)
         monthly_income = 0
         monthly_expense = 0
         
         month = target_month
 
 
-        for tx in self.tx_history:
-            if tx.type == 'purchase' and tx.sender_id == household_id and tx.month == month:
+        transactions = self.tx_by_party.get(household_key)
+        if transactions is None:
+            transactions = self.tx_history
+        for tx in transactions:
+            if tx.type == 'purchase' and tx.sender_id == household_key and tx.month == month:
                 monthly_expense += tx.amount
             # 消费税属于“含税购物支出”的一部分（家庭真实现金流支出）
-            elif tx.type == 'consume_tax' and tx.sender_id == household_id and tx.month == month:
+            elif tx.type == 'consume_tax' and tx.sender_id == household_key and tx.month == month:
                 monthly_expense += tx.amount
 
-            elif tx.type == 'service' and tx.sender_id == household_id and tx.month == month:
+            elif tx.type == 'service' and tx.sender_id == household_key and tx.month == month:
                 monthly_expense += tx.amount
 
-            elif tx.type == 'labor_payment' and tx.receiver_id == household_id and tx.month == month:
+            elif tx.type == 'labor_payment' and tx.receiver_id == household_key and tx.month == month:
                 monthly_income += tx.amount
 
-            elif tx.type == 'interest' and tx.receiver_id == household_id and tx.month == month:
+            elif tx.type == 'interest' and tx.receiver_id == household_key and tx.month == month:
                 monthly_income += tx.amount
 
             # elif tx.type == 'redistribution' and tx.receiver_id == household_id and tx.month == month:
@@ -1644,7 +1931,10 @@ class EconomicCenter:
             "total_tax": 0.0
         }
         
-        for tx in self.tx_history:
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = self.tx_history
+        for tx in transactions:
             if tx.month == month and tx.receiver_id == "gov_main_simulation":
                 if tx.type == 'consume_tax':
                     tax_summary["consume_tax"] += tx.amount
@@ -1947,29 +2237,25 @@ class EconomicCenter:
         """
         添加利息交易记录
         """
-        tx = Transaction(
-            id=str(uuid4()),
+        tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=amount,
-            type='interest',
-            month=month
+            tx_type='interest',
+            month=month,
         )
-        self.tx_history.append(tx)
         return tx.id
     def add_redistribution_tx(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
         """
         添加再分配交易记录
         """
-        tx = Transaction(
-            id=str(uuid4()),
+        tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=amount,
-            type='redistribution',
-            month=month
+            tx_type='redistribution',
+            month=month,
         )
-        self.tx_history.append(tx)
         return tx.id
 
     def add_tx_service(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
@@ -1995,7 +2281,7 @@ class EconomicCenter:
             raise ValueError(f"Insufficient balance for household {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
         elif is_company and self.ledger[sender_id].amount < amount:
             # 企业余额不足，允许负债交易，记录日志
-            logger.info(f"💳 Company {sender_id} transaction with negative balance: "
+            self.logger.info(f"💳 Company {sender_id} transaction with negative balance: "
                       f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
         
         # 直接更新账本
@@ -2003,18 +2289,14 @@ class EconomicCenter:
         self.ledger[receiver_id].amount += amount
         
         # 创建服务交易记录
-        tx = Transaction(
-            id=str(uuid4()),
+        tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=amount,
             assets=[],  # 服务交易没有具体商品
-            type='service',  # 使用service类型
-            month=month
+            tx_type='service',  # 使用service类型
+            month=month,
         )
-        
-        # 添加到交易历史
-        self.tx_history.append(tx)
        
         return tx.id
     
@@ -2057,7 +2339,7 @@ class EconomicCenter:
             raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
         elif is_company and self.ledger[sender_id].amount < amount:
             # 企业余额不足，允许负债交易
-            logger.info(f"💳 Company {sender_id} inherent market transaction with negative balance: "
+            self.logger.info(f"💳 Company {sender_id} inherent market transaction with negative balance: "
                       f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
 
         # 🔒 注意：固有市场可选择在此处原子扣库存（consume_inventory=True），避免“先扣库存后记账”失败导致不一致。
@@ -2078,18 +2360,18 @@ class EconomicCenter:
                             )
                         product.amount = max(0.0, float(product.amount) - float(quantity))
                         current_inventory = product.amount
-                        logger.info(
+                        self.logger.info(
                             f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 消耗 {quantity}件，剩余 {current_inventory}件"
                         )
                     else:
                         # 旧行为：库存已在调用方扣减，这里仅记录扣减后的库存
-                        logger.info(
+                        self.logger.info(
                             f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 已消耗 {quantity}件，剩余 {current_inventory}件"
                         )
                     break
 
         if not product_found:
-            logger.warning(f"固有市场购买: 未找到企业 {receiver_id} 的商品 {product_id}")
+            self.logger.warning(f"固有市场购买: 未找到企业 {receiver_id} 的商品 {product_id}")
             if consume_inventory:
                 raise ValueError(f"Product not found for inherent market: {receiver_id}:{product_id}")
 
@@ -2108,15 +2390,19 @@ class EconomicCenter:
             if gov_id in self.ledger:
                 self.ledger[sender_id].amount -= tax_amount
                 self.ledger[gov_id].amount += tax_amount
-            tax_tx = Transaction(
-                id=str(uuid4()),
+            tax_tx = self._record_transaction(
                 sender_id=sender_id,
                 receiver_id=gov_id,
                 amount=tax_amount,
-                type='consume_tax',
-                month=month
+                tx_type='consume_tax',
+                month=month,
+                metadata={
+                    "tax_base": amount,
+                    "tax_rate": self.vat_rate,
+                    "product_id": product_id,
+                    "quantity": float(quantity or 0.0),
+                },
             )
-            self.tx_history.append(tax_tx)
         
         # 💰 企业收入（现金流口径）：只记录真实收款额；生产成本在生产阶段记支出
         revenue = amount
@@ -2140,20 +2426,26 @@ class EconomicCenter:
         product_kwargs = inject_product_attributes(product_kwargs, product_id)
         product_asset = Product(**product_kwargs)
         
-        tx = Transaction(
-            id=str(uuid4()),
+        tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=amount,
             assets=[product_asset],
-            type='inherent_market',
-            month=month
+            tx_type='inherent_market',
+            month=month,
+            metadata={
+                "product_id": product_id,
+                "product_name": product_name,
+                "quantity": float(quantity or 0.0),
+                "unit_price": float(unit_price or 0.0),
+                "product_classification": product_classification,
+                "consume_inventory": consume_inventory,
+            },
         )
-        self.tx_history.append(tx)
         
         # 企业所得税改为“月度结算”（按净利润计税），避免与生产预算形成循环依赖。
         
-        # logger.info(f"固有市场交易: 政府购买商品 {product_name}(ID:{product_id}, {product_classification}) "
+        # self.logger.info(f"固有市场交易: 政府购买商品 {product_name}(ID:{product_id}, {product_classification}) "
         #            f"数量 {quantity} 金额 ${amount:.2f}, 成本 ${cost:.2f}, 毛利润 ${gross_profit:.2f} (毛利率{profit_margin}%), "
         #            f"企业所得税 ${corporate_tax:.2f}")
         
@@ -2239,16 +2531,22 @@ class EconomicCenter:
         product_kwargs = inject_product_attributes(product_kwargs, str(product_id))
         product_asset = Product(**product_kwargs)
 
-        tx = Transaction(
-            id=str(uuid4()),
+        tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=float(amount or 0.0),
             assets=[product_asset],
-            type="government_procurement",
+            tx_type="government_procurement",
             month=month,
+            metadata={
+                "product_id": product_id,
+                "product_name": product_name,
+                "quantity": float(quantity or 0.0),
+                "unit_price": float(unit_price or 0.0),
+                "product_classification": product_classification,
+                "consume_inventory": consume_inventory,
+            },
         )
-        self.tx_history.append(tx)
         return tx.id
     
 
@@ -2297,10 +2595,10 @@ class EconomicCenter:
             
             # 更新ProductMarket的商品列表
             await product_market.update_products_from_economic_center.remote(all_products)
-            logger.info(f"已同步 {len(all_products)} 个商品到ProductMarket")
+            self.logger.info(f"已同步 {len(all_products)} 个商品到ProductMarket")
             return True
         except Exception as e:
-            logger.error(f"同步库存到ProductMarket失败: {e}")
+            self.logger.error(f"同步库存到ProductMarket失败: {e}")
             return False
     
     def update_product_prices_based_on_sales(
@@ -2320,8 +2618,8 @@ class EconomicCenter:
         price_changes = {}
         
         # 🔍 调试信息：检查 firm_id 列表
-        logger.info(f"📋 已注册的企业数量: {len(self.firm_id)}")
-        logger.info(f"📦 商品所有者数量: {len(self.products)}")
+        self.logger.info(f"📋 已注册的企业数量: {len(self.firm_id)}")
+        self.logger.info(f"📦 商品所有者数量: {len(self.products)}")
         
         processed_owners = 0
         skipped_owners = 0
@@ -2391,12 +2689,12 @@ class EconomicCenter:
             else:
                 skipped_owners += 1
         
-        logger.info(f"✅ 处理了 {processed_owners} 个企业的商品，跳过了 {skipped_owners} 个非企业所有者")
+        self.logger.info(f"✅ 处理了 {processed_owners} 个企业的商品，跳过了 {skipped_owners} 个非企业所有者")
         print(f"\n📊 价格调整汇总: 涨价 {price_increase_count} 种商品, 降价 {price_decrease_count} 种商品")
         
         if skipped_owners > 0:
-            logger.warning(f"⚠️ 跳过的所有者示例: {list(self.products.keys())[:5]}")
-            logger.warning(f"⚠️ 已注册企业ID示例: {self.firm_id[:5] if self.firm_id else '空列表'}")
+            self.logger.warning(f"⚠️ 跳过的所有者示例: {list(self.products.keys())[:5]}")
+            self.logger.warning(f"⚠️ 已注册企业ID示例: {self.firm_id[:5] if self.firm_id else '空列表'}")
         
         return price_changes
     
@@ -2442,22 +2740,22 @@ class EconomicCenter:
             if supply_demand_ratio < 0.5:
                 # 库存不足销量的一半 - 严重供不应求
                 base_adjustment += 0.25  # 大幅涨价25%
-                logger.debug(f"🔥 严重供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+                self.logger.debug(f"🔥 严重供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
             elif supply_demand_ratio < 1.0:
                 # 库存不足一个周期的销量 - 供不应求
                 base_adjustment += 0.15  # 涨价15%
-                logger.debug(f"📈 供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+                self.logger.debug(f"📈 供不应求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
             elif supply_demand_ratio < 2.0:
                 # 库存略高于销量 - 供需平衡
                 base_adjustment += 0.02  # 小幅涨价2%
             elif supply_demand_ratio < 5.0:
                 # 库存明显高于销量 - 供过于求
                 base_adjustment -= 0.08  # 降价8%
-                logger.debug(f"📉 供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+                self.logger.debug(f"📉 供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
             else:
                 # 库存严重过剩 - 严重供过于求
                 base_adjustment -= 0.15  # 大幅降价15%
-                logger.debug(f"⚠️ 严重供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
+                self.logger.debug(f"⚠️ 严重供过于求: 库存{current_inventory:.1f} / 销量{quantity_sold:.1f} = {supply_demand_ratio:.2f}")
         
         # 4. 根据收入效率调整
         if revenue > 0 and quantity_sold > 0:
@@ -2484,7 +2782,7 @@ class EconomicCenter:
         # 记录显著的价格变化
         if abs(final_price - current_price) / current_price > 0.1:  # 变化超过10%
             inv_str = "N/A" if current_inventory is None else f"{float(current_inventory):.1f}"
-            logger.info(f"💹 显著价格变动: ${current_price:.2f} → ${final_price:.2f} "
+            self.logger.info(f"💹 显著价格变动: ${current_price:.2f} → ${final_price:.2f} "
                        f"({((final_price - current_price) / current_price * 100):+.1f}%) | "
                        f"销量:{quantity_sold:.1f} | 库存:{inv_str} | "
                        f"需求:{demand_level}")
@@ -2497,10 +2795,10 @@ class EconomicCenter:
         """
         try:
             success = await product_market.update_product_prices.remote(price_changes)
-            logger.info(f"已同步 {len(price_changes)} 个商品的价格变更到ProductMarket")
+            self.logger.info(f"已同步 {len(price_changes)} 个商品的价格变更到ProductMarket")
             return success
         except Exception as e:
-            logger.error(f"同步价格变更到ProductMarket失败: {e}")
+            self.logger.error(f"同步价格变更到ProductMarket失败: {e}")
             return False
     
 
@@ -2529,7 +2827,10 @@ class EconomicCenter:
         sales_stats = {}
         
         # 从交易历史中收集销售数据
-        for tx in self.tx_history:
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = self.tx_history
+        for tx in transactions:
             if tx.month == month:
                 seller_id = tx.receiver_id
                 
@@ -2853,7 +3154,7 @@ class EconomicCenter:
         }
         self.production_stats_by_month[month] = production_stats
 
-        logger.info(
+        self.logger.info(
             f"✅ Month {month} 初始化完成: 市场目标(不含税)=${market_total_value_target_ex_tax:,.2f}, "
             f"初始化SKU数={products_initialized}, 产出(件数)={total_output_qty:,.2f}, 成本支出=${total_cost_spent:,.2f}"
         )
@@ -2874,7 +3175,7 @@ class EconomicCenter:
                 - labor_productivity_factor: 劳动力生产率
                 - labor_elasticity: 劳动力弹性
         """
-        logger.info(f"🏭 开始第 {month} 月生产周期（月初生产）...")
+        self.logger.info(f"🏭 开始第 {month} 月生产周期（月初生产）...")
 
         # ========= 月1：仅期初库存初始化（不走生产函数） =========
         # 说明：用户要求 month=1 只使用初始值（没有 month=0 的参考数据），不使用生产函数产出。
@@ -3294,15 +3595,15 @@ class EconomicCenter:
             # 5. 同步库存到ProductMarket
             await self.sync_product_inventory_to_market(product_market)
 
-            logger.info(f"✅ 第 {month} 月生产周期完成（统一CD）")
-            logger.info(f"   CD产出(件数): {total_qty:.2f} | CD产出价值: ${total_output_value:,.2f} | 成本支出: ${total_cost_spent:,.2f}")
+            self.logger.info(f"✅ 第 {month} 月生产周期完成（统一CD）")
+            self.logger.info(f"   CD产出(件数): {total_qty:.2f} | CD产出价值: ${total_output_value:,.2f} | 成本支出: ${total_cost_spent:,.2f}")
 
             # 缓存本月生产统计
             self.production_stats_by_month[month] = production_stats
             return production_stats
             
         except Exception as e:
-            logger.error(f"❌ 第 {month} 月生产周期失败: {e}")
+            self.logger.error(f"❌ 第 {month} 月生产周期失败: {e}")
             # 失败也缓存，便于后续诊断
             self.production_stats_by_month[month] = production_stats
             return production_stats
@@ -3351,7 +3652,7 @@ class EconomicCenter:
             # 🔧 修改：允许企业负债缴税，即使余额为负也要扣税
             # 这样可以模拟企业即使亏损也需要缴纳企业所得税的情况
             if self.ledger[firm_id].amount < corporate_tax:
-                logger.info(f"💳 Company {firm_id} paying tax with insufficient balance: "
+                self.logger.info(f"💳 Company {firm_id} paying tax with insufficient balance: "
                           f"${self.ledger[firm_id].amount:.2f} → ${self.ledger[firm_id].amount - corporate_tax:.2f}")
             
             # 直接扣税，允许余额变为负数
@@ -3364,15 +3665,19 @@ class EconomicCenter:
             self.record_firm_monthly_expense(firm_id, month, corporate_tax)
             self.firm_monthly_corporate_tax[firm_id][month] += corporate_tax
 
-            corp_tax_tx = Transaction(
-                id=str(uuid4()),
+            corp_tax_tx = self._record_transaction(
                 sender_id=firm_id,
                 receiver_id=gov_id,
                 amount=corporate_tax,
-                type='corporate_tax',
-                month=month
+                tx_type='corporate_tax',
+                month=month,
+                metadata={
+                    "taxable_profit": taxable_profit,
+                    "tax_rate": self.corporate_tax_rate,
+                    "income": income,
+                    "expenses_pre_tax": expenses_pre_tax,
+                },
             )
-            self.tx_history.append(corp_tax_tx)
             results[firm_id] = corporate_tax
 
         self._corporate_tax_settled_months.add(month)
@@ -3560,7 +3865,7 @@ class EconomicCenter:
             # 1. 检查创新策略：抑制创新也允许LLM决策，但限制较低上限
             config = self.firm_innovation_config.get(firm.firm_id)
             if not config:
-                logger.warning(f"企业 {firm.firm_id} 没有创新配置，使用默认值")
+                self.logger.warning(f"企业 {firm.firm_id} 没有创新配置，使用默认值")
                 return 0.0
             
             strategy = config.innovation_strategy
@@ -3661,7 +3966,7 @@ Do NOT output any explanation, just the number.
                 return research_share
 
             except Exception as e:
-                logger.warning(f"LLM决策失败 {firm.firm_id}: {e}, 使用默认规则")
+                self.logger.warning(f"LLM决策失败 {firm.firm_id}: {e}, 使用默认规则")
 
             # 5. 回退方案：基于规则的决策
             print(f"🔍 企业 {firm.firm_id} 规则决策: 利润={monthly_profit:.0f}, 毛利率={profit_margin:.1f}%，政策信号={policy_signal}, 销量趋势={sales_trend:+.1f}%")
@@ -3669,13 +3974,13 @@ Do NOT output any explanation, just the number.
                 monthly_profit, profit_margin, policy_signal, sales_trend
             )
 
-            logger.debug(f"📊 企业 {firm.firm_id} 规则决策: 研发比例={research_share:.1%}")
+            self.logger.debug(f"📊 企业 {firm.firm_id} 规则决策: 研发比例={research_share:.1%}")
 
             research_share = max(0.0, min(max_research_share, research_share))
             return research_share
 
         except Exception as e:
-            logger.error(f"决策研发比例失败 {firm.firm_id}: {e}")
+            self.logger.error(f"决策研发比例失败 {firm.firm_id}: {e}")
             return 0.0
 
     def _decide_research_share_rule_based(
@@ -3773,7 +4078,7 @@ Do NOT output any explanation, just the number.
                     "abilities_count": len(employee_abilities)
                 })
                 
-                logger.debug(f"员工 {employee.get('household_id')}_{employee.get('lh_type')} ({job_soc}) 技能匹配度: {match_score:.3f}")
+                self.logger.debug(f"员工 {employee.get('household_id')}_{employee.get('lh_type')} ({job_soc}) 技能匹配度: {match_score:.3f}")
             
             # 计算平均匹配分数和有效劳动力
             avg_match_score = total_match_score / len(employees)
@@ -3786,7 +4091,7 @@ Do NOT output any explanation, just the number.
                     research_share = await self._decide_research_share_with_llm(firm, month)
                     self.firm_research_share.append({firm.firm_id: [research_share, month]})
                 except Exception as e:
-                    logger.error(f"计算企业 {firm.firm_id} 研发比例失败: {e}")
+                    self.logger.error(f"计算企业 {firm.firm_id} 研发比例失败: {e}")
                     research_share = 0.0
 
             research_share = max(0.0, min(1.0, research_share))
@@ -3804,7 +4109,7 @@ Do NOT output any explanation, just the number.
             }
             
         except Exception as e:
-            logger.error(f"计算企业 {firm.firm_id} 有效劳动力失败: {e}")
+            self.logger.error(f"计算企业 {firm.firm_id} 有效劳动力失败: {e}")
             return {
                 "total_employees": 0,
                 "effective_labor": 0.0,
@@ -3904,17 +4209,17 @@ Do NOT output any explanation, just the number.
                 job_skills = job_info.get('skills', {})
                 job_abilities = job_info.get('abilities', {})
                 
-                logger.debug(f"找到SOC {soc_code}的工作要求: {job_info.get('Title', 'Unknown')}")
+                self.logger.debug(f"找到SOC {soc_code}的工作要求: {job_info.get('Title', 'Unknown')}")
                 
                 return {
                     "skills": job_skills if isinstance(job_skills, dict) else {},
                     "abilities": job_abilities if isinstance(job_abilities, dict) else {}
                 }
             else:
-                logger.debug(f"未找到SOC {soc_code}的工作要求，使用默认要求")
+                self.logger.debug(f"未找到SOC {soc_code}的工作要求，使用默认要求")
                 
         except Exception as e:
-            logger.error(f"获取SOC {soc_code}工作要求失败: {e}")
+            self.logger.error(f"获取SOC {soc_code}工作要求失败: {e}")
 
 
     def _calculate_skill_match_score(self, worker_skills: Dict, worker_abilities: Dict,
@@ -4064,7 +4369,7 @@ Do NOT output any explanation, just the number.
                                 # jiaju_add_4 end
                                 print(f"🏭 企业 {firm.firm_id} 有效劳动力: {effective_labor['effective_labor']:.2f} (员工数: {firm.get_employees()})")
                         except Exception as e:
-                            logger.error(f"计算企业 {firm.firm_id} 劳动效率失败: {e}")
+                            self.logger.error(f"计算企业 {firm.firm_id} 劳动效率失败: {e}")
                             firm_labor_efficiency[firm.firm_id] = {"total_employees": 0, "effective_labor": 0.0, "avg_match_score": 0.0}
                             # 初始化创新到达次数为0，避免后续访问时出现KeyError
                             firm_innovation_arrivals[firm.firm_id] = 0
@@ -4106,12 +4411,12 @@ Do NOT output any explanation, just the number.
                 # 同步到月度统计容器（供外部导出/汇总）
                 self.firm_monthly_labor_production_value[firm_id][month] += float(company_output_value)
 
-                logger.debug(
+                self.logger.debug(
                     f"劳动力生产: 公司 {firm_id} 员工 {employee_count} 人，产出 {company_output:.2f} | 研发份额 {research_share:.2f} | 创新到达 {innovation_arrivals}"
                 )
 
         except Exception as e:
-            logger.warning(f"劳动力生产计算失败: {e}")
+            self.logger.warning(f"劳动力生产计算失败: {e}")
             import traceback
             traceback.print_exc()
         
@@ -4165,9 +4470,9 @@ Do NOT output any explanation, just the number.
                         company_products = [p for p in self.products[firm_id] if p.amount > 0]
                         if company_products:
                             await product_market.update_products_from_economic_center.remote(company_products)
-                            logger.info(f"已同步公司 {firm_id} 的创新更新到商品市场（{len(company_products)} 个商品）")
+                            self.logger.info(f"已同步公司 {firm_id} 的创新更新到商品市场（{len(company_products)} 个商品）")
                 except Exception as e:
-                    logger.warning(f"同步创新更新到商品市场失败: {e}")
+                    self.logger.warning(f"同步创新更新到商品市场失败: {e}")
 
     async def update_prices_innovation_arrival(self, firm_id: str, gamma: float = 1.2, month: int = 0):
         """
@@ -4181,7 +4486,7 @@ Do NOT output any explanation, just the number.
         print(f"🔬 公司 {firm_id} {month}月价格变化 {price_change}")
 
         if firm_id not in self.firm_innovation_config:
-            logger.warning(f"公司 {firm_id} 没有创新配置，无法更新劳动力因素")
+            self.logger.warning(f"公司 {firm_id} 没有创新配置，无法更新劳动力因素")
             return
         
         config = self.firm_innovation_config[firm_id]
@@ -4260,12 +4565,12 @@ Do NOT output any explanation, just the number.
         更新公司毛利率
         """
         if firm_id not in self.firm_innovation_config:
-            logger.warning(f"公司 {firm_id} 没有创新配置，无法更新毛利率")
+            self.logger.warning(f"公司 {firm_id} 没有创新配置，无法更新毛利率")
             return
         
         config = self.firm_innovation_config[firm_id]
         if config.profit_margin is None:
-            logger.warning(f"公司 {firm_id} 毛利率为None，无法更新")
+            self.logger.warning(f"公司 {firm_id} 毛利率为None，无法更新")
             return
         
         old_profit_margin = config.profit_margin
@@ -4299,7 +4604,7 @@ Do NOT output any explanation, just the number.
                 companies_employees[firm_id] = companies_employees.get(firm_id, 0) + 1
         
         except Exception as e:
-            logger.warning(f"获取公司员工数据失败: {e}")
+            self.logger.warning(f"获取公司员工数据失败: {e}")
         
         return companies_employees
 
@@ -4419,7 +4724,7 @@ Do NOT output any explanation, just the number.
                     priority_score = 1.0
                 
                 product_priorities[product_id] = priority_score
-                logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
+                self.logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
         
         # 若有家庭购买记录，则按家庭销量占比分配；
         # 否则回退到基于销量/库存的优先级逻辑。
@@ -4449,7 +4754,7 @@ Do NOT output any explanation, just the number.
                     else:
                         priority_score = 1.0
                     product_priorities[product_id] = priority_score
-                    logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
+                    self.logger.debug(f"劳动力生产: {product.name} (无销售记录, 库存{product.amount:.1f}, 优先级{priority_score})")
         
         # 按优先级分配产出
         total_priority = sum(product_priorities.values())
@@ -4482,10 +4787,10 @@ Do NOT output any explanation, just the number.
                 actual_output += product_output
                 actual_output_value += product_value
                 
-                logger.debug(f"劳动力产出: {product.name} 优先级 {priority:.2f}, 增加 {product_output:.2f}")
+                self.logger.debug(f"劳动力产出: {product.name} 优先级 {priority:.2f}, 增加 {product_output:.2f}")
         else:
             # 这种情况理论上不应该发生，因为所有产品都会有优先级
-            logger.warning(f"公司 {firm_id} 没有产品可以分配劳动力产出")
+            self.logger.warning(f"公司 {firm_id} 没有产品可以分配劳动力产出")
         
         return actual_output, actual_output_value
 
@@ -4547,7 +4852,7 @@ Do NOT output any explanation, just the number.
         if corporate_tax_rate is not None:
             self.corporate_tax_rate = corporate_tax_rate
 
-        logger.info(f"税率已更新: income_tax_rate={self.income_tax_rate:.1%}, vat_rate={self.vat_rate:.1%}, corporate_tax_rate={self.corporate_tax_rate:.1%}")
+        self.logger.info(f"税率已更新: income_tax_rate={self.income_tax_rate:.1%}, vat_rate={self.vat_rate:.1%}, corporate_tax_rate={self.corporate_tax_rate:.1%}")
 
 # ======================== 创新系统相关方法 ========================
 
@@ -4576,7 +4881,7 @@ Do NOT output any explanation, just the number.
             fund_share=fund_share
         )
         
-        logger.info(f"✅ 企业 {firm.firm_id} 创新策略: {strategy}, 研发比例: {fund_share:.1%}, 毛利率: {profit_margin:.1f}%")
+        self.logger.info(f"✅ 企业 {firm.firm_id} 创新策略: {strategy}, 研发比例: {fund_share:.1%}, 毛利率: {profit_margin:.1f}%")
 
     def query_firm_innovation_config(self, firm_id: str) -> FirmInnovationConfig:
         """
@@ -4661,10 +4966,14 @@ Do NOT output any explanation, just the number.
         inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
         gov_sales_ex_tax = float(sum((s.get("government_procurement_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
         total_sales_ex_tax = household_sales_ex_tax + inherent_sales_ex_tax + gov_sales_ex_tax
+
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = self.tx_history
         
         # VAT
         vat_collected = 0.0
-        for tx in self.tx_history:
+        for tx in transactions:
             if tx.month == month and tx.type == "consume_tax":
                 vat_collected += float(tx.amount or 0.0)
         
@@ -4692,7 +5001,7 @@ Do NOT output any explanation, just the number.
         
         # 3) 收入分配
         total_wages = 0.0
-        for tx in self.tx_history:
+        for tx in transactions:
             if tx.month == month and tx.type == "labor_payment":
                 total_wages += float(tx.amount or 0.0)
         
@@ -4710,7 +5019,7 @@ Do NOT output any explanation, just the number.
         labor_tax_collected = 0.0
         fica_tax_collected = 0.0
         corporate_tax_collected = 0.0
-        for tx in self.tx_history:
+        for tx in transactions:
             if tx.month == month:
                 if tx.type == "labor_tax":
                     labor_tax_collected += float(tx.amount or 0.0)
@@ -4725,7 +5034,7 @@ Do NOT output any explanation, just the number.
         # 6) 就业市场
         # ✅ 不依赖 self.households.employment_status（并行消费/轻量对象场景会缺失），改用交易与 laborhour 存量推断
         employed_count = 0
-        for tx in self.tx_history:
+        for tx in transactions:
             if tx.month == month and tx.type == "labor_payment":
                 employed_count += 1  # 每笔 labor_payment 近似对应一个劳动力单元（head/spouse）
 
@@ -4823,12 +5132,16 @@ Do NOT output any explanation, just the number.
         household_sales_ex_tax = float(sum((s.get("household_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
         inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
 
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = self.tx_history
+
         # 2) VAT（产品税）
         vat_rate = float(self.vat_rate or 0.0)
         vat_estimated = total_sales_ex_tax * vat_rate
         vat_actual = 0.0
         try:
-            for tx in self.tx_history:
+            for tx in transactions:
                 if tx.month == month and tx.type == "consume_tax":
                     vat_actual += float(tx.amount or 0.0)
         except Exception:
@@ -4886,7 +5199,7 @@ Do NOT output any explanation, just the number.
         wages_from_stats = float(ps.get("total_wage_expenses", 0.0) or 0.0) # 税前
         wages_from_tx = 0.0
         try:
-            for tx in self.tx_history:
+            for tx in transactions:
                 if tx.month == month and tx.type == "labor_payment":
                     wages_from_tx += float(tx.amount or 0.0) # 税后
         except Exception:
@@ -4952,4 +5265,3 @@ Do NOT output any explanation, just the number.
                 },
             },
         }
-

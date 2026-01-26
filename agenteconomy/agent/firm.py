@@ -86,6 +86,16 @@ class Firm:
         """Register the firm in the economic center"""
         await self.economic_center.register_firm.remote(self)
 
+    def _call_economic_center(self, method_name: str, *args, **kwargs):
+        if self.economic_center is None:
+            return None
+        method = getattr(self.economic_center, method_name, None)
+        if method is None:
+            return None
+        if 'ActorHandle' in str(type(self.economic_center)):
+            return ray.get(method.remote(*args, **kwargs))
+        return method(*args, **kwargs)
+
     # Query info
     def query_info(self):
         """Query information about the firm"""
@@ -150,37 +160,15 @@ class ManufactureFirm(Firm):
     
     注意：税和劳动报酬不从IO表计算，而是由企业实际运营决定
     """
+    # 子类默认值
+    DEFAULT_INDUSTRY_TYPE = "manufacture"
+    DEFAULT_DESCRIPTION = 'A producer of physical goods that consumes third-category resources and outputs concrete SKU inventories, with full pricing authority.'
     
-    def __init__(self, 
-                 firm_id: str, 
-                 name: Optional[str] = None, 
-                 description: Optional[str] = None, 
-                 industry: Optional[str] = None,
-                 industry_type: Optional[str] = None,
-                 economic_center: Optional['EconomicCenter'] = None,
-                 labor_market: Optional[LaborMarket] = None,
-                 product_market: Optional[ProductMarket] = None,
-                 abstract_resource_market: Optional[AbstractResourceMarket] = None,
-                 is_agent: bool = False,
-               ):
-        if industry_type is None:
-            industry_type = "manufacture"
-        if description is None:
-            description = 'A producer of physical goods that consumes third-category resources and outputs concrete SKU inventories, with full pricing authority.'
+    def __init__(self, firm_id: str, **kwargs):
+        kwargs.setdefault('industry_type', self.DEFAULT_INDUSTRY_TYPE)
+        kwargs.setdefault('description', self.DEFAULT_DESCRIPTION)
+        super().__init__(firm_id=firm_id, **kwargs) 
 
-        super().__init__(
-            firm_id=firm_id,
-            name=name,
-            description=description,
-            industry=industry,
-            industry_type=industry_type,
-            economic_center=economic_center,
-            labor_market=labor_market,
-            product_market=product_market,
-            abstract_resource_market=abstract_resource_market,
-            is_agent=is_agent,
-        )
-        
         # Production specific attributes
         self.production_costs: Dict[str, float] = {}  # Cost breakdown by input industry
         self.unit_costs: Dict[str, float] = {}  # Unit cost by SKU
@@ -292,9 +280,28 @@ class ManufactureFirm(Firm):
             io_suppliers=suppliers,
             period=period
         )
-        
+
         # 更新成本记录
         self.production_costs.update(result['by_industry'])
+
+        if self.economic_center is not None and result.get('total_cost', 0.0) > 0:
+            items_payload = [
+                {
+                    "sku_id": item.sku_id,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "total_cost": item.total_cost,
+                }
+                for item in result.get('items', [])
+            ]
+            self._call_economic_center(
+                "record_intermediate_goods_purchase",
+                month=period,
+                buyer_id=self.firm_id,
+                total_cost=result['total_cost'],
+                costs_by_industry=result.get('by_industry', {}),
+                items=items_payload,
+            )
         
         logger.info(
             f"Firm {self.firm_id} procured intermediate goods: "
@@ -347,10 +354,22 @@ class ManufactureFirm(Firm):
                     quantity=physical_qty,
                     period=period
                 )
-                
+
                 if transaction:
                     costs[supplier_code] = transaction['total_cost']
-                    
+                    if self.economic_center is not None:
+                        self._call_economic_center(
+                            "record_resource_purchase",
+                            month=period,
+                            buyer_id=self.firm_id,
+                            industry_code=supplier_code,
+                            quantity=physical_qty,
+                            unit_price=transaction.get('unit_price', 0.0),
+                            total_cost=transaction.get('total_cost', 0.0),
+                            unit=transaction.get('unit'),
+                            base_price=transaction.get('base_price'),
+                        )
+
                     supplier_name = supplier.get('name', supplier_code)
                     logger.info(
                         f"Firm {self.firm_id} purchased {supplier_name}: "
@@ -573,68 +592,25 @@ class ManufactureFirm(Firm):
 
 
 class RetailFirm(Firm):
-    def __init__(self, 
-                 firm_id: str, 
-                 name: Optional[str] = None, 
-                 description: Optional[str] = None, 
-                 industry: Optional[str] = None,
-                 industry_type: Optional[str] = None,
-                 economic_center: Optional['EconomicCenter'] = None,
-                 labor_market: Optional[LaborMarket] = None,
-                 product_market: Optional[ProductMarket] = None,
-                 abstract_resource_market: Optional[AbstractResourceMarket] = None,
-                 is_agent: bool = False,
-               ):
-        if industry_type is None:
-            industry_type = "retail"
-        if description is None:
-            description = 'A physical goods retail channel that procures products from first-category suppliers and sells them to households, earning a channel margin.'
-        super().__init__(
-            firm_id=firm_id,
-            name=name,
-            description=description,
-            industry=industry,
-            industry_type=industry_type,
-            economic_center=economic_center,
-            labor_market=labor_market,
-            product_market=product_market,
-            abstract_resource_market=abstract_resource_market,
-            is_agent=is_agent,
-        )
-        supply_chain_entry = _get_retail_supply_chain_entry(self.industry)
-        self.supplier_industries: List[str] = list(supply_chain_entry.get("suppliers", []))
-        self.supply_chain_entry: Dict[str, Any] = supply_chain_entry
+    # 子类默认值
+    DEFAULT_INDUSTRY_TYPE = "retail"
+    DEFAULT_DESCRIPTION = 'A physical goods retail channel that procures products from first-category suppliers and sells them to households, earning a channel margin.'
+    def __init__(self, firm_id: str, **kwargs):
+        kwargs.setdefault('industry_type', self.DEFAULT_INDUSTRY_TYPE)
+        kwargs.setdefault('description', self.DEFAULT_DESCRIPTION)
+        super().__init__(firm_id=firm_id, **kwargs)
+        self.supply_chain_entry = _get_retail_supply_chain_entry(self.industry)
+        self.supplier_industries: List[str] = list(self.supply_chain_entry.get("suppliers", []))
 
 
 class ServiceFirm(Firm):
-    def __init__(self, 
-                 firm_id: str, 
-                 name: Optional[str] = None, 
-                 description: Optional[str] = None, 
-                 industry: Optional[str] = None,
-                 industry_type: Optional[str] = None,
-                 economic_center: Optional['EconomicCenter'] = None,
-                 labor_market: Optional[LaborMarket] = None,
-                 product_market: Optional[ProductMarket] = None,
-                 abstract_resource_market: Optional[AbstractResourceMarket] = None,
-                 is_agent: bool = False,
-               ):
-        if industry_type is None:
-            industry_type = "service"
-        if description is None:
-            description = 'A virtual resource and service provider that does not produce SKUs, but supplies abstract units (currency per unit), and requires hired labor.'
-        super().__init__(
-            firm_id=firm_id,
-            name=name,
-            description=description,
-            industry=industry,
-            industry_type=industry_type,
-            economic_center=economic_center,
-            labor_market=labor_market,
-            product_market=product_market,
-            abstract_resource_market=abstract_resource_market,
-            is_agent=is_agent,
-        )
+    # 子类默认值
+    DEFAULT_INDUSTRY_TYPE = "service"
+    DEFAULT_DESCRIPTION = 'A virtual resource and service provider that does not produce SKUs, but supplies abstract units (currency per unit), and requires hired labor.'
+    def __init__(self, firm_id: str, **kwargs):
+        kwargs.setdefault('industry_type', self.DEFAULT_INDUSTRY_TYPE)
+        kwargs.setdefault('description', self.DEFAULT_DESCRIPTION)
+        super().__init__(firm_id=firm_id, **kwargs)
 
 
 if __name__ == "__main__":
