@@ -125,7 +125,7 @@ class EconomicCenter:
         # 创新系统数据结构
         # ===== Innovation System =====
         self.firm_innovation_strategy: Dict[str, str] = {}  # {firm_id: "encouraged" or "suppressed"}
-        self.firm_research_share: List[Dict[str, [float, int]]] = []  # [firm_id: [research_share, month]] 研发投入比例
+        self.firm_research_share: List[Dict[str, Tuple[float, int]]] = []  # [{firm_id: (research_share, month)}] 研发投入比例
         
         # 创新系统数据结构
         self.firm_innovation_config: Dict[str, FirmInnovationConfig] = {}  # {firm_id: innovation_config}
