@@ -344,6 +344,101 @@ class AbstractResourceMarket:
         )
         
         return transaction
+
+    def purchase_by_budget(
+        self,
+        industry_code: str,
+        buyer_id: str,
+        budget: float,
+        period: int
+    ) -> Dict:
+        """
+        按预算购买服务（家庭消费专用）
+        
+        与 purchase() 的区别：
+        - purchase(): 数量固定，花费浮动（企业用，技术决定需求量）
+        - purchase_by_budget(): 花费固定，数量浮动（家庭用，预算决定花费）
+        
+        价格上涨时：
+        - 企业：成本增加（生产必须用那么多电）
+        - 家庭：买到的服务变少（住差点的房子）
+        
+        Args:
+            industry_code: 服务行业代码（如 HS, 621 等）
+            buyer_id: 购买者ID（家庭ID）
+            budget: 预算金额（美元），实际花费就是这个数
+            period: 当前期数
+        
+        Returns:
+            交易详情 {
+                "quantity": 实际购买的服务量,
+                "unit": 单位,
+                "unit_price": 当期单价,
+                "total_cost": 实际花费（= budget）,
+                "receiver_id": 资金接收方,
+                ...
+            }
+        """
+        if industry_code not in self.resources:
+            raise ValueError(f"未找到资源: {industry_code}")
+        
+        if budget <= 0:
+            return None
+        
+        resource = self.resources[industry_code]
+        
+        # 核心区别：用预算÷当期价格 = 购买到的数量
+        # 花费是固定的（= budget），数量随价格浮动
+        unit_price = resource.current_price
+        quantity = budget / unit_price  # 预算÷价格 = 数量
+        total_cost = budget  # 实际花费就是预算
+        
+        # 累积需求（用于后续价格调整）
+        resource.total_demand += quantity
+        
+        # 获取资金接收方
+        receiver_id = self.get_receiver_id(industry_code)
+        is_government_fee = industry_code in GOVERNMENT_INDUSTRY_CODES
+        
+        # 记录交易（本地备份）
+        transaction = {
+            "period": period,
+            "resource": industry_code,
+            "buyer": buyer_id,
+            "receiver": receiver_id,
+            "quantity": quantity,
+            "unit": resource.unit.value,
+            "unit_price": unit_price,
+            "total_cost": total_cost,
+            "budget": budget,
+            "is_government_fee": is_government_fee,
+            "purchase_type": "by_budget"  # 标记为预算购买
+        }
+        self.transactions.append(transaction)
+        
+        # 通过 EconomicCenter 记录交易并执行转账
+        if self.economic_center is not None:
+            try:
+                import ray
+                ray.get(self.economic_center.record_resource_purchase.remote(
+                    month=period,
+                    buyer_id=buyer_id,
+                    industry_code=industry_code,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_cost=total_cost,
+                    unit=resource.unit.value,
+                    base_price=resource.base_price,
+                    receiver_id=receiver_id
+                ))
+                logger.info(
+                    f"家庭服务消费: {buyer_id} → {receiver_id} "
+                    f"预算${budget:.2f} → {quantity:.2f}单位 ({industry_code})"
+                )
+            except Exception as e:
+                logger.error(f"EconomicCenter 记录交易失败: {e}")
+        
+        return transaction
     
     def adjust_prices(self, period: int):
         """
