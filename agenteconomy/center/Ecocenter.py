@@ -98,6 +98,7 @@ class EconomicCenter:
 
         # ===== Agent ID Registry =====
         # Save IDs for different agents
+        self.firm_id: List[str] = []  # firm ID list
         self.government_id: List[str] = []  # government ID
         self.household_id: List[str] = []  #  household ID
         self.bank_id: List[str] = []  #  bank ID
@@ -1524,7 +1525,7 @@ class EconomicCenter:
                 f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
             )
         elif is_company and self.ledger[buyer_id].amount < total_cost:
-            self.self.logger.info(
+            self.logger.info(
                 f"💳 Company {buyer_id} resource purchase with negative balance: "
                 f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
             )
