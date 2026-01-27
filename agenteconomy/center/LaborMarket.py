@@ -43,6 +43,19 @@ class LaborMarket:
     
     def query_jobs_by_firm(self, firm_id: str) -> List[Job]:
         return [job for job in self.job_openings if job.firm_id == firm_id]
+
+    def get_firm_job_snapshot(self, firm_id: str) -> Dict[str, int]:
+        """
+        Get current open positions by SOC for a firm.
+        """
+        positions_by_soc: Dict[str, int] = {}
+        for job in self.job_openings:
+            if job.firm_id != firm_id:
+                continue
+            if not job.is_valid or job.positions_available <= 0:
+                continue
+            positions_by_soc[job.SOC] = positions_by_soc.get(job.SOC, 0) + job.positions_available
+        return positions_by_soc
     
     def query_jobs_by_soc(self, soc: str) -> List[Job]:
         return [job for job in self.job_openings if job.SOC == soc]
@@ -57,9 +70,24 @@ class LaborMarket:
         """
         for j in self.job_openings:
             if j.firm_id == firm_id and j.SOC == job.SOC:
-                j.positions_available += 1
+                j.positions_available += max(1, int(job.positions_available or 1))
+                j.is_valid = True
                 return
         self.job_openings.append(job)
+
+    def apply_job_plan(self, firm_id: str, jobs: List[Job]) -> Dict[str, int]:
+        """
+        Apply a job plan: add new roles or increase positions for existing roles.
+        """
+        added: Dict[str, int] = {}
+        for job in jobs:
+            if job.firm_id != firm_id:
+                job.firm_id = firm_id
+            if job.positions_available <= 0:
+                continue
+            self.add_job_position(firm_id, job)
+            added[job.SOC] = added.get(job.SOC, 0) + int(job.positions_available)
+        return added
 
     def align_job(self, household_id: str, job: Job, lh_type: str) -> Optional[Job]:
         """

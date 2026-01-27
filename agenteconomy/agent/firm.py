@@ -1,10 +1,16 @@
-from typing import Optional, List, TYPE_CHECKING, Dict, Any
+from typing import Optional, List, TYPE_CHECKING, Dict, Any, Iterable, Tuple
 from functools import lru_cache
 from pathlib import Path
 import json
+import ast
+import csv
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 import ray
 
-from agenteconomy.center.Model import LaborHour
+from agenteconomy.center.Model import LaborHour, Job
 from agenteconomy.center.LaborMarket import LaborMarket
 from agenteconomy.center.ProductMarket import ProductMarket
 from agenteconomy.market.AbstractResourceMarket import AbstractResourceMarket
@@ -21,6 +27,294 @@ if TYPE_CHECKING:
 
 logger = get_logger(name="Firm")
 
+_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+_OCCUPATION_XLSX = _DATA_DIR / "occupation.xlsx"
+_JOB_SKILLS_CSV = _DATA_DIR / "jobs_with_skills_abilities_IM_merged.csv"
+_IO_TABLE_CSV = _DATA_DIR / "Direct Total Requirements, After Redefinitions - Summary.csv"
+
+_TEXT_STOPWORDS = {
+    "and", "or", "of", "the", "for", "in", "to", "with",
+    "industry", "industries", "services", "service", "products", "product",
+    "manufacturing", "manufacture", "except", "other", "miscellaneous",
+    "activities", "related",
+}
+
+
+def _normalize_tokens(text: str) -> List[str]:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    tokens = [t for t in text.split() if t and t not in _TEXT_STOPWORDS]
+    return tokens
+
+
+def _token_similarity(tokens_a: Iterable[str], tokens_b: Iterable[str]) -> float:
+    set_a = set(tokens_a)
+    set_b = set(tokens_b)
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    return (2.0 * inter) / (len(set_a) + len(set_b))
+
+
+def _col_to_index(col: str) -> int:
+    idx = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _cell_value(cell: ET.Element, shared: List[str], ns: Dict[str, str]) -> str:
+    cell_type = cell.attrib.get("t")
+    v = cell.find("ns:v", ns)
+    if cell_type == "s":
+        if v is None or v.text is None:
+            return ""
+        idx = int(v.text)
+        return shared[idx] if 0 <= idx < len(shared) else ""
+    if cell_type == "inlineStr":
+        t = cell.find(".//ns:t", ns)
+        return t.text if t is not None else ""
+    return v.text if v is not None else ""
+
+
+def _read_xlsx_sheet(path: Path, sheet_name: str) -> List[List[str]]:
+    if not path.exists():
+        return []
+    with zipfile.ZipFile(path) as zf:
+        shared: List[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            with zf.open("xl/sharedStrings.xml") as f:
+                tree = ET.parse(f)
+            root = tree.getroot()
+            ns = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            for si in root.findall(".//ns:si", ns):
+                texts = []
+                for t in si.findall(".//ns:t", ns):
+                    texts.append(t.text or "")
+                shared.append("".join(texts))
+
+        with zf.open("xl/workbook.xml") as f:
+            tree = ET.parse(f)
+        root = tree.getroot()
+        ns = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        rels: Dict[str, str] = {}
+        with zf.open("xl/_rels/workbook.xml.rels") as f:
+            rel_tree = ET.parse(f)
+        rel_root = rel_tree.getroot()
+        rel_ns = {"ns": "http://schemas.openxmlformats.org/package/2006/relationships"}
+        for rel in rel_root.findall("ns:Relationship", rel_ns):
+            rels[rel.attrib["Id"]] = rel.attrib["Target"]
+
+        target_sheet = None
+        for sheet in root.findall(".//ns:sheets/ns:sheet", ns):
+            if sheet.attrib.get("name") == sheet_name:
+                rid = sheet.attrib.get(
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                )
+                target_sheet = rels.get(rid)
+                break
+        if not target_sheet:
+            return []
+
+        sheet_path = "xl/" + target_sheet
+        with zf.open(sheet_path) as f:
+            tree = ET.parse(f)
+        root = tree.getroot()
+        ns = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+        rows: List[List[str]] = []
+        for row in root.findall(".//ns:sheetData/ns:row", ns):
+            row_values: Dict[int, str] = {}
+            max_col = -1
+            for cell in row.findall("ns:c", ns):
+                ref = cell.attrib.get("r", "")
+                col = "".join(ch for ch in ref if ch.isalpha())
+                idx = _col_to_index(col) if col else len(row_values)
+                row_values[idx] = _cell_value(cell, shared, ns).strip()
+                if idx > max_col:
+                    max_col = idx
+            if max_col >= 0:
+                values = [""] * (max_col + 1)
+                for idx, val in row_values.items():
+                    values[idx] = val
+                rows.append(values)
+        return rows
+
+
+@lru_cache(maxsize=1)
+def _load_io_industry_names() -> Dict[str, str]:
+    if not _IO_TABLE_CSV.exists():
+        return {}
+    with _IO_TABLE_CSV.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, [])
+        first_row = next(reader, [])
+    if len(header) < 3 or len(first_row) < 3:
+        return {}
+    codes = header[2:]
+    names = first_row[2:]
+    return {code: name for code, name in zip(codes, names) if code and name}
+
+
+@lru_cache(maxsize=1)
+def _load_job_skill_data() -> Dict[str, Dict[str, Any]]:
+    if not _JOB_SKILLS_CSV.exists():
+        return {}
+    data: Dict[str, Dict[str, Any]] = {}
+    with _JOB_SKILLS_CSV.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            soc = (row.get("O*NET-SOC Code") or "").strip()
+            if not soc or soc in data:
+                continue
+            try:
+                wage = float(row.get("Average_Wage") or 0.0)
+            except ValueError:
+                wage = 0.0
+            skills_raw = row.get("skills") or "{}"
+            abilities_raw = row.get("abilities") or "{}"
+            try:
+                skills = ast.literal_eval(skills_raw) if skills_raw else {}
+            except Exception:
+                skills = {}
+            try:
+                abilities = ast.literal_eval(abilities_raw) if abilities_raw else {}
+            except Exception:
+                abilities = {}
+            data[soc] = {
+                "soc": soc,
+                "title": (row.get("Title") or "").strip(),
+                "description": (row.get("Description") or "").strip(),
+                "wage": wage,
+                "skills": skills if isinstance(skills, dict) else {},
+                "abilities": abilities if isinstance(abilities, dict) else {},
+            }
+    return data
+
+
+def _find_header_row(rows: List[List[str]], required: Iterable[str]) -> Tuple[int, Dict[str, int]]:
+    required_lower = [r.lower() for r in required]
+    for idx, row in enumerate(rows):
+        lowered = [c.lower() for c in row if c]
+        if all(r in lowered for r in required_lower):
+            mapping = {}
+            for col_idx, value in enumerate(row):
+                if not value:
+                    continue
+                mapping[value.lower()] = col_idx
+            return idx, mapping
+    return -1, {}
+
+
+@lru_cache(maxsize=1)
+def _load_soc_distribution() -> Dict[str, float]:
+    rows = _read_xlsx_sheet(_OCCUPATION_XLSX, "Table 1.2")
+    if not rows:
+        return {}
+    header_idx, mapping = _find_header_row(
+        rows,
+        [
+            "2024 national employment matrix code",
+            "employment distribution, percent, 2024",
+        ],
+    )
+    if header_idx < 0:
+        return {}
+    code_idx = mapping.get("2024 national employment matrix code")
+    dist_idx = mapping.get("employment distribution, percent, 2024")
+    occ_type_idx = mapping.get("occupation type")
+    if code_idx is None or dist_idx is None:
+        return {}
+
+    distribution: Dict[str, float] = {}
+    for row in rows[header_idx + 1 :]:
+        if code_idx >= len(row):
+            continue
+        soc = row[code_idx].strip()
+        if not soc or soc == "00-0000":
+            continue
+        if occ_type_idx is not None and occ_type_idx < len(row):
+            occ_type = row[occ_type_idx].strip().lower()
+            if occ_type and occ_type != "line item":
+                continue
+        if dist_idx >= len(row):
+            continue
+        try:
+            dist = float(row[dist_idx])
+        except ValueError:
+            continue
+        distribution[soc] = dist
+    return distribution
+
+
+@lru_cache(maxsize=1)
+def _load_naics_to_soc() -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    rows = _read_xlsx_sheet(_OCCUPATION_XLSX, "Table 1.12")
+    if not rows:
+        return {}, {}
+    header_idx, mapping = _find_header_row(
+        rows,
+        [
+            "2024 national employment matrix occupation code",
+            "2024 national employment matrix industry title",
+            "2024 national employment matrix industry code",
+        ],
+    )
+    if header_idx < 0:
+        return {}, {}
+    occ_idx = mapping.get("2024 national employment matrix occupation code")
+    ind_title_idx = mapping.get("2024 national employment matrix industry title")
+    ind_code_idx = mapping.get("2024 national employment matrix industry code")
+    if occ_idx is None or ind_title_idx is None or ind_code_idx is None:
+        return {}, {}
+
+    naics_to_soc: Dict[str, List[str]] = defaultdict(list)
+    naics_titles: Dict[str, str] = {}
+    for row in rows[header_idx + 1 :]:
+        if occ_idx >= len(row) or ind_code_idx >= len(row) or ind_title_idx >= len(row):
+            continue
+        soc = row[occ_idx].strip()
+        ind_code = row[ind_code_idx].strip()
+        ind_title = row[ind_title_idx].strip()
+        if not soc or not ind_code:
+            continue
+        if ind_title.lower().startswith("total, all industries"):
+            continue
+        naics_to_soc[ind_code].append(soc)
+        if ind_code not in naics_titles and ind_title:
+            naics_titles[ind_code] = ind_title
+    return naics_to_soc, naics_titles
+
+
+def _match_naics_for_io(industry_code: str, industry_name: str) -> Tuple[Optional[str], Optional[str], float]:
+    naics_to_soc, naics_titles = _load_naics_to_soc()
+    if not naics_titles:
+        return None, None, 0.0
+
+    tokens_io = _normalize_tokens(industry_name or "")
+    best_score = 0.0
+    best_code = None
+    best_title = None
+
+    digits = re.match(r"^\\d+", str(industry_code or ""))
+    prefix = digits.group(0) if digits else ""
+    candidates = naics_titles.items()
+    if prefix:
+        candidates = [(c, t) for c, t in naics_titles.items() if str(c).startswith(prefix)]
+        if not candidates:
+            candidates = naics_titles.items()
+
+    for code, title in candidates:
+        score = _token_similarity(tokens_io, _normalize_tokens(title))
+        if score > best_score:
+            best_score = score
+            best_code = code
+            best_title = title
+
+    if best_code and best_code in naics_to_soc:
+        return best_code, best_title, best_score
+    return None, None, best_score
 @lru_cache(maxsize=1)
 def _load_retail_supply_chain_map() -> Dict[str, Dict[str, Any]]:
     data_path = Path(__file__).resolve().parents[1] / "data" / "retailer_mfg.json"
@@ -86,6 +380,16 @@ class Firm:
         """Register the firm in the economic center"""
         await self.economic_center.register_firm.remote(self)
 
+    def _call_labor_market(self, method_name: str, *args, **kwargs):
+        if self.labor_market is None:
+            return None
+        method = getattr(self.labor_market, method_name, None)
+        if method is None:
+            return None
+        if 'ActorHandle' in str(type(self.labor_market)):
+            return ray.get(method.remote(*args, **kwargs))
+        return method(*args, **kwargs)
+
     def _call_economic_center(self, method_name: str, *args, **kwargs):
         if self.economic_center is None:
             return None
@@ -95,6 +399,159 @@ class Firm:
         if 'ActorHandle' in str(type(self.economic_center)):
             return ray.get(method.remote(*args, **kwargs))
         return method(*args, **kwargs)
+
+    def _compute_labor_budget(self, period: Optional[int] = None) -> float:
+        base_value = 0.0
+        current_period = int(period if period is not None else self.current_period or 0)
+        if current_period > 0:
+            stats = self._call_economic_center(
+                "query_firm_monthly_financials",
+                firm_id=self.firm_id,
+                month=current_period - 1,
+            )
+            if isinstance(stats, dict):
+                base_value = float(stats.get("monthly_income", 0.0) or 0.0)
+        if base_value <= 0 and self.production_history:
+            try:
+                base_value = float(self.production_history[-1].get("production_value", 0.0) or 0.0)
+            except Exception:
+                base_value = 0.0
+        if base_value <= 0:
+            base_value = float(self.cash or 0.0)
+
+        compensation_ratio = 0.2
+        try:
+            cost_structure = get_cost_structure(self.industry)
+            if cost_structure:
+                compensation_ratio = float(cost_structure.get("compensation", compensation_ratio) or compensation_ratio)
+        except Exception:
+            compensation_ratio = 0.2
+
+        budget = base_value * compensation_ratio
+        return max(0.0, budget)
+
+    def _decide_job_postings_from_data(self, period: Optional[int] = None, max_job_types: int = 10) -> List[Job]:
+        if not self.industry:
+            return []
+
+        job_data = _load_job_skill_data()
+        if not job_data:
+            return []
+
+        io_names = _load_io_industry_names()
+        io_name = io_names.get(self.industry, "") if io_names else ""
+
+        naics_code, naics_title, score = _match_naics_for_io(self.industry, io_name)
+        naics_to_soc, _ = _load_naics_to_soc()
+        candidate_socs = []
+        if naics_code and naics_code in naics_to_soc:
+            candidate_socs = list(dict.fromkeys(naics_to_soc[naics_code]))
+
+        if not candidate_socs:
+            distribution = _load_soc_distribution()
+            candidate_socs = [
+                soc for soc, _ in sorted(
+                    distribution.items(), key=lambda kv: kv[1], reverse=True
+                )
+            ][:max_job_types]
+
+        candidate_socs = [soc for soc in candidate_socs if soc in job_data]
+        if not candidate_socs:
+            return []
+
+        distribution = _load_soc_distribution()
+        weights = {}
+        total_weight = 0.0
+        for soc in candidate_socs:
+            w = float(distribution.get(soc, 1.0) or 1.0)
+            weights[soc] = w
+            total_weight += w
+        if total_weight <= 0:
+            total_weight = float(len(candidate_socs))
+
+        labor_budget = self._compute_labor_budget(period)
+        if labor_budget <= 0:
+            return []
+
+        hours_per_week = 40.0
+        weeks_per_month = 4.0
+        hours_per_period = hours_per_week * weeks_per_month
+
+        jobs: List[Job] = []
+        remaining_budget = labor_budget
+
+        ranked_socs = sorted(candidate_socs, key=lambda s: weights.get(s, 0.0), reverse=True)
+        for soc in ranked_socs[:max_job_types]:
+            info = job_data.get(soc)
+            if not info:
+                continue
+            hourly_wage = float(info.get("wage", 0.0) or 0.0)
+            if hourly_wage <= 0:
+                continue
+            monthly_wage = hourly_wage * hours_per_period
+            if monthly_wage <= 0:
+                continue
+            budget_share = labor_budget * (weights.get(soc, 1.0) / total_weight)
+            positions = int(budget_share // monthly_wage)
+            if positions <= 0:
+                continue
+            max_affordable = int(remaining_budget // monthly_wage)
+            if max_affordable <= 0:
+                continue
+            positions = min(positions, max_affordable)
+            remaining_budget -= positions * monthly_wage
+
+            job = Job.create(
+                soc=soc,
+                title=info.get("title") or soc,
+                wage_per_hour=hourly_wage,
+                firm_id=self.firm_id,
+                description=info.get("description"),
+                hours_per_period=hours_per_period,
+                required_skills=info.get("skills") or {},
+                required_abilities=info.get("abilities") or {},
+            )
+            job.positions_available = positions
+            jobs.append(job)
+
+        if not jobs:
+            # Fallback: try to hire 1 lowest-wage role
+            cheapest_soc = None
+            cheapest_monthly = 0.0
+            for soc in ranked_socs:
+                info = job_data.get(soc)
+                if not info:
+                    continue
+                hourly_wage = float(info.get("wage", 0.0) or 0.0)
+                if hourly_wage <= 0:
+                    continue
+                monthly_wage = hourly_wage * hours_per_period
+                if monthly_wage <= 0:
+                    continue
+                if cheapest_soc is None or monthly_wage < cheapest_monthly:
+                    cheapest_soc = soc
+                    cheapest_monthly = monthly_wage
+            if cheapest_soc and remaining_budget >= cheapest_monthly:
+                info = job_data[cheapest_soc]
+                job = Job.create(
+                    soc=cheapest_soc,
+                    title=info.get("title") or cheapest_soc,
+                    wage_per_hour=float(info.get("wage", 0.0) or 0.0),
+                    firm_id=self.firm_id,
+                    description=info.get("description"),
+                    hours_per_period=hours_per_period,
+                    required_skills=info.get("skills") or {},
+                    required_abilities=info.get("abilities") or {},
+                )
+                job.positions_available = 1
+                jobs.append(job)
+
+        if jobs and naics_title:
+            logger.info(
+                f"Firm {self.firm_id} matched IO '{io_name}' to NAICS '{naics_title}' (score={score:.2f})"
+            )
+
+        return jobs
 
     # Query info
     def query_info(self):
@@ -113,9 +570,26 @@ class Firm:
         return self.employee_count, self.employee_list
 
     # Labor market operations
-    async def post_jobs(self):
+    async def post_jobs(self, period: Optional[int] = None):
         """Post jobs to the labor market"""
-        # 根据企业自身的情况 用llm决策是否要发布岗位 发布什么岗位
+        jobs = self._decide_job_postings_from_data(period=period)
+        if jobs:
+            snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            to_post: List[Job] = []
+            for job in jobs:
+                desired = int(job.positions_available or 0)
+                existing = int(snapshot.get(job.SOC, 0) or 0)
+                delta = desired - existing
+                if delta <= 0:
+                    continue
+                job.positions_available = delta
+                to_post.append(job)
+            if to_post:
+                self._call_labor_market("apply_job_plan", self.firm_id, to_post)
+            return to_post
+
         prompt = build_firm_post_job_prompt(self)
         response = await call_llm(prompt)
         return response
