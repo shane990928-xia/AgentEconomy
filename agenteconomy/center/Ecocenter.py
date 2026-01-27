@@ -20,16 +20,14 @@ Key Components:
 import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
-from uuid import uuid4
 
-import numpy as np
 import ray
 from dotenv import load_dotenv
 
 from agenteconomy.center.Model import *
 from agenteconomy.center.transaction import PeriodStatistics
+from agenteconomy.utils.load_io_table import load_value_added_components
 from agenteconomy.utils.logger import get_logger
-from agenteconomy.utils.product_attribute_loader import inject_product_attributes
 
 # Avoid circular import by using TYPE_CHECKING
 if TYPE_CHECKING:
@@ -48,13 +46,12 @@ class EconomicCenter:
     # =========================================================================
     # Initialization
     # =========================================================================
-    def __init__(self, tax_policy: TaxPolicy = None, category_profit_margins: Dict[str, float] = None):
+    def __init__(self, tax_policy: TaxPolicy = None):
         """
         Initialize EconomicCenter with tax rates
         
         Args:
             tax_policy: 税收政策配置（包含累进税阶梯）
-            category_profit_margins: 各行业毛利率配置
         """
         self.logger = get_logger(name="economic_center")
         
@@ -70,31 +67,16 @@ class EconomicCenter:
         self.corporate_tax_rate = tax_policy.corporate_tax_rate # float - 企业所得税率
 
         # =========================================================================
-        # 2️⃣ 商品毛利率配置 (Category Profit Margins)
+        # 2️⃣ 行业利润率配置 (从IO表V003加载)
         # =========================================================================
-        if category_profit_margins is None:
-            self.category_profit_margins = {
-                "Beverages": 25.0,                              # Beverages
-                "Confectionery and Snacks": 32.0,               # Confectionery and Snacks
-                "Dairy Products": 15.0,                         # Dairy Products
-                "Furniture and Home Furnishing": 30.0,          # Furniture and Home Furnishing
-                "Garden and Outdoor": 28.0,                     # Garden and Outdoor
-                "Grains and Bakery": 18.0,                      # Grains and Bakery
-                "Household Appliances and Equipment": 30.0,     # Household Appliances and Equipment
-                "Meat and Seafood": 16.0,                       # Meat and Seafood
-                "Personal Care and Cleaning": 40.0,            # Personal Care and Cleaning
-                "Pharmaceuticals and Health": 45.0,            # Pharmaceuticals and Health
-                "Retail and Stores": 25.0,                      # Retail and Stores
-                "Sugars, Oils, and Seasonings": 20.0,           # Sugars, Oils, and Seasonings
-            }
-        else:
-            self.category_profit_margins = category_profit_margins
+        # V003 = Gross Operating Surplus (毛营业盈余率)
+        # 直接作为各行业的目标利润率
+        self._io_gross_surplus: Optional[Dict[str, float]] = None  # 延迟加载
 
         # =========================================================================
         # 3️⃣ 资产存储 (Asset Storage)
         # =========================================================================
         self.ledger: Dict[str, Ledger] = defaultdict(Ledger)            # 现金账本
-        self.products: Dict[str, List[Product]] = defaultdict(list)     # 商品库存
         self.laborhour: Dict[str, List[LaborHour]] = defaultdict(list)  # 劳动力
 
         # =========================================================================
@@ -118,14 +100,11 @@ class EconomicCenter:
         
         # =========================================================================
         # 6️⃣ 企业财务追踪 (Firm Financial Tracking)
+        # 统一数据结构: firm_monthly_data[firm_id][month] = {income, expenses, wage, tax, production_cost, depreciation}
         # =========================================================================
-        self.firm_financials: Dict[str, Dict[str, float]] = defaultdict(lambda: {"total_income": 0.0, "total_expenses": 0.0})
-        self.firm_monthly_financials: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"income": 0.0, "expenses": 0.0}))
-        self.firm_production_stats: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"base_production": 0.0, "labor_production": 0.0}))
-        self.firm_monthly_wage_expenses: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.firm_monthly_corporate_tax: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.firm_monthly_production_cost: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.firm_monthly_labor_production_value: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        def _default_firm_month() -> Dict[str, float]:
+            return {"income": 0.0, "expenses": 0.0, "wage": 0.0, "tax": 0.0, "production_cost": 0.0}
+        self.firm_monthly_data: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(_default_firm_month))
         self._corporate_tax_settled_months: set[int] = set()
 
         # =========================================================================
@@ -138,13 +117,7 @@ class EconomicCenter:
         self.firm_innovation_events: List[FirmInnovationEvent] = []
 
         # =========================================================================
-        # 8️⃣ 库存预留系统 (Inventory Reservation System)
-        # =========================================================================
-        self.inventory_reservations: Dict[str, InventoryReservation] = {}
-        self.reservation_timeout: float = 300.0
-
-        # =========================================================================
-        # 9️⃣ 未满足需求追踪 (Unmet Demand Tracking)
+        # 8️⃣ 未满足需求追踪 (Unmet Demand Tracking)
         # =========================================================================
         self.unmet_demand_by_month: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
 
@@ -184,19 +157,19 @@ class EconomicCenter:
         self._cd_firm_K: Dict[str, float] = {}
         self._cd_firm_A: Dict[str, float] = {}
 
-    def register_firm(self, firm: 'Firm'):
+    def register(self, agent_type: Literal['government', 'household', 'firm', 'bank']):
         """
-        Register a firm in the economic center.
-        
-        Args:
-            firm: Firm instance to register
+        Register the EconomicCenter in the specified agent type list.
         """
-        # Import here to avoid circular import
-        from agenteconomy.agent.firm import Firm as FirmType
-        if not isinstance(firm, FirmType):
-            raise TypeError(f"Expected Firm instance, got {type(firm)}")
-        self.firm.append(firm)
-        
+        if agent_type == 'government':
+            self.government_id.append("economic_center")
+        elif agent_type == 'household':
+            self.household_id.append("economic_center")
+        elif agent_type == 'firm':
+            self.firm_id.append("economic_center")
+        elif agent_type == 'bank':
+            self.bank_id.append("economic_center")
+             
     @staticmethod
     def _monthly_rate_from_annual(annual_rate: float) -> float:
         """
@@ -257,74 +230,6 @@ class EconomicCenter:
             cash_total += cash
 
         return {"firms_updated": int(firms_updated), "capital_total": float(cap_total), "cash_total": float(cash_total)}
-
-    def overwrite_product_amounts(
-        self,
-        inventory_by_firm: Dict[str, Dict[str, float]],
-        set_unmentioned_to_zero: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Overwrite inventory amounts for existing products.
-
-        inventory_by_firm:
-            {firm_id: {product_id: amount}}
-        """
-        if not isinstance(inventory_by_firm, dict):
-            return {"firms_updated": 0, "products_updated": 0, "products_missing": 0}
-
-        firms_updated = 0
-        products_updated = 0
-        products_missing = 0
-
-        for cid, prod_map in (inventory_by_firm or {}).items():
-            firm_id = str(cid or "")
-            if not firm_id or not isinstance(prod_map, dict):
-                continue
-
-            if firm_id not in self.products:
-                # Inventory overwrite assumes products are already registered for the firm
-                self.products[firm_id] = []
-
-            existing = {str(getattr(p, "product_id", "") or ""): p for p in (self.products.get(firm_id) or [])}
-
-            touched = set()
-            for pid, qty in (prod_map or {}).items():
-                product_id = str(pid or "")
-                if not product_id:
-                    continue
-                touched.add(product_id)
-                try:
-                    amount = float(qty or 0.0)
-                except Exception:
-                    amount = 0.0
-                if amount < 0:
-                    amount = 0.0
-
-                if product_id in existing:
-                    try:
-                        existing[product_id].amount = amount
-                        products_updated += 1
-                    except Exception:
-                        products_missing += 1
-                else:
-                    products_missing += 1
-
-            if set_unmentioned_to_zero:
-                for pid, p in existing.items():
-                    if pid and pid not in touched:
-                        try:
-                            p.amount = 0.0
-                            products_updated += 1
-                        except Exception:
-                            continue
-
-            firms_updated += 1
-
-        return {
-            "firms_updated": int(firms_updated),
-            "products_updated": int(products_updated),
-            "products_missing": int(products_missing),
-        }
 
     def query_firm_assets(self, firm_id: str) -> Dict[str, float]:
         cid = str(firm_id or "")
@@ -392,7 +297,7 @@ class EconomicCenter:
     def apply_monthly_depreciation(self, month: int, annual_depreciation_rate: float = 0.08, reduce_capital_stock: bool = True) -> Dict[str, float]:
         """
         对所有企业计提月度折旧：
-        - 折旧费用计入 firm_monthly_financials[month]["expenses"]（用于企业税基/利润口径）
+        - 折旧费用计入 firm_monthly_data[firm_id][month]["expenses"]
         - 默认同时减少 firm_capital_stock（K_{t+1} = (1-δ_m)K_t）
         """
         try:
@@ -547,18 +452,6 @@ class EconomicCenter:
             ledger = Ledger.create(agent_id, amount=initial_amount)
             self.ledger[agent_id] = ledger
             # self.logger.info(f"Initialized ledger for agent {agent_id} with amount {initial_amount}")
-    
-    def init_agent_product(self, agent_id: str, product: Optional[Product]=None):
-        """
-        Initialize a product for an agent. If the product already exists, it will merge the amounts.
-        """
-        if agent_id not in self.products:
-            # print(f"Initialized product for agent {agent_id}")
-            self.products[agent_id] = []
-        
-        if product:
-            self._add_or_merge_product(agent_id, product)
-            # self.logger.info(f"Initialized product {product.name} for agent {agent_id} with amount {product.amount}")
 
     def init_agent_labor(self, agent_id:str, labor:[LaborHour]=[]):
         """
@@ -574,48 +467,33 @@ class EconomicCenter:
         Register an agent ID based on its type.
         """
         if agent_type == 'government':
-            self.government_id.append(agent_id)
+            if agent_id not in self.government_id:
+                self.government_id.append(agent_id)
         elif agent_type == 'household':
-            self.household_id.append(agent_id)
+            if agent_id not in self.household_id:
+                self.household_id.append(agent_id)
         elif agent_type == 'firm':
-            self.firm_id.append(agent_id)
+            if agent_id not in self.firm_id:
+                self.firm_id.append(agent_id)
         elif agent_type == 'bank':
-            self.bank_id.append(agent_id)
+            if agent_id not in self.bank_id:
+                self.bank_id.append(agent_id)
+
+    def get_all_agent_ids(self) -> Dict[str, List[str]]:
+        """Get all registered agent IDs by type."""
+        return {
+            "government": list(self.government_id),
+            "household": list(self.household_id),
+            "firm": list(self.firm_id),
+            "bank": list(self.bank_id),
+        }
 
 
     # =========================================================================
     # Query Methods
     # =========================================================================
-    def query_all_products(self):
-        return self.products
-
     def query_all_tx(self):
         return self.tx_history
-
-    def set_all_firm_products_amount(self, amount: float) -> Dict[str, float]:
-        """
-        将所有企业名下商品库存 amount 设为统一值（用于需求采样/压力测试）。
-
-        Returns:
-            {"products_updated": int, "amount": float}
-        """
-        try:
-            amt = float(amount)
-        except Exception:
-            amt = 0.0
-        if amt < 0:
-            amt = 0.0
-        updated = 0
-        for owner_id, products in (self.products or {}).items():
-            if owner_id not in (self.firm_id or []):
-                continue
-            for p in (products or []):
-                try:
-                    p.amount = amt
-                    updated += 1
-                except Exception:
-                    continue
-        return {"products_updated": int(updated), "amount": float(amt)}
     
     def query_exsiting_agents(self, agent_type: Literal['government', 'household', 'firm']) -> List[str]:
         """
@@ -649,41 +527,17 @@ class EconomicCenter:
     def query_redistribution_record_per_person(self, month: int) -> float:
         return self.redistribution_record_per_person[month]
     
-    def query_products(self, agent_id: str) -> List[Product]:
-        """
-        Query all products owned by an agent.
-        
-        Args:
-            agent_id: Unique identifier of the agent
-            
-        Returns:
-            List of products owned by the agent
-        """
-        return self.products[agent_id]
-    
-    def query_price(self, agent_id: str, product_id: str) -> float:
-        for product in self.products[agent_id]:
-            if product.product_id == product_id:
-                return product.price
-        return 0.0
-    
     def query_financial_summary(self, agent_id: str) -> Dict[str, float]:
         """查询代理的财务摘要：余额、总收入、总支出（企业适用）"""
-        result = {}
-        
-        if agent_id in self.ledger:
-            result["balance"] = self.ledger[agent_id].amount
-        else:
-            result["balance"] = 0.0
-        
-        # 如果是企业，添加收支记录
-        if agent_id in self.firm_financials:
-            result.update(self.firm_financials[agent_id])
-            result["net_profit"] = result.get("total_income", 0.0) - result.get("total_expenses", 0.0)
-        
-        result['total_income'] = self.firm_financials[agent_id].get("total_income", 0.0)
-        result['total_expenses'] = self.firm_financials[agent_id].get("total_expenses", 0.0)
-        return result
+        balance = self.ledger[agent_id].amount if agent_id in self.ledger else 0.0
+        total_income = sum(d.get("income", 0.0) for d in self.firm_monthly_data.get(agent_id, {}).values())
+        total_expenses = sum(d.get("expenses", 0.0) for d in self.firm_monthly_data.get(agent_id, {}).values())
+        return {
+            "balance": balance,
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit": total_income - total_expenses
+        }
 
     def get_transactions(
         self,
@@ -789,38 +643,32 @@ class EconomicCenter:
             self._update_period_statistics(tx)
         return self.period_statistics[month]
     
-    def record_firm_income(self, firm_id: str, amount: float):
+    def record_firm_income(self, firm_id: str, amount: float, month: int = 0):
         """记录企业收入"""
-        self.firm_financials[firm_id]["total_income"] += amount
+        self.firm_monthly_data[firm_id][month]["income"] += amount
         
-    def record_firm_expense(self, firm_id: str, amount: float):
+    def record_firm_expense(self, firm_id: str, amount: float, month: int = 0):
         """记录企业支出"""
-        self.firm_financials[firm_id]["total_expenses"] += amount
+        self.firm_monthly_data[firm_id][month]["expenses"] += amount
     
     def record_firm_monthly_income(self, firm_id: str, month: int, amount: float):
         """记录企业月度收入"""
-        self.firm_monthly_financials[firm_id][month]["income"] += amount
+        self.firm_monthly_data[firm_id][month]["income"] += amount
         
     def record_firm_monthly_expense(self, firm_id: str, month: int, amount: float):
         """记录企业月度支出"""
-        self.firm_monthly_financials[firm_id][month]["expenses"] += amount
+        self.firm_monthly_data[firm_id][month]["expenses"] += amount
     
     def query_firm_monthly_financials(self, firm_id: str, month: int) -> Dict[str, float]:
         """查询企业指定月份的财务数据"""
-        if firm_id in self.firm_monthly_financials and month in self.firm_monthly_financials[firm_id]:
-            monthly_data = self.firm_monthly_financials[firm_id][month]
-            depreciation = float(self.firm_monthly_depreciation.get(firm_id, {}).get(month, 0.0) or 0.0)
-            return {
-                "monthly_income": monthly_data["income"],
-                "monthly_expenses": monthly_data["expenses"],
-                "monthly_profit": monthly_data["income"] - monthly_data["expenses"],
-                "monthly_depreciation": depreciation,
-            }
+        data = self.firm_monthly_data.get(firm_id, {}).get(month, {})
         depreciation = float(self.firm_monthly_depreciation.get(firm_id, {}).get(month, 0.0) or 0.0)
+        inc = float(data.get("income", 0.0) or 0.0)
+        exp = float(data.get("expenses", 0.0) or 0.0)
         return {
-            "monthly_income": 0.0,
-            "monthly_expenses": 0.0,
-            "monthly_profit": 0.0,
+            "monthly_income": inc,
+            "monthly_expenses": exp,
+            "monthly_profit": inc - exp,
             "monthly_depreciation": depreciation,
         }
 
@@ -832,60 +680,32 @@ class EconomicCenter:
             {firm_id: {"monthly_income":..., "monthly_expenses":..., "monthly_profit":...}}
         """
         result: Dict[str, Dict[str, float]] = {}
-        try:
-            for cid in list(self.firm_id or []):
-                data = self.firm_monthly_financials.get(cid, {}).get(month, None)
-                if data:
-                    inc = float(data.get("income", 0.0) or 0.0)
-                    exp = float(data.get("expenses", 0.0) or 0.0)
-                else:
-                    inc = 0.0
-                    exp = 0.0
-                dep = float(self.firm_monthly_depreciation.get(str(cid), {}).get(month, 0.0) or 0.0)
-                result[str(cid)] = {
-                    "monthly_income": inc,
-                    "monthly_expenses": exp,
-                    "monthly_profit": inc - exp,
-                    "monthly_depreciation": dep,
-                }
-        except Exception:
-            # 兜底：返回已收集到的部分结果
-            return result
+        for cid in list(self.firm_id or []):
+            data = self.firm_monthly_data.get(cid, {}).get(month, {})
+            inc = float(data.get("income", 0.0) or 0.0)
+            exp = float(data.get("expenses", 0.0) or 0.0)
+            dep = float(self.firm_monthly_depreciation.get(str(cid), {}).get(month, 0.0) or 0.0)
+            result[str(cid)] = {
+                "monthly_income": inc,
+                "monthly_expenses": exp,
+                "monthly_profit": inc - exp,
+                "monthly_depreciation": dep,
+            }
         return result
 
     def query_firm_monthly_wage_expenses(self, firm_id: str, month: int) -> float:
-        """
-        查询企业指定月份的工资总支出（税前 gross_wage）。
-
-        注意：工资在 process_labor 中以 gross_wage 计入 firm_monthly_wage_expenses，
-        与 tx_history 的 labor_payment（税后）不同。
-        """
-        try:
-            return float(self.firm_monthly_wage_expenses.get(firm_id, {}).get(month, 0.0) or 0.0)
-        except Exception:
-            return 0.0
-    
-    def query_firm_production_stats(self, firm_id: str, month: int) -> Dict[str, float]:
-        """查询企业指定月份的生产统计数据"""
-        if firm_id in self.firm_production_stats and month in self.firm_production_stats[firm_id]:
-            production_data = self.firm_production_stats[firm_id][month]
-            return {
-                "base_production": production_data["base_production"],
-                "labor_production": production_data["labor_production"],
-                "total_production": production_data["base_production"] + production_data["labor_production"]
-            }
-        return {"base_production": 0.0, "labor_production": 0.0, "total_production": 0.0}
+        """查询企业指定月份的工资总支出（税前 gross_wage）。"""
+        return float(self.firm_monthly_data.get(firm_id, {}).get(month, {}).get("wage", 0.0) or 0.0)
     
     def query_firm_all_monthly_financials(self, firm_id: str) -> Dict[int, Dict[str, float]]:
         """查询企业所有月份的财务数据"""
         result = {}
-        if firm_id in self.firm_monthly_financials:
-            for month, data in self.firm_monthly_financials[firm_id].items():
-                result[month] = {
-                    "monthly_income": data["income"],
-                    "monthly_expenses": data["expenses"],
-                    "monthly_profit": data["income"] - data["expenses"]
-                }
+        for month, data in self.firm_monthly_data.get(firm_id, {}).items():
+            result[month] = {
+                "monthly_income": data.get("income", 0.0),
+                "monthly_expenses": data.get("expenses", 0.0),
+                "monthly_profit": data.get("income", 0.0) - data.get("expenses", 0.0)
+            }
         return result
 
     def query_income(self, agent_id: str, month: int) -> float:
@@ -956,151 +776,6 @@ class EconomicCenter:
             self.ledger[agent_id] = Ledger()
         self.ledger[agent_id].amount += amount
     
-    def consume_product_inventory(self, firm_id: str, product_id: str, quantity: float) -> bool:
-        """
-        减少企业商品库存
-        
-        Args:
-            firm_id: 企业ID
-            product_id: 商品ID
-            quantity: 消耗数量
-            
-        Returns:
-            bool: 是否成功消耗
-        """
-        if firm_id not in self.products:
-            self.logger.warning(f"企业 {firm_id} 没有产品库存")
-            return False
-        
-        for product in self.products[firm_id]:
-            if product.product_id == product_id:
-                if product.amount >= quantity:
-                    product.amount -= quantity
-                    # self.logger.info(f"企业 {firm_id} 商品 {product_id} 消耗 {quantity} 单位，剩余 {product.amount}")
-                    return True
-                else:
-                    self.logger.warning(f"企业 {firm_id} 商品 {product_id} 库存不足: {product.amount} < {quantity}")
-                    return False
-        
-        self.logger.warning(f"企业 {firm_id} 没有找到商品 {product_id}")
-        return False
-    
-
-    # =========================================================================
-    # Product Management
-    # =========================================================================
-    def register_product(self, agent_id: str, product: Product):
-        """
-        Register a product for an agent. If the product already exists, it will merge the amounts.
-        """
-        if agent_id not in self.products:
-            # print(f"Initialized product for agent {agent_id}")
-            self.products[agent_id] = []
-        
-        self._add_or_merge_product(agent_id, product, product.amount)
-        # self.logger.info(f"Registered product {product.name} for agent {agent_id} with amount {product.amount}")
-
-    def _add_or_merge_product(self, agent_id:str, product: Product, quantity: float = 1.0):
-
-        product.owner_id = agent_id
-        product.amount = quantity
-        for existing_product in self.products[agent_id]:
-            if existing_product.product_id == product.product_id:
-                existing_product.amount += quantity
-                return
-        self.products[agent_id].append(product)
-
-    def _check_and_reserve_inventory(self, seller_id: str, product: Product, quantity: float) -> bool:
-        """
-        检查并预留库存，确保原子性购买操作
-        返回True表示库存充足且已预留，False表示库存不足
-        """
-        if seller_id not in self.products:
-            return False
-
-        # 🔒 兼容预留系统：无 reservation_id 的购买也应考虑“已被其他人预留”的数量
-        try:
-            available_stock = self._get_available_stock(seller_id, product.product_id)
-            return available_stock >= quantity
-        except Exception:
-            # 回退旧逻辑
-            for existing_product in self.products[seller_id]:
-                if existing_product.product_id == product.product_id:
-                    return existing_product.amount >= quantity
-            return False
-    
-    def _get_profit_margin(self, category: str) -> float:
-        """
-        根据商品大类获取毛利率（用于利润计算）
-        
-        Args:
-            category: 商品大类名称（daily_cate）
-            
-        Returns:
-            毛利率（百分比，如25.0表示25%）
-        """
-        # 如果配置中有该大类，返回配置的毛利率
-        if category in self.category_profit_margins:
-            return self.category_profit_margins[category]
-        
-        # 如果找不到该大类，返回默认毛利率25%
-        self.logger.warning(f"未找到大类 '{category}' 的毛利率配置，使用默认值25%")
-        return 25.0
-
-    def _ensure_product_cost_fields(self, product: Product, default_category: Optional[str] = None) -> None:
-        """
-        Ensure product has stable base_price and unit_cost.
-
-        - base_price: original (initial) price used for cost derivation
-        - unit_cost: derived from base_price and category gross margin (kept stable even if price changes)
-        """
-        try:
-            current_price = float(getattr(product, "price", 0.0) or 0.0)
-        except Exception:
-            current_price = 0.0
-
-        try:
-            base_price = getattr(product, "base_price", None)
-            base_price = float(base_price) if base_price is not None else 0.0
-        except Exception:
-            base_price = 0.0
-
-        if base_price <= 0 and current_price > 0:
-            product.base_price = current_price
-            base_price = current_price
-
-        try:
-            unit_cost = getattr(product, "unit_cost", None)
-            unit_cost = float(unit_cost) if unit_cost is not None else 0.0
-        except Exception:
-            unit_cost = 0.0
-
-        if unit_cost <= 0 and base_price > 0:
-            category = getattr(product, "classification", None) or default_category or "Unknown"
-            try:
-                margin_pct = float(self.category_profit_margins.get(category, 25.0) or 25.0)
-            except Exception:
-                margin_pct = 25.0
-            margin_pct = max(0.0, min(80.0, margin_pct))
-            unit_cost = base_price * (1.0 - margin_pct / 100.0)
-            if unit_cost <= 1e-6:
-                unit_cost = max(0.01, base_price * 0.2)
-            product.unit_cost = float(unit_cost)
-    
-    def _reduce_or_remove_product(self, agent_id: str, product: Product, quantity: float = 1.0):
-        """
-        减少商品库存（在确认库存充足后调用）
-        """
-        for existing_product in self.products[agent_id]:
-            if existing_product.product_id == product.product_id:
-                # 再次检查库存（双重保险）
-                if existing_product.amount < quantity:
-                    raise ValueError(f"库存不足: 需要 {quantity}，但只有 {existing_product.amount}")
-                
-                existing_product.amount -= quantity
-                return
-        raise ValueError("Asset not found or insufficient amount to reduce.")
-    
     # register_middleware
     def register_middleware(self, tx_type: str, middleware_fn: Callable[[Transaction, Dict[str, float]], None], tag: Optional[str] = None):
         """
@@ -1115,248 +790,6 @@ class EconomicCenter:
             self.middleware.register(tx_type, middleware_fn, tag)
         else:
             self.middleware.register(tx_type, middleware_fn)
-    
-    # ============================================================================
-    # 🔒 库存预留系统（解决并发竞争问题）
-    # ============================================================================
-    
-
-    # =========================================================================
-    # Inventory Reservation System
-    # =========================================================================
-    def reserve_inventory(self, buyer_id: str, seller_id: str, product_id: str,
-                         product_name: str, quantity: float,
-                         timeout_seconds: float = None,
-                         month: Optional[int] = None) -> Optional[str]:
-        """
-        预留库存
-        
-        Args:
-            buyer_id: 买家ID
-            seller_id: 卖家ID
-            product_id: 商品ID
-            product_name: 商品名称
-            quantity: 预留数量
-            timeout_seconds: 超时时间（秒），默认使用系统配置
-        
-        Returns:
-            预留ID（成功）或 None（失败）
-        """
-        # 清理过期预留
-        self._cleanup_expired_reservations()
-        
-        # 检查库存是否充足（考虑已预留的数量）
-        available_stock = self._get_available_stock(seller_id, product_id)
-        
-        if available_stock < quantity:
-            self.logger.warning(f"🔒 库存预留失败: {product_name} 可用库存 {available_stock:.2f} < 需求 {quantity:.2f}")
-            try:
-                if month is not None:
-                    self.record_unmet_demand(
-                        month=int(month),
-                        buyer_id=str(buyer_id),
-                        seller_id=str(seller_id),
-                        product_id=str(product_id),
-                        product_name=str(product_name),
-                        quantity_requested=float(quantity or 0.0),
-                        available_stock=float(available_stock or 0.0),
-                        reason="reserve_failed",
-                    )
-            except Exception:
-                pass
-            return None
-        
-        # 创建预留记录
-        timeout = timeout_seconds if timeout_seconds is not None else self.reservation_timeout
-        reservation = InventoryReservation.create(
-            buyer_id=buyer_id,
-            seller_id=seller_id,
-            product_id=product_id,
-            product_name=product_name,
-            quantity=quantity,
-            timeout_seconds=timeout
-        )
-        
-        # 保存预留记录
-        # ===== Inventory Reservation System =====
-        self.inventory_reservations[reservation.reservation_id] = reservation
-        
-        self.logger.info(f"✅ 库存预留成功: {product_name} × {quantity:.2f} (预留ID: {reservation.reservation_id[:8]}...)")
-        return reservation.reservation_id
-    
-    def confirm_reservation(self, reservation_id: str) -> bool:
-        """
-        确认预留（购买成功后调用）
-        
-        Args:
-            reservation_id: 预留ID
-        
-        Returns:
-            是否成功确认
-        """
-        # ===== Inventory Reservation System =====
-        if reservation_id not in self.inventory_reservations:
-            self.logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
-            return False
-        
-        # ===== Inventory Reservation System =====
-        reservation = self.inventory_reservations[reservation_id]
-
-        # 只允许确认“活跃”的预留，避免重复确认/错误确认
-        if reservation.status != 'active':
-            self.logger.warning(
-                f"⚠️ 预留状态不可确认: {reservation.product_name} status={reservation.status} "
-                f"(预留ID: {reservation_id[:8]}...)"
-            )
-            return False
-        
-        # 检查预留是否已过期
-        if time.time() > reservation.expires_at:
-            self.logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
-            reservation.status = 'expired'
-            return False
-        
-        # 标记为已确认
-        reservation.status = 'confirmed'
-        self.logger.info(f"✅ 预留已确认: {reservation.product_name} × {reservation.quantity:.2f}")
-        
-        return True
-
-    def validate_reservation(
-        self,
-        reservation_id: str,
-        buyer_id: Optional[str] = None,
-        seller_id: Optional[str] = None,
-        product_id: Optional[str] = None,
-        quantity: Optional[float] = None,
-    ) -> bool:
-        """
-        校验预留是否可用于本次购买（不改变预留状态）。
-
-        说明：预留在“商品转移完成后”才会被 confirm；在此之前保持 active，
-        使得 _get_available_stock 能正确扣除已预留数量，避免并发超卖。
-        """
-        self._cleanup_expired_reservations()
-
-        # ===== Inventory Reservation System =====
-        if reservation_id not in self.inventory_reservations:
-            self.logger.warning(f"⚠️ 预留ID不存在: {reservation_id[:8]}...")
-            return False
-
-        # ===== Inventory Reservation System =====
-        reservation = self.inventory_reservations[reservation_id]
-        if reservation.status != 'active':
-            self.logger.warning(
-                f"⚠️ 预留不可用: {reservation.product_name} status={reservation.status} "
-                f"(预留ID: {reservation_id[:8]}...)"
-            )
-            return False
-
-        if time.time() > reservation.expires_at:
-            reservation.status = 'expired'
-            self.logger.warning(f"⚠️ 预留已过期: {reservation.product_name} (预留ID: {reservation_id[:8]}...)")
-            return False
-
-        if buyer_id is not None and reservation.buyer_id != buyer_id:
-            self.logger.warning(f"⚠️ 预留buyer不匹配: expected={buyer_id} got={reservation.buyer_id}")
-            return False
-        if seller_id is not None and reservation.seller_id != seller_id:
-            self.logger.warning(f"⚠️ 预留seller不匹配: expected={seller_id} got={reservation.seller_id}")
-            return False
-        if product_id is not None and reservation.product_id != product_id:
-            self.logger.warning(f"⚠️ 预留product不匹配: expected={product_id} got={reservation.product_id}")
-            return False
-        if quantity is not None and abs(float(reservation.quantity) - float(quantity)) > 1e-6:
-            self.logger.warning(f"⚠️ 预留quantity不匹配: expected={quantity} got={reservation.quantity}")
-            return False
-
-        return True
-    
-    def release_reservation(self, reservation_id: str, reason: str = "cancelled") -> bool:
-        """
-        释放预留（购买失败或取消时调用）
-        
-        Args:
-            reservation_id: 预留ID
-            reason: 释放原因
-        
-        Returns:
-            是否成功释放
-        """
-        # ===== Inventory Reservation System =====
-        if reservation_id not in self.inventory_reservations:
-            return False
-        
-        # ===== Inventory Reservation System =====
-        reservation = self.inventory_reservations[reservation_id]
-        reservation.status = 'released'
-        
-        self.logger.info(f"🔓 预留已释放: {reservation.product_name} × {reservation.quantity:.2f} (原因: {reason})")
-        return True
-    
-    def _get_available_stock(self, seller_id: str, product_id: str) -> float:
-        """
-        获取可用库存（实际库存 - 已预留数量）
-        
-        Args:
-            seller_id: 卖家ID
-            product_id: 商品ID
-        
-        Returns:
-            可用库存数量
-        """
-        # 获取实际库存
-        actual_stock = 0.0
-        for product in self.products.get(seller_id, []):
-            if product.product_id == product_id:
-                actual_stock = product.amount
-                break
-        
-        # 计算已预留数量（只统计活跃状态的预留）
-        reserved_quantity = 0.0
-        # ===== Inventory Reservation System =====
-        for reservation in self.inventory_reservations.values():
-            if (reservation.seller_id == seller_id and
-                reservation.product_id == product_id and
-                reservation.status == 'active' and
-                time.time() <= reservation.expires_at):
-                reserved_quantity += reservation.quantity
-        
-        available = actual_stock - reserved_quantity
-        return max(0.0, available)  # 确保不返回负数
-    
-    def _cleanup_expired_reservations(self):
-        """清理过期的预留记录"""
-        current_time = time.time()
-        expired_ids = []
-        
-        # ===== Inventory Reservation System =====
-        for reservation_id, reservation in self.inventory_reservations.items():
-            if reservation.status == 'active' and current_time > reservation.expires_at:
-                reservation.status = 'expired'
-                expired_ids.append(reservation_id)
-        
-        if expired_ids:
-            self.logger.info(f"🧹 清理了 {len(expired_ids)} 个过期预留")
-    
-    def get_reservation_stats(self) -> Dict[str, int]:
-        """获取预留统计信息（用于监控）"""
-        stats = {
-        # ===== Inventory Reservation System =====
-            'total': len(self.inventory_reservations),
-            'active': 0,
-            'confirmed': 0,
-            'released': 0,
-            'expired': 0
-        }
-        
-        # ===== Inventory Reservation System =====
-        for reservation in self.inventory_reservations.values():
-            stats[reservation.status] += 1
-        
-        return stats
-    
-
     # =========================================================================
     # Transaction Processing
     # =========================================================================
@@ -1483,7 +916,7 @@ class EconomicCenter:
         if is_company:
             self.record_firm_expense(buyer_id, total_cost)
             self.record_firm_monthly_expense(buyer_id, month, total_cost)
-            self.firm_monthly_production_cost[buyer_id][month] += total_cost
+            self.firm_monthly_data[buyer_id][month]["production_cost"] += total_cost
 
         tx = self._record_transaction(
             sender_id=buyer_id,
@@ -1538,7 +971,7 @@ class EconomicCenter:
         if is_company:
             self.record_firm_expense(buyer_id, total_cost)
             self.record_firm_monthly_expense(buyer_id, month, total_cost)
-            self.firm_monthly_production_cost[buyer_id][month] += total_cost
+            self.firm_monthly_data[buyer_id][month]["production_cost"] += total_cost
 
         tx = self._record_transaction(
             sender_id=buyer_id,
@@ -1584,79 +1017,52 @@ class EconomicCenter:
                 results.append(None)  # 购买失败
         return results
     
-    def process_purchase(self, month: int, buyer_id: str, seller_id: str, product: Product,
-                         quantity: float = 1.0, reservation_id: Optional[str] = None) -> Optional[str]:
+    def process_purchase(
+        self, 
+        month: int, 
+        buyer_id: str, 
+        seller_id: str, 
+        amount: float,
+        quantity: float = 1.0,
+        product_id: Optional[str] = None,
+        product_name: Optional[str] = None,
+        unit_price: Optional[float] = None,
+    ) -> Optional[str]:
         """
-        处理购买交易
+        处理购买交易（纯转账，商品管理由商品市场负责）
         
         Args:
             month: 当前月份
             buyer_id: 买家ID
             seller_id: 卖家ID
-            product: 商品对象
-            quantity: 购买数量
-            reservation_id: 预留ID（如果有）
+            amount: 交易金额（不含税）
+            quantity: 购买数量（用于记录）
+            product_id: 商品ID（可选，用于记录）
+            product_name: 商品名称（可选，用于记录）
+            unit_price: 单价（可选，用于记录）
         
         Returns:
-            Transaction对象（成功）或 False（失败）
+            交易ID（成功）或 None（失败）
         """
         # 计算总费用：标价 + 消费税
-        base_price = product.price * quantity
-        total_cost_with_tax = base_price * (1 + self.vat_rate)  # 家庭支付标价+消费税
+        base_price = float(amount)
+        total_cost_with_tax = base_price * (1 + self.vat_rate)
         
-        # 检查家庭余额是否足够支付含税价格
+        # 检查买家余额
+        if buyer_id not in self.ledger:
+            self.ledger[buyer_id] = Ledger()
         if self.ledger[buyer_id].amount < total_cost_with_tax:
-            # 如果有预留，释放它
-            if reservation_id:
-                self.release_reservation(reservation_id, reason="insufficient_funds")
-            return False
+            self.logger.warning(f"购买失败: 买家 {buyer_id} 余额不足 (需要 {total_cost_with_tax:.2f})")
+            return None
 
-        # 🔒 新版库存检查：优先使用预留机制（先校验，不改变状态；成功转移后再 confirm）
-        if reservation_id:
-            if not self.validate_reservation(
-                reservation_id,
-                buyer_id=buyer_id,
-                seller_id=seller_id,
-                product_id=getattr(product, "product_id", None),
-                quantity=quantity,
-            ):
-                # 尽量释放无效预留，避免“卡死库存”
-                self.release_reservation(reservation_id, reason="invalid_reservation")
-                self.logger.warning(f"预留无效，购买失败: {product.name} (预留ID: {reservation_id[:8]}...)")
-                return False
-        else:
-            # 无预留ID：使用旧的检查方式（向后兼容）
-            if not self._check_and_reserve_inventory(seller_id, product, quantity):
-                # 获取当前库存用于调试
-                current_stock = 0
-                for pro in self.products.get(seller_id, []):
-                    if pro.product_id == product.product_id:
-                        current_stock = pro.amount
-                        break
-                self.logger.warning(f"库存不足，购买失败: {product.name} 需要 {quantity}，但库存不足, 剩余库存: {current_stock}")
-                try:
-                    self.record_unmet_demand(
-                        month=int(month),
-                        buyer_id=str(buyer_id),
-                        seller_id=str(seller_id),
-                        product_id=str(getattr(product, "product_id", "")),
-                        product_name=str(getattr(product, "name", "")),
-                        quantity_requested=float(quantity or 0.0),
-                        available_stock=float(current_stock or 0.0),
-                        reason="purchase_no_reservation_insufficient_stock",
-                    )
-                except Exception:
-                    pass
-                return False
-
-        # 家庭支付含税价格
+        # 买家支付含税价格
         self.ledger[buyer_id].amount -= total_cost_with_tax
 
-        # 创建消费税交易记录（税收部分）
+        # 创建消费税交易记录
         tax_amount = base_price * self.vat_rate
-        tax_tx = self._record_transaction(
+        self._record_transaction(
             sender_id=buyer_id,
-            receiver_id="gov_main_simulation",  # 固定政府ID
+            receiver_id="gov_main_simulation",
             amount=tax_amount,
             tx_type='consume_tax',
             month=month,
@@ -1667,102 +1073,33 @@ class EconomicCenter:
         )
         
         # 政府收取消费税
+        if "gov_main_simulation" not in self.ledger:
+            self.ledger["gov_main_simulation"] = Ledger()
         self.ledger["gov_main_simulation"].amount += tax_amount
 
-        # 创建购买交易记录（企业收入部分）
-        # 🔧 交易资产必须携带“本次成交数量”，否则销售统计会误读为“当时库存量”
-        try:
-            tx_product_id = str(getattr(product, "product_id", "") or "")
-            tx_name = str(getattr(product, "name", "Unknown") or "Unknown")
-            tx_classification = getattr(product, "classification", None) or "Unknown"
-            tx_price = float(getattr(product, "price", 0.0) or 0.0)
-            tx_base_price = float(getattr(product, "base_price", 0.0) or 0.0)
-            tx_unit_cost = float(getattr(product, "unit_cost", 0.0) or 0.0)
-
-            if seller_id in self.products and tx_product_id:
-                for inv_p in (self.products.get(seller_id) or []):
-                    if str(getattr(inv_p, "product_id", "") or "") == tx_product_id:
-                        self._ensure_product_cost_fields(inv_p, default_category=tx_classification)
-                        tx_name = str(getattr(inv_p, "name", tx_name) or tx_name)
-                        tx_classification = getattr(inv_p, "classification", tx_classification) or tx_classification
-                        tx_base_price = float(getattr(inv_p, "base_price", tx_base_price) or tx_base_price)
-                        tx_unit_cost = float(getattr(inv_p, "unit_cost", tx_unit_cost) or tx_unit_cost)
-                        break
-
-            if tx_base_price <= 0 and tx_price > 0:
-                tx_base_price = tx_price
-            if tx_unit_cost <= 0 and tx_base_price > 0:
-                margin_pct = float(self.category_profit_margins.get(tx_classification, 25.0) or 25.0)
-                margin_pct = max(0.0, min(80.0, margin_pct))
-                tx_unit_cost = tx_base_price * (1.0 - margin_pct / 100.0)
-                if tx_unit_cost <= 1e-6:
-                    tx_unit_cost = max(0.01, tx_base_price * 0.2)
-
-            product_kwargs = dict(
-                asset_type="products",
-                product_id=tx_product_id,
-                name=tx_name,
-                owner_id=seller_id,
-                amount=float(quantity or 0.0),
-                price=tx_price,
-                classification=tx_classification,
-                base_price=float(tx_base_price),
-                unit_cost=float(tx_unit_cost),
-            )
-            product_kwargs = inject_product_attributes(product_kwargs, tx_product_id)
-            product_asset = Product(**product_kwargs)
-        except Exception:
-            # 兜底：至少保证 amount=quantity，避免销量统计爆炸
-            product_asset = Product.create(
-                name=str(getattr(product, "name", "Unknown") or "Unknown"),
-                price=float(getattr(product, "price", 0.01) or 0.01),
-                owner_id=seller_id,
-                amount=float(quantity or 0.0),
-                classification=getattr(product, "classification", None),
-                product_id=getattr(product, "product_id", None),
-                base_price=getattr(product, "base_price", None),
-                unit_cost=getattr(product, "unit_cost", None),
-            )
-
+        # 创建购买交易记录
         purchase_tx = self._record_transaction(
             sender_id=buyer_id,
             receiver_id=seller_id,
             amount=base_price,
-            assets=[product_asset],
             tx_type='purchase',
             month=month,
             metadata={
-                "product_id": getattr(product_asset, "product_id", None),
+                "product_id": product_id,
+                "product_name": product_name,
                 "quantity": float(quantity or 0.0),
-                "unit_price": float(getattr(product_asset, "price", 0.0) or 0.0),
-                "reservation_id": reservation_id,
+                "unit_price": float(unit_price or 0.0) if unit_price else base_price / max(quantity, 1),
             },
         )
 
-        # 💰 企业收入（现金流口径）：只记录真实收款额
-        # 说明：生产成本应在“生产补货阶段”作为当月支出记录，而不是在销售发生时扣除。
-        revenue = base_price
-        self.ledger[seller_id].amount += revenue
-        self.record_firm_income(seller_id, revenue)
-        self.record_firm_monthly_income(seller_id, month, revenue)
+        # 企业收入
+        if seller_id not in self.ledger:
+            self.ledger[seller_id] = Ledger()
+        self.ledger[seller_id].amount += base_price
+        self.record_firm_income(seller_id, base_price)
+        self.record_firm_monthly_income(seller_id, month, base_price)
         
-        # 企业所得税改为“月度结算”（按净利润计税），避免与生产预算形成循环依赖。
-        
-        # 商品转移
-        try:
-            self._add_or_merge_product(buyer_id, product, quantity)
-            self._reduce_or_remove_product(seller_id, product, quantity)
-        except Exception as e:
-            if reservation_id:
-                self.release_reservation(reservation_id, reason="transfer_failed")
-            print(f"Warning: Failed to process purchase: {e}")
-            return False
-
-        # 🔒 成功完成商品转移后，确认预留
-        if reservation_id:
-            self.confirm_reservation(reservation_id)
-        
-        return purchase_tx
+        return purchase_tx.id
 
     def process_wage(
         self,
@@ -1843,7 +1180,7 @@ class EconomicCenter:
             # 记录企业月度支出
             self.record_firm_monthly_expense(firm_id, month, gross_wage)
             # 细分统计：月度工资支出（税前工资）
-            self.firm_monthly_wage_expenses[firm_id][month] += gross_wage
+            self.firm_monthly_data[firm_id][month]["wage"] += gross_wage
 
         # 记录工资历史（记录税前工资）
         self.wage_history.append(Wage.create(household_id, gross_wage, month))
@@ -2342,8 +1679,7 @@ class EconomicCenter:
         consume_inventory: bool = False,
     ) -> str:
         """
-        添加固有市场交易记录（包含毛利率计算）
-        用于记录政府通过固有市场购买企业商品的交易
+        添加固有市场交易记录（纯转账，商品库存由商品市场管理）
         
         Args:
             month: 交易月份
@@ -2354,71 +1690,33 @@ class EconomicCenter:
             quantity: 购买数量
             product_name: 商品名称
             product_price: 商品单价
-            product_classification: 商品分类（daily_cate）
+            product_classification: 商品分类
+            consume_inventory: 已废弃，库存由商品市场管理
             
         Returns:
             str: 交易ID
         """
-        # 🔧 修改：只检查家庭和政府的余额，企业允许负债
+        # 检查余额
         is_company = sender_id in self.firm_id
         
         if not is_company and self.ledger[sender_id].amount < amount:
-            # 家庭/政府余额不足，不允许交易
             raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
         elif is_company and self.ledger[sender_id].amount < amount:
-            # 企业余额不足，允许负债交易
-            self.logger.info(f"💳 Company {sender_id} inherent market transaction with negative balance: "
-                      f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
+            self.logger.info(f"Company {sender_id} inherent market transaction with negative balance: "
+                      f"${self.ledger[sender_id].amount:.2f} -> ${self.ledger[sender_id].amount - amount:.2f}")
 
-        # 🔒 注意：固有市场可选择在此处原子扣库存（consume_inventory=True），避免“先扣库存后记账”失败导致不一致。
-        # 验证商品是否存在并记录当前库存状态
-        product_found = False
-        current_inventory = 0.0
-        if receiver_id in self.products:
-            for product in self.products[receiver_id]:
-                if product.product_id == product_id:
-                    product_found = True
-                    current_inventory = product.amount
-                    if consume_inventory:
-                        eps = 1e-9
-                        if current_inventory + eps < quantity:
-                            raise ValueError(
-                                f"Insufficient inventory for {receiver_id}:{product_id}: "
-                                f"{current_inventory} < {quantity}"
-                            )
-                        product.amount = max(0.0, float(product.amount) - float(quantity))
-                        current_inventory = product.amount
-                        self.logger.info(
-                            f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 消耗 {quantity}件，剩余 {current_inventory}件"
-                        )
-                    else:
-                        # 旧行为：库存已在调用方扣减，这里仅记录扣减后的库存
-                        self.logger.info(
-                            f"固有市场购买: 企业 {receiver_id} 商品 {product_name} 已消耗 {quantity}件，剩余 {current_inventory}件"
-                        )
-                    break
-
-        if not product_found:
-            self.logger.warning(f"固有市场购买: 未找到企业 {receiver_id} 的商品 {product_id}")
-            if consume_inventory:
-                raise ValueError(f"Product not found for inherent market: {receiver_id}:{product_id}")
-
-        # 政府/买方支付企业（不含税销售额）
+        # 转账
         self.ledger[sender_id].amount -= amount
         self.ledger[receiver_id].amount += amount
 
-        # 🧾 固有市场同样计入 VAT（消费税）
-        # 逻辑与家庭购买一致：税基为不含税销售额 amount，税额=amount*vat_rate。
-        # 若 sender 本身就是政府（gov_main_simulation），该税款在账面上“转给自己”不会改变余额，
-        # 但仍会生成 consume_tax 交易记录，供统计与GDP核算使用。
+        # VAT（消费税）
         tax_amount = float(amount or 0.0) * float(self.vat_rate or 0.0)
         if tax_amount > 0:
             gov_id = "gov_main_simulation"
-            # 确保政府账本存在
             if gov_id in self.ledger:
                 self.ledger[sender_id].amount -= tax_amount
                 self.ledger[gov_id].amount += tax_amount
-            tax_tx = self._record_transaction(
+            self._record_transaction(
                 sender_id=sender_id,
                 receiver_id=gov_id,
                 amount=tax_amount,
@@ -2432,33 +1730,17 @@ class EconomicCenter:
                 },
             )
         
-        # 💰 企业收入（现金流口径）：只记录真实收款额；生产成本在生产阶段记支出
-        revenue = amount
-        self.record_firm_income(receiver_id, revenue)
-        self.record_firm_monthly_income(receiver_id, month, revenue)
+        # 企业收入
+        self.record_firm_income(receiver_id, amount)
+        self.record_firm_monthly_income(receiver_id, month, amount)
         
-        # 创建固有市场交易记录
-        unit_price = product_price if product_price > 0 else (amount / quantity if quantity > 0 else 0)
-        if unit_price <= 0:
-            unit_price = 0.01
-            
-        product_kwargs = dict(
-            asset_type='products',
-            product_id=product_id,
-            name=product_name,
-            owner_id=receiver_id,
-            amount=quantity,
-            price=unit_price,
-            classification=product_classification
-        )
-        product_kwargs = inject_product_attributes(product_kwargs, product_id)
-        product_asset = Product(**product_kwargs)
+        # 创建交易记录
+        unit_price = product_price if product_price > 0 else (amount / quantity if quantity > 0 else 0.01)
         
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=amount,
-            assets=[product_asset],
             tx_type='inherent_market',
             month=month,
             metadata={
@@ -2467,15 +1749,8 @@ class EconomicCenter:
                 "quantity": float(quantity or 0.0),
                 "unit_price": float(unit_price or 0.0),
                 "product_classification": product_classification,
-                "consume_inventory": consume_inventory,
             },
         )
-        
-        # 企业所得税改为“月度结算”（按净利润计税），避免与生产预算形成循环依赖。
-        
-        # self.logger.info(f"固有市场交易: 政府购买商品 {product_name}(ID:{product_id}, {product_classification}) "
-        #            f"数量 {quantity} 金额 ${amount:.2f}, 成本 ${cost:.2f}, 毛利润 ${gross_profit:.2f} (毛利率{profit_margin}%), "
-        #            f"企业所得税 ${corporate_tax:.2f}")
         
         return tx.id
 
@@ -2493,77 +1768,33 @@ class EconomicCenter:
         consume_inventory: bool = True,
     ) -> str:
         """
-        Government procurement transaction:
-        - No VAT/consume_tax is generated (avoid government self-tax artifacts).
-        - Books firm revenue (cashflow) equal to `amount` (ex-tax).
-        - Optionally consumes inventory atomically.
+        政府采购交易（纯转账，商品库存由商品市场管理）
+        - 不产生VAT/消费税（避免政府自我征税）
+        - 记录企业收入
         """
-        # Balance check (government is not a company)
+        # 余额检查
         is_company = sender_id in self.firm_id
         if not is_company and self.ledger[sender_id].amount < amount:
             raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
 
-        # Inventory consume
-        if consume_inventory:
-            product_found = False
-            current_inventory = 0.0
-            if receiver_id in self.products:
-                for p in (self.products.get(receiver_id) or []):
-                    if str(getattr(p, "product_id", "") or "") == str(product_id):
-                        product_found = True
-                        current_inventory = float(getattr(p, "amount", 0.0) or 0.0)
-                        eps = 1e-9
-                        if current_inventory + eps < float(quantity or 0.0):
-                            raise ValueError(
-                                f"Insufficient inventory for {receiver_id}:{product_id}: "
-                                f"{current_inventory} < {quantity}"
-                            )
-                        p.amount = max(0.0, float(p.amount) - float(quantity))
-                        current_inventory = float(p.amount)
-                        # enrich fields from inventory product
-                        try:
-                            self._ensure_product_cost_fields(p, default_category=getattr(p, "classification", product_classification))
-                            product_name = str(getattr(p, "name", product_name) or product_name)
-                            product_classification = getattr(p, "classification", product_classification) or product_classification
-                            if unit_price <= 0:
-                                unit_price = float(getattr(p, "price", 0.0) or 0.0)
-                        except Exception:
-                            pass
-                        break
-            if not product_found:
-                raise ValueError(f"Product not found for government procurement: {receiver_id}:{product_id}")
-
-        # Ledger transfer
+        # 转账
         self.ledger[sender_id].amount -= amount
         self.ledger[receiver_id].amount += amount
 
-        # Firm revenue bookkeeping (cashflow)
+        # 企业收入记账
         self.record_firm_income(receiver_id, amount)
         self.record_firm_monthly_income(receiver_id, month, amount)
 
-        # Transaction asset payload (quantity = purchased quantity)
+        # 计算单价
         if unit_price <= 0 and quantity and float(quantity) > 0:
             unit_price = float(amount) / float(quantity)
         if unit_price <= 0:
             unit_price = 0.01
 
-        product_kwargs = dict(
-            asset_type="products",
-            product_id=str(product_id),
-            name=str(product_name),
-            owner_id=str(receiver_id),
-            amount=float(quantity or 0.0),
-            price=float(unit_price),
-            classification=str(product_classification or "Unknown"),
-        )
-        product_kwargs = inject_product_attributes(product_kwargs, str(product_id))
-        product_asset = Product(**product_kwargs)
-
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
             amount=float(amount or 0.0),
-            assets=[product_asset],
             tx_type="government_procurement",
             month=month,
             metadata={
@@ -2572,63 +1803,11 @@ class EconomicCenter:
                 "quantity": float(quantity or 0.0),
                 "unit_price": float(unit_price or 0.0),
                 "product_classification": product_classification,
-                "consume_inventory": consume_inventory,
             },
         )
         return tx.id
-    
 
-    # =========================================================================
-    # Inventory & Pricing Management
-    # =========================================================================
-    def get_product_inventory(self, owner_id: str, product_id: str) -> float:
-        """
-        获取指定商品的当前库存数量
-        """
-        if owner_id not in self.products:
-            return 0.0
-        
-        for product in self.products[owner_id]:
-            if product.product_id == product_id:
-                return product.amount
-        return 0.0
-    
-    def get_all_product_inventory(self) -> Dict[tuple, float]:
-        """
-        批量获取所有商品的库存信息
-        
-        Returns:
-            Dict[tuple, float]: {(product_id, owner_id): amount} 字典
-        """
-        inventory_dict = {}
-        for owner_id, products in self.products.items():
-            for product in products:
-                key = (product.product_id, owner_id)
-                inventory_dict[key] = product.amount
-        return inventory_dict
-    
-    async def sync_product_inventory_to_market(self, product_market):
-        """
-        将EconomicCenter的库存信息同步到ProductMarket
-        这个方法可以定期调用以保持两边数据一致
-        """
-        try:
-            # 收集所有有库存的商品
-            all_products = []
-            for owner_id, products in self.products.items():
-                if owner_id in self.firm_id:
-                    for product in products:
-                        if product.amount > 0:  # 只同步有库存的商品
-                            all_products.append(product)
-            
-            # 更新ProductMarket的商品列表
-            await product_market.update_products_from_economic_center.remote(all_products)
-            self.logger.info(f"已同步 {len(all_products)} 个商品到ProductMarket")
-            return True
-        except Exception as e:
-            self.logger.error(f"同步库存到ProductMarket失败: {e}")
-            return False
-    
+
     # Sales Statistics & Market Analysis
     # =========================================================================
     def collect_sales_statistics(self, month: int) -> Dict[tuple, Dict]:
@@ -2831,8 +2010,8 @@ class EconomicCenter:
             if firm_id not in self.ledger:
                 self.ledger[firm_id] = Ledger.create(firm_id, 0.0)
 
-            income = float(self.firm_monthly_financials.get(firm_id, {}).get(month, {}).get("income", 0.0) or 0.0)
-            expenses_pre_tax = float(self.firm_monthly_financials.get(firm_id, {}).get(month, {}).get("expenses", 0.0) or 0.0)
+            income = float(self.firm_monthly_data.get(firm_id, {}).get(month, {}).get("income", 0.0) or 0.0)
+            expenses_pre_tax = float(self.firm_monthly_data.get(firm_id, {}).get(month, {}).get("expenses", 0.0) or 0.0)
             taxable_profit = max(0.0, income - expenses_pre_tax)
             corporate_tax = taxable_profit * float(self.corporate_tax_rate or 0.0)
 
@@ -2854,7 +2033,7 @@ class EconomicCenter:
             # 账务记录
             self.record_firm_expense(firm_id, corporate_tax)
             self.record_firm_monthly_expense(firm_id, month, corporate_tax)
-            self.firm_monthly_corporate_tax[firm_id][month] += corporate_tax
+            self.firm_monthly_data[firm_id][month]["tax"] += corporate_tax
 
             corp_tax_tx = self._record_transaction(
                 sender_id=firm_id,
@@ -2903,32 +2082,20 @@ class EconomicCenter:
         return self.production_stats_by_month.get(month, {})
 
     # ======================== GDP 核算（生产法/支出法/收入法） ========================
-    def _infer_firm_category(self, firm_id: str) -> Optional[str]:
-        """
-        尝试从企业库存中推断企业所属大类（用于毛利率）。
-        规则：取该企业库存中第一个带 classification 的商品。
-        """
-        try:
-            for p in (self.products.get(firm_id, []) or []):
-                cate = getattr(p, "classification", None)
-                if cate:
-                    return cate
-        except Exception:
-            pass
-        return None
 
-    def _get_firm_margin_rate(self, firm_id: str) -> float:
+
+    def _get_firm_margin_rate(self, firm_id: str, industry_code: Optional[str] = None) -> float:
         """
-        获取企业毛利率（rate），默认 25%。
+        获取企业毛利率（rate），默认 15%。
         注意：毛利率定义为 (售价-成本)/售价，因此 售价 = 成本 / (1-毛利率)。
+        基于IO表V003获取。
         """
         try:
-            cate = self._infer_firm_category(firm_id) or "Unknown"
-            margin_pct = float(self.category_profit_margins.get(cate, 25.0) or 25.0)
-            margin_pct = max(0.0, min(80.0, margin_pct))
-            return margin_pct / 100.0
+            if not industry_code:
+                industry_code = "Unknown"
+            return 0.15  # 默认15%，行业利润率由商品市场管理
         except Exception:
-            return 0.25
+            return 0.15  # 默认15%
 
     def calculate_nominal_gdp_and_health(self, month: int) -> Dict[str, Any]:
         """
@@ -2988,12 +2155,9 @@ class EconomicCenter:
         total_firm_revenue = total_sales_ex_tax
         total_firm_profit = total_firm_revenue - total_production_cost - total_wages  # 简化估算
         
-        # 4) 库存健康
+        # 4) 库存健康 - 由商品市场管理，这里返回0
         total_inventory_value = 0.0
-        for owner_id, products in self.products.items():
-            for p in products:
-                total_inventory_value += float(getattr(p, "amount", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
-        inventory_to_gdp_ratio = (total_inventory_value / nominal_gdp_transaction) if nominal_gdp_transaction > 0 else 0.0
+        inventory_to_gdp_ratio = 0.0
         
         # 5) 财政健康
         labor_tax_collected = 0.0
@@ -3029,16 +2193,8 @@ class EconomicCenter:
         employment_rate = (float(employed_count) / float(total_labor_force_units)) if total_labor_force_units > 0 else 0.0
         average_wage = (total_wages / employed_count) if employed_count > 0 else 0.0
         
-        # 7) 价格水平（简化：所有产品的加权平均价格）
-        total_price_weighted = 0.0
-        total_quantity = 0.0
-        for owner_id, products in self.products.items():
-            for p in products:
-                qty = float(getattr(p, "amount", 0.0) or 0.0)
-                price = float(getattr(p, "price", 0.0) or 0.0)
-                total_price_weighted += price * qty
-                total_quantity += qty
-        average_price_level = (total_price_weighted / total_quantity) if total_quantity > 0 else 0.0
+        # 7) 价格水平 - 由商品市场管理，这里返回0
+        average_price_level = 0.0
         
         return {
             "month": month,

@@ -54,8 +54,7 @@ class Simulator:
                 )
             # Initialize core components (pass in tax policy)
             self.economic_center = EconomicCenter.remote(
-                tax_policy=tax_policy,
-                category_profit_margins=self.config.category_profit_margins
+                tax_policy=tax_policy
             )
             self.product_market = ProductMarket.remote()
             # LaborMarket needs economic_center for wage transfers
