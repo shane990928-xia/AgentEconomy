@@ -234,50 +234,72 @@ class Product(Asset):
     """
     Represents a product available for purchase.
     
-    Includes pricing, ownership, attributes, and nutrition/satisfaction data.
+    Supports multi-layer supply chain pricing:
+    - Manufacturer Price: Price when sold by manufacturer
+    - Wholesale Price: Price when sold by wholesaler (optional layer)
+    - Retail Price: Final consumer price
+    
+    Includes ownership, attributes, and nutrition/satisfaction data.
     """
     asset_type: Literal['products'] = Field(default='products', description="Type of the asset")
     product_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique product ID")
     name: str = Field(..., description="Name of the product")
     description: Optional[str] = Field(None, description="Description of the product")
-    price: float = Field(..., gt=0, description="Current price of the product")
-    base_price: Optional[float] = Field(
-        default=None,
-        gt=0,
-        description="Original price used for unit cost calculation; stable even if price changes"
-    )
-    unit_cost: Optional[float] = Field(
-        default=None,
-        ge=0,
-        description="Unit cost derived from base_price and industry gross margin"
-    )
-    owner_id: str = Field(..., description="ID of the owner/seller")
+    
+    # === Supply Chain Pricing ===
+    manufacturer_price: float = Field(..., gt=0, description="Price when sold by manufacturer")
+    base_manufacturer_price: float = Field(..., gt=0, description="Original manufacturer price (stable)")
+    wholesale_price: Optional[float] = Field(default=None, gt=0, description="Price when sold by wholesaler")
+    base_wholesale_price: Optional[float] = Field(default=None, gt=0, description="Original wholesale price (stable)")
+    retail_price: float = Field(..., gt=0, description="Final consumer price")
+    base_retail_price: float = Field(..., gt=0, description="Original retail price (stable)")
+    has_wholesale_layer: bool = Field(default=False, description="Whether product goes through wholesale")
+    
+    # === Supply Chain Participants ===
+    manufacturer_code: Optional[str] = Field(None, description="Industry code of manufacturer")
+    retailer_code: Optional[str] = Field(None, description="Industry code of retailer")
+    owner_id: str = Field(..., description="ID of the current owner/seller")
+    
+    # === Inventory ===
+    available_stock: float = Field(default=0.0, ge=0, description="Available stock for sale")
+    
+    # === Legacy/Computed Fields ===
+    unit_cost: Optional[float] = Field(default=None, ge=0, description="Manufacturing cost per unit")
+    
+    # === Product Attributes ===
     brand: Optional[str] = Field(None, description="Brand of the product")
-    attributes: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Raw attribute payload for the product"
-    )
+    attributes: Optional[Dict[str, Any]] = Field(default=None, description="Raw attribute payload")
     is_food: Optional[bool] = Field(default=None, description="Whether the product is food")
-    nutrition_supply: Optional[Dict[str, float]] = Field(
-        default=None,
-        description="Nutrition data when product is food"
-    )
-    satisfaction_attributes: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Satisfaction attributes for non-food products"
-    )
-    duration_months: Optional[int] = Field(
-        default=None,
-        description="Duration (months) product provides satisfaction/nutrition"
-    )
+    nutrition_supply: Optional[Dict[str, float]] = Field(default=None, description="Nutrition data for food")
+    satisfaction_attributes: Optional[Dict[str, Any]] = Field(default=None, description="Satisfaction attributes")
+    duration_months: Optional[int] = Field(default=None, description="Duration (months) product provides value")
+    
+    @property
+    def price(self) -> float:
+        """Current selling price based on owner's position in supply chain."""
+        return self.retail_price
+    
+    @property
+    def base_price(self) -> float:
+        """Base price for calculations."""
+        return self.base_retail_price
     
     @classmethod
     def create(
         cls,
         name: str,
-        price: float,
         owner_id: str,
+        manufacturer_price: float,
+        retail_price: float,
+        base_manufacturer_price: Optional[float] = None,
+        base_retail_price: Optional[float] = None,
+        wholesale_price: Optional[float] = None,
+        base_wholesale_price: Optional[float] = None,
+        has_wholesale_layer: bool = False,
+        manufacturer_code: Optional[str] = None,
+        retailer_code: Optional[str] = None,
         amount: float = 1.0,
+        available_stock: float = 0.0,
         classification: Optional[str] = None,
         expiration_date: Optional[date] = None,
         manufacturer: Optional[str] = None,
@@ -289,17 +311,25 @@ class Product(Asset):
         nutrition_supply: Optional[Dict[str, float]] = None,
         satisfaction_attributes: Optional[Dict[str, Any]] = None,
         duration_months: Optional[int] = None,
-        base_price: Optional[float] = None,
         unit_cost: Optional[float] = None
     ) -> 'Product':
         """
-        Create a new product.
+        Create a new product with supply chain pricing.
         
         Args:
             name: Product name
-            price: Current selling price
-            owner_id: ID of the owner/seller
+            owner_id: ID of the current owner/seller
+            manufacturer_price: Price when sold by manufacturer
+            retail_price: Final consumer price
+            base_manufacturer_price: Original manufacturer price (defaults to manufacturer_price)
+            base_retail_price: Original retail price (defaults to retail_price)
+            wholesale_price: Price when sold by wholesaler (optional)
+            base_wholesale_price: Original wholesale price (optional)
+            has_wholesale_layer: Whether product goes through wholesale
+            manufacturer_code: Industry code of manufacturer
+            retailer_code: Industry code of retailer
             amount: Quantity available
+            available_stock: Stock available for sale
             classification: Product classification
             expiration_date: When product expires
             manufacturer: Who manufactures the product
@@ -311,31 +341,53 @@ class Product(Asset):
             nutrition_supply: Nutrition data for food
             satisfaction_attributes: Satisfaction data for non-food
             duration_months: How long product provides value
-            base_price: Original/base price (defaults to price)
             unit_cost: Manufacturing cost per unit
             
         Returns:
             New Product instance
             
         Raises:
-            ValueError: If price or base_price <= 0
+            ValueError: If required prices <= 0
         """
-        if price <= 0:
-            raise ValueError("Price must be greater than zero")
-        if base_price is None:
-            base_price = price
-        elif base_price <= 0:
-            raise ValueError("base_price must be greater than zero")
+        if manufacturer_price <= 0:
+            raise ValueError("manufacturer_price must be greater than zero")
+        if retail_price <= 0:
+            raise ValueError("retail_price must be greater than zero")
+        
+        # Set base prices to current prices if not provided
+        if base_manufacturer_price is None:
+            base_manufacturer_price = manufacturer_price
+        elif base_manufacturer_price <= 0:
+            raise ValueError("base_manufacturer_price must be greater than zero")
+            
+        if base_retail_price is None:
+            base_retail_price = retail_price
+        elif base_retail_price <= 0:
+            raise ValueError("base_retail_price must be greater than zero")
+        
+        # Validate wholesale prices if provided
+        if wholesale_price is not None and wholesale_price <= 0:
+            raise ValueError("wholesale_price must be greater than zero")
+        if base_wholesale_price is None and wholesale_price is not None:
+            base_wholesale_price = wholesale_price
         
         return cls(
             name=name,
             asset_type='products',
             product_id=product_id,
-            price=price,
-            base_price=base_price,
-            unit_cost=unit_cost,
             owner_id=owner_id,
+            manufacturer_price=manufacturer_price,
+            base_manufacturer_price=base_manufacturer_price,
+            wholesale_price=wholesale_price,
+            base_wholesale_price=base_wholesale_price,
+            retail_price=retail_price,
+            base_retail_price=base_retail_price,
+            has_wholesale_layer=has_wholesale_layer,
+            manufacturer_code=manufacturer_code,
+            retailer_code=retailer_code,
             amount=amount,
+            available_stock=available_stock,
+            unit_cost=unit_cost,
             classification=classification,
             expiration_date=expiration_date,
             manufacturer=manufacturer,
