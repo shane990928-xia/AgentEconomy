@@ -4,7 +4,7 @@ Economic Center Module
 This module implements the central economic system that manages all economic activities
 in the agent-based economic simulation, including:
 
-- Asset Management: Ledgers, products, labor hours, capital stocks
+- Asset Management: Ledgers, products, capital stocks
 - Transaction Processing: Purchases, labor payments, taxes
 - Tax System: Progressive income tax, corporate tax, VAT
 - Firm Finances: Revenue, expenses, depreciation, innovation
@@ -77,7 +77,7 @@ class EconomicCenter:
         # 3️⃣ 资产存储 (Asset Storage)
         # =========================================================================
         self.ledger: Dict[str, Ledger] = defaultdict(Ledger)            # 现金账本
-        self.laborhour: Dict[str, List[LaborHour]] = defaultdict(list)  # 劳动力
+        self.labor_market = None
 
         # =========================================================================
         # 4️⃣ Agent ID 注册表 (Agent ID Registry)
@@ -453,15 +453,6 @@ class EconomicCenter:
             self.ledger[agent_id] = ledger
             # self.logger.info(f"Initialized ledger for agent {agent_id} with amount {initial_amount}")
 
-    def init_agent_labor(self, agent_id:str, labor:[LaborHour]=[]):
-        """
-        Initialize the labor hour for an agent.
-        """
-        if agent_id not in self.laborhour:
-            self.laborhour[agent_id] = []
-        if labor:
-            self.laborhour[agent_id] = labor
-
     def register_id(self, agent_id: str, agent_type: Literal['government', 'household', 'firm', 'bank']):
         """
         Register an agent ID based on its type.
@@ -487,6 +478,25 @@ class EconomicCenter:
             "firm": list(self.firm_id),
             "bank": list(self.bank_id),
         }
+
+    def set_labor_market(self, labor_market):
+        self.labor_market = labor_market
+
+    def _call_labor_market(self, method_name: str, *args, **kwargs):
+        if self.labor_market is None:
+            return None
+        method = getattr(self.labor_market, method_name, None)
+        if method is None:
+            return None
+        if 'ActorHandle' in str(type(self.labor_market)):
+            return ray.get(method.remote(*args, **kwargs))
+        return method(*args, **kwargs)
+
+    def _get_labor_snapshot(self) -> Dict[str, Dict[str, int]]:
+        snapshot = self._call_labor_market("get_labor_force_snapshot")
+        if isinstance(snapshot, dict):
+            return snapshot
+        return {}
 
 
     # =========================================================================
@@ -740,9 +750,6 @@ class EconomicCenter:
             return 0.0
         return float(total)
 
-
-    def query_labor(self, agent_id: str) -> List[LaborHour]:
-        return self.laborhour[agent_id]
 
     def deposit_funds(self, agent_id: str, amount: float):
         """
@@ -1354,16 +1361,15 @@ class EconomicCenter:
             print(f"Month {month}: No tax revenue to redistribute")
             return {"total_redistributed": 0.0, "recipients": 0, "per_person": 0.0}
         
-        # 获取所有有劳动力的家庭ID（基于现有的laborhour字典）
-        all_workers = [household_id for household_id, labor_hours in self.laborhour.items()
-                      if labor_hours]  # 只包括有劳动力的家庭
+        labor_snapshot = self._get_labor_snapshot()
+        all_workers = list(labor_snapshot.keys())
         if not all_workers:
             print(f"Month {month}: No households with labor hours found for tax redistribution")
             return {"total_redistributed": 0.0, "recipients": 0, "per_person": 0.0}
         
         # 根据策略计算分配金额
         household_allocations = self._calculate_redistribution_allocations(
-            all_workers, total_tax, strategy, poverty_weight, unemployment_weight, family_size_weight, month
+            all_workers, total_tax, strategy, poverty_weight, unemployment_weight, family_size_weight, month, labor_snapshot
         )
         
         total_redistributed = 0.0
@@ -1410,7 +1416,7 @@ class EconomicCenter:
     def _calculate_redistribution_allocations(self, all_workers: List[str], total_tax: float,
                                            strategy: str, poverty_weight: float,
                                            unemployment_weight: float, family_size_weight: float,
-                                           month: int) -> Dict[str, float]:
+                                           month: int, labor_snapshot: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, float]:
         """
         根据策略计算每个家庭的分配金额
         
@@ -1433,12 +1439,12 @@ class EconomicCenter:
         elif strategy == "poverty_focused":
             return self._poverty_focused_allocation(all_workers, total_tax, month)
         elif strategy == "unemployment_focused":
-            return self._unemployment_focused_allocation(all_workers, total_tax, month)
+            return self._unemployment_focused_allocation(all_workers, total_tax, month, labor_snapshot)
         elif strategy == "family_size":
-            return self._family_size_allocation(all_workers, total_tax)
+            return self._family_size_allocation(all_workers, total_tax, labor_snapshot)
         elif strategy == "mixed":
             return self._mixed_allocation(all_workers, total_tax, poverty_weight,
-                                        unemployment_weight, family_size_weight, month)
+                                        unemployment_weight, family_size_weight, month, labor_snapshot)
         else:
             print(f"Unknown redistribution strategy: {strategy}, using equal allocation")
             return self._equal_allocation(all_workers, total_tax)
@@ -1520,15 +1526,22 @@ class EconomicCenter:
         
         return allocations
 
-    def _unemployment_focused_allocation(self, all_workers: List[str], total_tax: float, month: int) -> Dict[str, float]:
+    def _unemployment_focused_allocation(
+        self,
+        all_workers: List[str],
+        total_tax: float,
+        month: int,
+        labor_snapshot: Optional[Dict[str, Dict[str, int]]] = None
+    ) -> Dict[str, float]:
         """失业导向分配策略（失业者获得更多）"""
         unemployment_weights = {}
         total_weight = 0.0
+        snapshot = labor_snapshot if labor_snapshot is not None else self._get_labor_snapshot()
         
         for household_id in all_workers:
-            labor_hours = self.laborhour.get(household_id, [])
-            employed_count = sum(1 for lh in labor_hours if not lh.is_valid and lh.firm_id is not None)
-            unemployed_count = len(labor_hours) - employed_count
+            entry = snapshot.get(household_id, {})
+            employed_count = int(entry.get("employed", 0) or 0)
+            unemployed_count = int(entry.get("unemployed", 0) or 0)
             
             # 失业者权重更高
             weight = unemployed_count * 2.0 + employed_count * 1.0
@@ -1545,14 +1558,20 @@ class EconomicCenter:
         
         return allocations
 
-    def _family_size_allocation(self, all_workers: List[str], total_tax: float) -> Dict[str, float]:
+    def _family_size_allocation(
+        self,
+        all_workers: List[str],
+        total_tax: float,
+        labor_snapshot: Optional[Dict[str, Dict[str, int]]] = None
+    ) -> Dict[str, float]:
         """按家庭规模分配策略"""
         family_weights = {}
         total_weight = 0.0
+        snapshot = labor_snapshot if labor_snapshot is not None else self._get_labor_snapshot()
         
         for household_id in all_workers:
-            labor_hours = self.laborhour.get(household_id, [])
-            family_size = len(labor_hours)
+            entry = snapshot.get(household_id, {})
+            family_size = int(entry.get("total", 0) or 0)
             family_weights[household_id] = family_size
             total_weight += family_size
         
@@ -1568,12 +1587,13 @@ class EconomicCenter:
 
     def _mixed_allocation(self, all_workers: List[str], total_tax: float,
                          poverty_weight: float, unemployment_weight: float,
-                         family_size_weight: float, month: int) -> Dict[str, float]:
+                         family_size_weight: float, month: int,
+                         labor_snapshot: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, float]:
         """混合分配策略"""
         # 获取各种权重
         poverty_allocations = self._poverty_focused_allocation(all_workers, total_tax, month)
-        unemployment_allocations = self._unemployment_focused_allocation(all_workers, total_tax, month)
-        family_size_allocations = self._family_size_allocation(all_workers, total_tax)
+        unemployment_allocations = self._unemployment_focused_allocation(all_workers, total_tax, month, labor_snapshot)
+        family_size_allocations = self._family_size_allocation(all_workers, total_tax, labor_snapshot)
         equal_allocations = self._equal_allocation(all_workers, total_tax)
         
         # 计算剩余权重
@@ -2176,18 +2196,16 @@ class EconomicCenter:
         gov_balance = self.ledger.get("gov_main_simulation", type('obj', (), {'amount': 0.0})()).amount
         
         # 6) 就业市场
-        # ✅ 不依赖 self.households.employment_status（并行消费/轻量对象场景会缺失），改用交易与 laborhour 存量推断
+        # ✅ 不依赖 self.households.employment_status（并行消费/轻量对象场景会缺失），改用交易与 labor market 存量推断
         employed_count = 0
         for tx in transactions:
             if tx.month == month and tx.type == "labor_payment":
                 employed_count += 1  # 每笔 labor_payment 近似对应一个劳动力单元（head/spouse）
 
+        labor_snapshot = self._get_labor_snapshot()
         total_labor_force_units = 0
-        try:
-            for _hid, lhs in (self.laborhour or {}).items():
-                total_labor_force_units += len(lhs or [])
-        except Exception:
-            total_labor_force_units = 0
+        for entry in labor_snapshot.values():
+            total_labor_force_units += int(entry.get("total", 0) or 0)
 
         unemployed_count = max(0, int(total_labor_force_units) - int(employed_count))
         employment_rate = (float(employed_count) / float(total_labor_force_units)) if total_labor_force_units > 0 else 0.0

@@ -1,0 +1,1356 @@
+{
+  "codebook_id": "J357328",
+  "n_variables": 30,
+  "variables": [
+    {
+      "var": "ER82001",
+      "name": "RELEASE NUMBER",
+      "label": "Release Number",
+      "description": null,
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "1",
+          "text": "Release number 1, May 2025"
+        }
+      ]
+    },
+    {
+      "var": "ER82002",
+      "name": "2023 FAMILY INTERVIEW (ID) NUMBER",
+      "label": "2023 Interview Number",
+      "description": "The values for this variable represent the 2023 interview number. The case count for 2023 is 9,152. Values for this variable may not be contiguous.",
+      "field_type": "continuous",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "1 - 9,244",
+          "text": "Interview number"
+        }
+      ]
+    },
+    {
+      "var": "ER82017",
+      "name": "# IN FU",
+      "label": "Number of Persons in FU at the Time of the 2023 Interview",
+      "description": "This variable represents the actual number of persons currently in the FU.",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "1 - 20",
+          "text": "Actual number"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER82027",
+      "name": "A3 LIFE SATISFACTION",
+      "label": "A3 Life Satisfaction",
+      "description": "A3. Please think about your life as a whole. How satisfied are you with it? Are you completely satisfied, very satisfied, somewhat satisfied, not very satisfied, or not at all satisfied?",
+      "distribution": [
+        {
+          "count": 1700,
+          "percent": 18.58,
+          "value_range": "1",
+          "text": "Completely satisfied"
+        },
+        {
+          "count": 3843,
+          "percent": 41.99,
+          "value_range": "2",
+          "text": "Very satisfied"
+        },
+        {
+          "count": 3010,
+          "percent": 32.89,
+          "value_range": "3",
+          "text": "Somewhat satisfied"
+        },
+        {
+          "count": 430,
+          "percent": 4.7,
+          "value_range": "4",
+          "text": "Not very satisfied"
+        },
+        {
+          "count": 80,
+          "percent": 0.87,
+          "value_range": "5",
+          "text": "Not at all satisfied"
+        },
+        {
+          "count": 26,
+          "percent": 0.28,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 12,
+          "percent": 0.13,
+          "value_range": "9",
+          "text": "NA; refused"
+        },
+        {
+          "count": 51,
+          "percent": 0.56,
+          "value_range": "0",
+          "text": "Inap.: respondent was not Reference Person or Spouse/Partner"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER82150",
+      "name": "BC1 EMPLOYMENT STATUS-1ST MENTION",
+      "label": "BC1 Employment Status - First Mention",
+      "description": "BC1. We would like to know about what (you do/Reference Person does) -- (are you/is Reference Person) working now, looking for work, retired, keeping house, a student, or what?--FIRST MENTION",
+      "distribution": [
+        {
+          "count": 5890,
+          "percent": 64.36,
+          "value_range": "1",
+          "text": "Working now"
+        },
+        {
+          "count": 175,
+          "percent": 1.91,
+          "value_range": "2",
+          "text": "Only temporarily laid off, sick leave or maternity leave"
+        },
+        {
+          "count": 570,
+          "percent": 6.23,
+          "value_range": "3",
+          "text": "Looking for work, unemployed"
+        },
+        {
+          "count": 1563,
+          "percent": 17.08,
+          "value_range": "4",
+          "text": "Retired"
+        },
+        {
+          "count": 442,
+          "percent": 4.83,
+          "value_range": "5",
+          "text": "Permanently disabled; temporarily disabled"
+        },
+        {
+          "count": 327,
+          "percent": 3.57,
+          "value_range": "6",
+          "text": "Keeping house"
+        },
+        {
+          "count": 102,
+          "percent": 1.11,
+          "value_range": "7",
+          "text": "Student"
+        },
+        {
+          "count": 7,
+          "percent": 0.08,
+          "value_range": "8",
+          "text": "Other; \"workfare\"; in prison or jail"
+        },
+        {
+          "count": 76,
+          "percent": 0.83,
+          "value_range": "99",
+          "text": "DK; NA; refused"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER82181",
+      "name": "BC20 MAIN OCC FOR JOB 1: 2010 CODE (RP)",
+      "label": "BC20 Main Occupation for Job 1 (2010 Census Code) - RP",
+      "description": "BC20. In (your/his/her) work for (EMPNAME) (BEGMO/BEGYR)-(ENDMO/ENDYR) what (is/was) (your/Reference Person's) occupation? ... The 4-digit 2010 Census Occupation Codes with Crosswalk ... was used for this variable.",
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 673,
+          "percent": 7.35,
+          "value_range": "10 - 430",
+          "text": "Management Occupations"
+        },
+        {
+          "count": 332,
+          "percent": 3.63,
+          "value_range": "500 - 950",
+          "text": "Business and Financial Operations Occupations"
+        },
+        {
+          "count": 232,
+          "percent": 2.53,
+          "value_range": "1,000 - 1,240",
+          "text": "Computer and Mathematical Occupations"
+        },
+        {
+          "count": 133,
+          "percent": 1.45,
+          "value_range": "1,300 - 1,560",
+          "text": "Architecture and Engineering Occupations"
+        },
+        {
+          "count": 54,
+          "percent": 0.59,
+          "value_range": "1,600 - 1,965",
+          "text": "Life, Physical, and Social Science Occupations"
+        },
+        {
+          "count": 141,
+          "percent": 1.54,
+          "value_range": "2,000 - 2,060",
+          "text": "Community and Social Services Occupations"
+        },
+        {
+          "count": 62,
+          "percent": 0.68,
+          "value_range": "2,100 - 2,160",
+          "text": "Legal Occupations"
+        },
+        {
+          "count": 270,
+          "percent": 2.95,
+          "value_range": "2,200 - 2,550",
+          "text": "Education, Training, and Library Occupations"
+        },
+        {
+          "count": 148,
+          "percent": 1.62,
+          "value_range": "2,600 - 2,960",
+          "text": "Arts, Design, Entertainment, Sports, and Media Occupations"
+        },
+        {
+          "count": 241,
+          "percent": 2.63,
+          "value_range": "3,000 - 3,540",
+          "text": "Healthcare Practitioners and Technical Occupations"
+        },
+        {
+          "count": 165,
+          "percent": 1.8,
+          "value_range": "3,600 - 3,655",
+          "text": "Healthcare Support Occupations"
+        },
+        {
+          "count": 258,
+          "percent": 2.82,
+          "value_range": "3,700 - 3,955",
+          "text": "Protective Service Occupations"
+        },
+        {
+          "count": 309,
+          "percent": 3.38,
+          "value_range": "4,000 - 4,160",
+          "text": "Food Preparation and Serving Related Occupations"
+        },
+        {
+          "count": 340,
+          "percent": 3.72,
+          "value_range": "4,200 - 4,250",
+          "text": "Building and Grounds Cleaning and Maintenance Occupations"
+        },
+        {
+          "count": 230,
+          "percent": 2.51,
+          "value_range": "4,300 - 4,650",
+          "text": "Personal Care and Service Occupations"
+        },
+        {
+          "count": 512,
+          "percent": 5.59,
+          "value_range": "4,700 - 4,965",
+          "text": "Sales and Related Occupations"
+        },
+        {
+          "count": 756,
+          "percent": 8.26,
+          "value_range": "5,000 - 5,940",
+          "text": "Office and Administrative Support Occupations"
+        },
+        {
+          "count": 70,
+          "percent": 0.76,
+          "value_range": "6,005 - 6,130",
+          "text": "Farming, Fishing, and Forestry Occupations"
+        },
+        {
+          "count": 406,
+          "percent": 4.44,
+          "value_range": "6,200 - 6,940",
+          "text": "Construction and Extraction Occupations"
+        },
+        {
+          "count": 322,
+          "percent": 3.52,
+          "value_range": "7,000 - 7,630",
+          "text": "Installation, Maintenance, and Repair Occupations"
+        },
+        {
+          "count": 497,
+          "percent": 5.43,
+          "value_range": "7,700 - 8,965",
+          "text": "Production Occupations"
+        },
+        {
+          "count": 683,
+          "percent": 7.46,
+          "value_range": "9,000 - 9,750",
+          "text": "Transportation and Material Moving Occupations"
+        },
+        {
+          "count": 60,
+          "percent": 0.66,
+          "value_range": "9,800 - 9,830",
+          "text": "Military Specific Occupations"
+        },
+        {
+          "count": 164,
+          "percent": 1.79,
+          "value_range": "9,999",
+          "text": "DK; NA; refused"
+        },
+        {
+          "count": 2094,
+          "percent": 22.88,
+          "value_range": "0",
+          "text": "Inap.: did not work for money in 2022; has not worked for money since January 1, 2021 (ER82155=5); DK/NA/RF whether worked since Jan 1 2021 (ER82155=8 or 9)"
+        }
+      ]
+    },
+    {
+      "var": "ER82182",
+      "name": "BC21 MAIN IND FOR JOB 1: 2012 CODE (RP)",
+      "label": "BC21 Main Industry for Job 1 (2012 Census Code) - RP",
+      "description": "BC21. What kind of business or industry (is/was) that in?--CURRENT OR MOST RECENT MAIN JOB. The 4-digit 2012 Census Detailed Industry Code ... was used for this variable.",
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 134,
+          "percent": 1.46,
+          "value_range": "170 - 290",
+          "text": "Agriculture, Forestry, Fishing, and Hunting"
+        },
+        {
+          "count": 19,
+          "percent": 0.21,
+          "value_range": "370 - 490",
+          "text": "Mining, Quarrying, and Oil and Gas Extraction"
+        },
+        {
+          "count": 85,
+          "percent": 0.93,
+          "value_range": "570 - 690",
+          "text": "Utilities"
+        },
+        {
+          "count": 524,
+          "percent": 5.73,
+          "value_range": "770",
+          "text": "Construction"
+        },
+        {
+          "count": 867,
+          "percent": 9.47,
+          "value_range": "1,070 - 3,990",
+          "text": "Manufacturing"
+        },
+        {
+          "count": 164,
+          "percent": 1.79,
+          "value_range": "4,070 - 4,590",
+          "text": "Wholesale Trade"
+        },
+        {
+          "count": 616,
+          "percent": 6.73,
+          "value_range": "4,670 - 5,790",
+          "text": "Retail Trade"
+        },
+        {
+          "count": 528,
+          "percent": 5.77,
+          "value_range": "6,070 - 6,390",
+          "text": "Transportation and Warehousing"
+        },
+        {
+          "count": 135,
+          "percent": 1.48,
+          "value_range": "6,470 - 6,780",
+          "text": "Information"
+        },
+        {
+          "count": 294,
+          "percent": 3.21,
+          "value_range": "6,870 - 6,990",
+          "text": "Finance and Insurance"
+        },
+        {
+          "count": 142,
+          "percent": 1.55,
+          "value_range": "7,070 - 7,190",
+          "text": "Real Estate and Rental and Leasing"
+        },
+        {
+          "count": 423,
+          "percent": 4.62,
+          "value_range": "7,270 - 7,490",
+          "text": "Professional, Scientific, and Technical Services"
+        },
+        {
+          "count": 412,
+          "percent": 4.5,
+          "value_range": "7,570 - 7,790",
+          "text": "Management, Administrative and Support, and Waste Management Services"
+        },
+        {
+          "count": 420,
+          "percent": 4.59,
+          "value_range": "7,860 - 7,890",
+          "text": "Educational Services"
+        },
+        {
+          "count": 807,
+          "percent": 8.82,
+          "value_range": "7,970 - 8,470",
+          "text": "Health Care and Social Assistance"
+        },
+        {
+          "count": 114,
+          "percent": 1.25,
+          "value_range": "8,560 - 8,590",
+          "text": "Arts, Entertainment, and Recreation"
+        },
+        {
+          "count": 440,
+          "percent": 4.81,
+          "value_range": "8,660 - 8,690",
+          "text": "Accommodations and Food Services"
+        },
+        {
+          "count": 337,
+          "percent": 3.68,
+          "value_range": "8,770 - 9,290",
+          "text": "Other Services (Except Public Administration)"
+        },
+        {
+          "count": 430,
+          "percent": 4.7,
+          "value_range": "9,370 - 9,870",
+          "text": "Public Administration and Active Duty Military"
+        },
+        {
+          "count": 167,
+          "percent": 1.82,
+          "value_range": "9,999",
+          "text": "DK; NA; refused"
+        },
+        {
+          "count": 2094,
+          "percent": 22.88,
+          "value_range": "0",
+          "text": "Inap.: did not work for money in 2022; has not worked for money since January 1, 2021 (ER82155=5); DK/NA/RF whether worked since Jan 1 2021 (ER82155=8 or 9)"
+        }
+      ]
+    },
+    {
+      "var": "ER82433",
+      "name": "BC60ACKPT WTR CURRENTLY WORKING",
+      "label": "BC60ackpt Whether RP is Currently Working",
+      "description": "BC60ackpt. INTERVIEWER CHECKPOINT: Whether Reference Person is currently working",
+      "distribution": [
+        {
+          "count": 6518,
+          "percent": 71.22,
+          "value_range": "1",
+          "text": "Currently working"
+        },
+        {
+          "count": 2634,
+          "percent": 28.78,
+          "value_range": "5",
+          "text": "No Current Main Job"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "SP_employment_status",
+      "name": "SP EMPLOYMENT STATUS (SIMULATED)",
+      "label": "Whether Spouse/Partner is Currently Working (Simulated)",
+      "description": "Simulation-only field added for the spouse/partner's current employment status. Uses the same coding as ER82433: 1=Currently working, 5=No Current Main Job.",
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 0,
+          "percent": 0.0,
+          "value_range": "1",
+          "text": "Currently working"
+        },
+        {
+          "count": 0,
+          "percent": 0.0,
+          "value_range": "5",
+          "text": "No Current Main Job"
+        }
+      ]
+    },
+    {
+      "var": "ER82800",
+      "name": "F1K HOW OFTEN PRESSED FOR TIME-RP",
+      "label": "F1k How Often Pressed for Time - RP",
+      "description": "F1k. (CURRENTLY WORKING: Outside of work, how/ALL OTHERS: How) often (do you/does [he/she]) feel rushed or pressed for time? Would you say never, rarely, sometimes, often, or almost always?",
+      "distribution": [
+        {
+          "count": 1694,
+          "percent": 18.51,
+          "value_range": "1",
+          "text": "Never"
+        },
+        {
+          "count": 2899,
+          "percent": 31.68,
+          "value_range": "2",
+          "text": "Rarely"
+        },
+        {
+          "count": 2922,
+          "percent": 31.93,
+          "value_range": "3",
+          "text": "Sometimes"
+        },
+        {
+          "count": 991,
+          "percent": 10.83,
+          "value_range": "4",
+          "text": "Often"
+        },
+        {
+          "count": 554,
+          "percent": 6.05,
+          "value_range": "5",
+          "text": "Almost Always or Always"
+        },
+        {
+          "count": 5,
+          "percent": 0.05,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 87,
+          "percent": 0.95,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER82840",
+      "name": "F11 WTR RECEIVED FOOD STAMPS LAST YEAR",
+      "label": "F11 Received Food Stamps Last Year (2022)",
+      "description": "F11. Did you (or anyone else in your family) receive food stamp benefits ... at any time last year, in 2022?",
+      "distribution": [
+        {
+          "count": 1534,
+          "percent": 16.76,
+          "value_range": "1",
+          "text": "Yes"
+        },
+        {
+          "count": 7577,
+          "percent": 82.79,
+          "value_range": "5",
+          "text": "No"
+        },
+        {
+          "count": 1,
+          "percent": 0.01,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 40,
+          "percent": 0.44,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER82856",
+      "name": "F14 WTR RECEIVED FOOD STAMPS LAST MONTH",
+      "label": "F14 Used Food Stamps Last Month",
+      "description": "F14. Did you (or anyone else now living in your family) use food stamp benefits last month?",
+      "distribution": [
+        {
+          "count": 1285,
+          "percent": 14.04,
+          "value_range": "1",
+          "text": "Yes"
+        },
+        {
+          "count": 7836,
+          "percent": 85.62,
+          "value_range": "5",
+          "text": "No"
+        },
+        {
+          "count": 3,
+          "percent": 0.03,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 28,
+          "percent": 0.31,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER82926",
+      "name": "F47 WTR HAVE VEHICLE",
+      "label": "F47 Own/Lease Vehicle",
+      "description": "F47. ... Do you (or anyone else in your family living there) own or lease a car or other vehicle for personal use?",
+      "distribution": [
+        {
+          "count": 6876,
+          "percent": 75.13,
+          "value_range": "1",
+          "text": "Yes"
+        },
+        {
+          "count": 2261,
+          "percent": 24.7,
+          "value_range": "5",
+          "text": "No"
+        },
+        {
+          "count": null,
+          "percent": null,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 15,
+          "percent": 0.16,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER83010",
+      "name": "F82 WTR SCHOOL EXPENSES",
+      "label": "F82 School Expenses in 2022",
+      "description": "F82. In 2022, did you (and your family living there) have any school-related expenses such as: Tuition or tutoring ... ?",
+      "distribution": [
+        {
+          "count": 1267,
+          "percent": 13.84,
+          "value_range": "1",
+          "text": "Yes to any expense item"
+        },
+        {
+          "count": 7840,
+          "percent": 85.66,
+          "value_range": "5",
+          "text": "No"
+        },
+        {
+          "count": 2,
+          "percent": 0.02,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 43,
+          "percent": 0.47,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER83977",
+      "name": "W38B WTR HAS STUDENT LOANS",
+      "label": "W38b Has Student Loans",
+      "description": "W38b. Do you (or anyone in your family living there) currently have any other debts ... ?--STUDENT LOANS",
+      "distribution": [
+        {
+          "count": 2093,
+          "percent": 22.87,
+          "value_range": "1",
+          "text": "Has student loans"
+        },
+        {
+          "count": 6960,
+          "percent": 76.05,
+          "value_range": "5",
+          "text": "Does not have student loans"
+        },
+        {
+          "count": 6,
+          "percent": 0.07,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 93,
+          "percent": 1.02,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER83978",
+      "name": "W38B WTR HAS MEDICAL BILLS",
+      "label": "W38b Has Medical Bills",
+      "description": "W38b. Do you (or anyone in your family living there) currently have any other debts ... ?--MEDICAL BILLS",
+      "distribution": [
+        {
+          "count": 1008,
+          "percent": 11.01,
+          "value_range": "1",
+          "text": "Has medical bills"
+        },
+        {
+          "count": 8045,
+          "percent": 87.9,
+          "value_range": "5",
+          "text": "Does not have medical bills"
+        },
+        {
+          "count": 6,
+          "percent": 0.07,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 93,
+          "percent": 1.02,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER84520",
+      "name": "H1 HEALTH STATUS-RP",
+      "label": "H1 Health Status - RP",
+      "description": "H1. ... Would you say (your/Reference Person's) health in general is excellent, very good, good, fair, or poor?",
+      "distribution": [
+        {
+          "count": 1036,
+          "percent": 11.32,
+          "value_range": "1",
+          "text": "Excellent"
+        },
+        {
+          "count": 2975,
+          "percent": 32.51,
+          "value_range": "2",
+          "text": "Very good"
+        },
+        {
+          "count": 3351,
+          "percent": 36.61,
+          "value_range": "3",
+          "text": "Good"
+        },
+        {
+          "count": 1409,
+          "percent": 15.4,
+          "value_range": "4",
+          "text": "Fair"
+        },
+        {
+          "count": 329,
+          "percent": 3.59,
+          "value_range": "5",
+          "text": "Poor"
+        },
+        {
+          "count": 1,
+          "percent": 0.01,
+          "value_range": "8",
+          "text": "DK"
+        },
+        {
+          "count": 51,
+          "percent": 0.56,
+          "value_range": "9",
+          "text": "NA; refused"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER85079",
+      "name": "SECTION L MODE",
+      "label": "Section L Mode",
+      "description": null,
+      "distribution": [
+        {
+          "count": 3593,
+          "percent": 39.26,
+          "value_range": "1",
+          "text": "Web mode"
+        },
+        {
+          "count": 5559,
+          "percent": 60.74,
+          "value_range": "2",
+          "text": "CATI mode"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER85311",
+      "name": "WTR EMPLOYED IN 2021 (RP)",
+      "label": "Whether RP Employed in 2021 (constructed)",
+      "description": "Constructed variable from the Employment History Calendar (EHC): Whether Reference Person was employed in 2021.",
+      "distribution": [
+        {
+          "count": 6762,
+          "percent": 73.89,
+          "value_range": "1",
+          "text": "Yes"
+        },
+        {
+          "count": 2390,
+          "percent": 26.11,
+          "value_range": "5",
+          "text": "No"
+        },
+        {
+          "count": null,
+          "percent": null,
+          "value_range": "9",
+          "text": "DK; NA; refused"
+        }
+      ],
+      "field_type": "binary"
+    },
+    {
+      "var": "ER85533",
+      "name": "REF PERSN AND SPOUSE TAXABLE INCOME-2022",
+      "label": "RP and Spouse/Partner Total Taxable Income in 2022",
+      "description": "Collected in 2023 about tax year 2022. Can contain negative values (net loss from a business or farm). Includes RP/Spouse income from assets, earnings, and net profit from farm or business (G4-G25d). All missing data are assigned.",
+      "distribution": [
+        {
+          "count": 16,
+          "percent": 0.17,
+          "value_range": "-999,997 - -1",
+          "text": "Actual loss"
+        },
+        {
+          "count": 7871,
+          "percent": 86.0,
+          "value_range": "1 - 9,999,997",
+          "text": "Actual amount"
+        },
+        {
+          "count": 1265,
+          "percent": 13.82,
+          "value_range": "0",
+          "text": "Inap.: no taxable income in 2022"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85629",
+      "name": "TOTAL FAMILY INCOME-2022",
+      "label": "Total 2022 Family Money Income",
+      "description": "Collected in 2023 about tax year 2022. Can contain negative values (net loss). This variable is the sum of 7 income components including taxable/transfer/social security incomes for RP/Spouse/other FU members. All missing data are assigned.",
+      "distribution": [
+        {
+          "count": 8,
+          "percent": 0.09,
+          "value_range": "-999,997 - -1",
+          "text": "Actual loss"
+        },
+        {
+          "count": 8857,
+          "percent": 96.78,
+          "value_range": "1 - 9,999,997",
+          "text": "Actual amount"
+        },
+        {
+          "count": 287,
+          "percent": 3.14,
+          "value_range": "0",
+          "text": "Inap.: no family money income in 2022"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85666",
+      "name": "IMP VAL CREDIT CARD DEBT (W39A) 2023",
+      "label": "Imputed Credit Card/Store Card Debt (2023)",
+      "description": "W39a. If you added up all credit card and store card debts ... amount right now? Imputed version used in 2023 Wealth summary variables. All missing data were assigned.",
+      "distribution": [
+        {
+          "count": 2789,
+          "percent": 30.47,
+          "value_range": "1 - 9,999,997",
+          "text": "Actual amount"
+        },
+        {
+          "count": 6363,
+          "percent": 69.53,
+          "value_range": "0",
+          "text": "Inap.: does not have any credit card or store card debt"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85690",
+      "name": "IMP WEALTH W/O EQUITY (WEALTH1) 2023",
+      "label": "Constructed Wealth Excluding Equity (imputed)",
+      "description": "Constructed wealth variable excluding equity. Sum of eight asset types net of debt values. All missing data were assigned.",
+      "distribution": [
+        {
+          "count": 1872,
+          "percent": 20.45,
+          "value_range": "-99,999,997 - -1",
+          "text": "Actual amount of negative net worth"
+        },
+        {
+          "count": 6305,
+          "percent": 68.89,
+          "value_range": "1 - 999,999,997",
+          "text": "Actual amount of positive net worth"
+        },
+        {
+          "count": 975,
+          "percent": 10.65,
+          "value_range": "0",
+          "text": "Inap.: net value is zero; does not have any assets"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85692",
+      "name": "IMP WEALTH W/ EQUITY (WEALTH2) 2023",
+      "label": "Constructed Wealth Including Equity (imputed)",
+      "description": "Constructed wealth including equity: assets net of debts plus home equity. All missing data were assigned.",
+      "distribution": [
+        {
+          "count": 1269,
+          "percent": 13.87,
+          "value_range": "-99,999,997 - -1",
+          "text": "Actual amount of negative net worth"
+        },
+        {
+          "count": 7087,
+          "percent": 77.44,
+          "value_range": "1 - 999,999,997",
+          "text": "Actual amount of positive net worth"
+        },
+        {
+          "count": 796,
+          "percent": 8.7,
+          "value_range": "0",
+          "text": "Inap.: net value is zero; does not have any assets or home equity"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85701",
+      "name": "HOUSING EXPENDITURE 2023",
+      "label": "Total Family Housing Expenditure (2023, generated)",
+      "description": "Generated variable combining expenditures for mortgage/loan payments, rent, property tax, insurance, utilities, cable TV, telephone, internet, home repairs, furnishings. Missing values are imputed (may be negative due to regression).",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "156.00 - 660,780.00",
+          "text": "Total Family Housing Expenditure"
+        },
+        {
+          "count": null,
+          "percent": null,
+          "value_range": "0.00",
+          "text": "Inap.: FU pays rent or FU neither owns nor rents (ER82032=5 or 8)"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85747",
+      "name": "HEALTH CARE EXPENDITURE 2023",
+      "label": "Total Family Health Care Expenditure (2023, generated)",
+      "description": "Generated variable combining expenditures for hospital/nursing home, doctor, prescription drugs and insurance. Missing values are imputed (may be negative due to regression).",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "-995.34 - 224,098.00",
+          "text": "Total Family Health Care Expenditure"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85768",
+      "name": "TOTAL EXPENDITURE",
+      "label": "Total Expenditure (generated)",
+      "description": "Generated variable combining all expenditures, excluding rent value ER85704. Includes food, medical, insurance, housing, transport, education, childcare, clothing, trips, recreation, computing, etc. Missing values are imputed (may be negative due to regression).",
+      "distribution": [
+        {
+          "count": 9152,
+          "percent": 100.0,
+          "value_range": "0.00 - 918,408.15",
+          "text": "Total Expenditure"
+        }
+      ],
+      "field_type": "continuous"
+    },
+    {
+      "var": "ER85780",
+      "name": "COMPLETED ED-RP",
+      "label": "Reference Person Completed Education Level",
+      "description": "Values 1-16 are actual grade completed; computed using rules based on college attendance and GED/high school status. Education asked when FU acquires new RP/SP; carried forward/updated across waves. DK/NA represented as 99.",
+      "distribution": [
+        {
+          "count": 22,
+          "percent": 0.24,
+          "value_range": "0",
+          "text": "Completed no grades of school"
+        },
+        {
+          "count": 9038,
+          "percent": 98.75,
+          "value_range": "1 - 17",
+          "text": "Actual number"
+        },
+        {
+          "count": 92,
+          "percent": 1.01,
+          "value_range": "99",
+          "text": "DK; NA"
+        }
+      ],
+      "field_type": "categorical"
+    },
+    {
+      "var": "ER82500",
+      "name": "DE20 MAIN OCC FOR JOB 1: 2010 CODE (SP)",
+      "label": "DE20 Main Occupation for Job 1 (2010 Census Code) - SP",
+      "description": "DE20. In (your/his/her) work for (EMPNAME) (BEGMO/BEGYR)-(ENDMO/ENDYR) what (is/was) (your/Spouse's/Partner's) occupation (when [you/he/she] left that employer)? What sort of work (do/does/did) (you/he/she) do? What (are/were) (your/his/her) most important activities or duties?--CURRENT OR MOST RECENT MAIN JOB. The 4-digit 2010 Census Occupation Codes with Crosswalk issued by the U.S. Department of Commerce and the Bureau of the Census was used for this variable.",
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 311,
+          "percent": 3.4,
+          "value_range": "10 - 430",
+          "text": "Management Occupations"
+        },
+        {
+          "count": 198,
+          "percent": 2.16,
+          "value_range": "500 - 950",
+          "text": "Business and Financial Operations Occupations"
+        },
+        {
+          "count": 56,
+          "percent": 0.61,
+          "value_range": "1,000 - 1,240",
+          "text": "Computer and Mathematical Occupations"
+        },
+        {
+          "count": 15,
+          "percent": 0.16,
+          "value_range": "1,300 - 1,560",
+          "text": "Architecture and Engineering Occupations"
+        },
+        {
+          "count": 33,
+          "percent": 0.36,
+          "value_range": "1,600 - 1,965",
+          "text": "Life, Physical, and Social Science Occupations"
+        },
+        {
+          "count": 103,
+          "percent": 1.13,
+          "value_range": "2,000 - 2,060",
+          "text": "Community and Social Services Occupations"
+        },
+        {
+          "count": 45,
+          "percent": 0.49,
+          "value_range": "2,100 - 2,160",
+          "text": "Legal Occupations"
+        },
+        {
+          "count": 323,
+          "percent": 3.53,
+          "value_range": "2,200 - 2,550",
+          "text": "Education, Training, and Library Occupations"
+        },
+        {
+          "count": 86,
+          "percent": 0.94,
+          "value_range": "2,600 - 2,960",
+          "text": "Arts, Design, Entertainment, Sports, and Media Occupations"
+        },
+        {
+          "count": 314,
+          "percent": 3.43,
+          "value_range": "3,000 - 3,540",
+          "text": "Healthcare Practitioners and Technical Occupations"
+        },
+        {
+          "count": 149,
+          "percent": 1.63,
+          "value_range": "3,600 - 3,655",
+          "text": "Healthcare Support Occupations"
+        },
+        {
+          "count": 36,
+          "percent": 0.39,
+          "value_range": "3,700 - 3,955",
+          "text": "Protective Service Occupations"
+        },
+        {
+          "count": 142,
+          "percent": 1.55,
+          "value_range": "4,000 - 4,160",
+          "text": "Food Preparation and Serving Related Occupations"
+        },
+        {
+          "count": 75,
+          "percent": 0.82,
+          "value_range": "4,200 - 4,250",
+          "text": "Building and Grounds Cleaning and Maintenance Occupations"
+        },
+        {
+          "count": 185,
+          "percent": 2.02,
+          "value_range": "4,300 - 4,650",
+          "text": "Personal Care and Service Occupations"
+        },
+        {
+          "count": 256,
+          "percent": 2.8,
+          "value_range": "4,700 - 4,965",
+          "text": "Sales and Related Occupations"
+        },
+        {
+          "count": 571,
+          "percent": 6.24,
+          "value_range": "5,000 - 5,940",
+          "text": "Office and Administrative Support Occupations"
+        },
+        {
+          "count": 12,
+          "percent": 0.13,
+          "value_range": "6,005 - 6,130",
+          "text": "Farming, Fishing, and Forestry Occupations"
+        },
+        {
+          "count": 6,
+          "percent": 0.07,
+          "value_range": "6,200 - 6,940",
+          "text": "Construction and Extraction Occupations"
+        },
+        {
+          "count": 8,
+          "percent": 0.09,
+          "value_range": "7,000 - 7,630",
+          "text": "Installation, Maintenance, and Repair Occupations"
+        },
+        {
+          "count": 110,
+          "percent": 1.2,
+          "value_range": "7,700 - 8,965",
+          "text": "Production Occupations"
+        },
+        {
+          "count": 62,
+          "percent": 0.68,
+          "value_range": "9,000 - 9,750",
+          "text": "Transportation and Material Moving Occupations"
+        },
+        {
+          "count": 6,
+          "percent": 0.07,
+          "value_range": "9,800 - 9,830",
+          "text": "Military Specific Occupations"
+        },
+        {
+          "count": 96,
+          "percent": 1.05,
+          "value_range": "9,999",
+          "text": "DK; NA; refused"
+        },
+        {
+          "count": 5954,
+          "percent": 65.06,
+          "value_range": "0",
+          "text": "Inap.: did not work for money in 2022; has not worked for money since January 1, 2021 (ER82155=5); DK, NA, or RF whether worked for money since January 1, 2021 (ER82155=8 or 9); no Spouse/Partner in FU (ER83493=5)"
+        }
+      ]
+    },
+    {
+      "var": "ER82501",
+      "name": "DE21 MAIN IND FOR JOB 1: 2012 CODE (SP)",
+      "label": "DE21 Main Industry for Job 1 (2012 Census Code) - SP",
+      "description": "DE21. What kind of business or industry (is/was) that in?--CURRENT OR MOST RECENT MAIN JOB. The 4-digit 2012 Census Detailed Industry Code issued by the U.S. Department of Commerce and the Bureau of the Census was used for this variable.",
+      "field_type": "categorical",
+      "distribution": [
+        {
+          "count": 28,
+          "percent": 0.31,
+          "value_range": "170 - 290",
+          "text": "Agriculture, Forestry, Fishing, and Hunting"
+        },
+        {
+          "count": 4,
+          "percent": 0.04,
+          "value_range": "370 - 490",
+          "text": "Mining, Quarrying, and Oil and Gas Extraction"
+        },
+        {
+          "count": 23,
+          "percent": 0.25,
+          "value_range": "570 - 690",
+          "text": "Utilities"
+        },
+        {
+          "count": 39,
+          "percent": 0.43,
+          "value_range": "770",
+          "text": "Construction"
+        },
+        {
+          "count": 214,
+          "percent": 2.34,
+          "value_range": "1,070 - 3,990",
+          "text": "Manufacturing"
+        },
+        {
+          "count": 39,
+          "percent": 0.43,
+          "value_range": "4,070 - 4,590",
+          "text": "Wholesale Trade"
+        },
+        {
+          "count": 252,
+          "percent": 2.75,
+          "value_range": "4,670 - 5,790",
+          "text": "Retail Trade"
+        },
+        {
+          "count": 83,
+          "percent": 0.91,
+          "value_range": "6,070 - 6,390",
+          "text": "Transportation and Warehousing"
+        },
+        {
+          "count": 49,
+          "percent": 0.54,
+          "value_range": "6,470 - 6,780",
+          "text": "Information"
+        },
+        {
+          "count": 186,
+          "percent": 2.03,
+          "value_range": "6,870 - 6,990",
+          "text": "Finance and Insurance"
+        },
+        {
+          "count": 54,
+          "percent": 0.59,
+          "value_range": "7,070 - 7,190",
+          "text": "Real Estate and Rental and Leasing"
+        },
+        {
+          "count": 219,
+          "percent": 2.39,
+          "value_range": "7,270 - 7,490",
+          "text": "Professional, Scientific, and Technical Services"
+        },
+        {
+          "count": 106,
+          "percent": 1.16,
+          "value_range": "7,570 - 7,790",
+          "text": "Management, Administrative and Support, and Waste Management Services"
+        },
+        {
+          "count": 464,
+          "percent": 5.07,
+          "value_range": "7,860 - 7,890",
+          "text": "Educational Services"
+        },
+        {
+          "count": 805,
+          "percent": 8.8,
+          "value_range": "7,970 - 8,470",
+          "text": "Health Care and Social Assistance"
+        },
+        {
+          "count": 52,
+          "percent": 0.57,
+          "value_range": "8,560 - 8,590",
+          "text": "Arts, Entertainment, and Recreation"
+        },
+        {
+          "count": 176,
+          "percent": 1.92,
+          "value_range": "8,660 - 8,690",
+          "text": "Accommodations and Food Services"
+        },
+        {
+          "count": 176,
+          "percent": 1.92,
+          "value_range": "8,770 - 9,290",
+          "text": "Other Services (Except Public Administration)"
+        },
+        {
+          "count": 161,
+          "percent": 1.76,
+          "value_range": "9,370 - 9,870",
+          "text": "Public Administration and Active Duty Military"
+        },
+        {
+          "count": 68,
+          "percent": 0.74,
+          "value_range": "9,999",
+          "text": "DK; NA; refused"
+        },
+        {
+          "count": 5954,
+          "percent": 65.06,
+          "value_range": "0",
+          "text": "Inap.: did not work for money in 2022; has not worked for money since January 1, 2021 (ER82155=5); DK, NA, or RF whether worked for money since January 1, 2021 (ER82155=8 or 9); no Spouse/Partner in FU (ER83493=5)"
+        }
+      ]
+    }
+  ]
+}

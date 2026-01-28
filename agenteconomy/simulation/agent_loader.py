@@ -1,8 +1,13 @@
+import csv
+import json
+import os
+from pathlib import Path
 from uuid import uuid4
-from typing import List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from agenteconomy.data.industry_cate_map import industry_cate_map
 from agenteconomy.agent.firm import ManufactureFirm, RetailFirm, ServiceFirm, Firm
+from agenteconomy.agent.household import Household
 
 if TYPE_CHECKING:
     from agenteconomy.center.Ecocenter import EconomicCenter
@@ -10,8 +15,160 @@ if TYPE_CHECKING:
     from agenteconomy.center.ProductMarket import ProductMarket
     from agenteconomy.market.AbstractResourceMarket import AbstractResourceMarket
 
-def create_households():
-    pass
+def create_households(
+    *,
+    data_dir: Optional[str] = None,
+    persona_mapping_csv: str = "J357328_merged_household_persona_mapping.csv",
+    codebook_json: str = "codebook.json",
+    personas_json: str = "personas_final.json",
+    census2010_to_soc2010_csv: str = "census2010_to_soc2010_exploded.csv",
+    household_id_prefix: str = "household_",
+    limit: Optional[int] = None,
+    household_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[Household]:
+    households = load_all_households(
+        data_dir=data_dir,
+        persona_mapping_csv=persona_mapping_csv,
+        codebook_json=codebook_json,
+        personas_json=personas_json,
+        census2010_to_soc2010_csv=census2010_to_soc2010_csv,
+        household_id_prefix=household_id_prefix,
+        limit=limit,
+        household_kwargs=household_kwargs,
+    )
+    return list(households.values())
+
+
+def load_household_rows(csv_path: str) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    """
+    Load persona-mapped household CSV.
+    Returns:
+      - by_household_idx: household_idx(int) -> row(dict[str, str])
+      - by_fid: fid(int) -> row(dict[str, str])
+    """
+    by_idx: Dict[int, Dict[str, Any]] = {}
+    by_fid: Dict[int, Dict[str, Any]] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            hh_idx_raw = row.get("household_idx")
+            fid_raw = row.get("fid")
+            if hh_idx_raw is not None and str(hh_idx_raw).strip() != "":
+                by_idx[int(float(hh_idx_raw))] = row
+            if fid_raw is not None and str(fid_raw).strip() != "":
+                by_fid[int(float(fid_raw))] = row
+    return by_idx, by_fid
+
+
+def load_codebook_by_var(codebook_json_path: str) -> Dict[str, Dict[str, Any]]:
+    raw = json.loads(Path(codebook_json_path).read_text(encoding="utf-8"))
+    by_var: Dict[str, Dict[str, Any]] = {}
+    for v in (raw or {}).get("variables", []) or []:
+        var = v.get("var")
+        if var:
+            by_var[str(var)] = v
+    return by_var
+
+
+def load_personas_by_name(personas_json_path: str) -> Dict[str, Dict[str, Any]]:
+    raw = json.loads(Path(personas_json_path).read_text(encoding="utf-8"))
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for rec in raw or []:
+        name = rec.get("persona_name")
+        if name:
+            by_name[str(name)] = rec
+    return by_name
+
+
+def load_census2010_to_soc2010(mapping_csv_path: str) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    Load mapping from 2010 Census occupation code (4-digit string) -> list[(SOC2010, occupation_title)].
+    """
+    m: Dict[str, List[Tuple[str, str]]] = {}
+    with open(mapping_csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            census_code = str(row.get("census_code") or "").strip()
+            soc = str(row.get("soc2010_code") or "").strip()
+            title = str(row.get("occupation_title") or "").strip()
+            if not census_code or not soc:
+                continue
+            m.setdefault(census_code, []).append((soc, title))
+    return m
+
+
+def build_preloaded_bundle(
+    *,
+    data_dir: str,
+    persona_mapping_csv: str,
+    codebook_json: str,
+    personas_json: str,
+    census2010_to_soc2010_csv: str,
+) -> Dict[str, Any]:
+    """
+    Read all required files once and return a dict bundle that can be passed into Household(preloaded_data=...).
+    """
+    d = Path(data_dir)
+    rows_by_idx, rows_by_fid = load_household_rows(str(d / persona_mapping_csv))
+    return {
+        "household_row_by_household_idx": rows_by_idx,
+        "household_row_by_fid": rows_by_fid,
+        "codebook_by_var": load_codebook_by_var(str(d / codebook_json)),
+        "persona_by_name": load_personas_by_name(str(d / personas_json)),
+        "census2010_to_soc2010": load_census2010_to_soc2010(str(d / census2010_to_soc2010_csv)),
+    }
+
+
+def load_all_households(
+    *,
+    data_dir: Optional[str] = None,
+    persona_mapping_csv: str = "J357328_merged_household_persona_mapping.csv",
+    codebook_json: str = "codebook.json",
+    personas_json: str = "personas_final.json",
+    census2010_to_soc2010_csv: str = "census2010_to_soc2010_exploded.csv",
+    household_id_prefix: str = "household_",
+    limit: Optional[int] = None,
+    household_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Household]:
+    """
+    Bulk loader:
+    - reads files once (outside Household)
+    - iterates all households
+    - instantiates one Household per row
+
+    Returns: household_id -> Household instance
+    """
+    base_dir = data_dir or os.getenv(
+        "AGENTECO_DATA_DIR",
+        str(Path(__file__).resolve().parents[1] / "data" / "household"),
+    )
+    bundle = build_preloaded_bundle(
+        data_dir=base_dir,
+        persona_mapping_csv=persona_mapping_csv,
+        codebook_json=codebook_json,
+        personas_json=personas_json,
+        census2010_to_soc2010_csv=census2010_to_soc2010_csv,
+    )
+    by_idx = bundle["household_row_by_household_idx"]
+    out: Dict[str, Household] = {}
+    kwargs = dict(household_kwargs or {})
+    n = 0
+    for hh_idx in sorted(by_idx.keys()):
+        hid = f"{household_id_prefix}{hh_idx}"
+        out[hid] = Household(
+            household_id=hid,
+            name=hid,
+            description="",
+            owner="",
+            data_dir=base_dir,
+            load_profile=True,
+            preloaded_data=bundle,
+            **kwargs,
+        )
+        n += 1
+        if limit is not None and n >= int(limit):
+            break
+    return out
 
 def create_firms(
     economic_center: Optional['EconomicCenter'] = None,

@@ -183,6 +183,7 @@ class SimulationInitializer:
         self.context.labor_market = LaborMarket.remote(
             economic_center=self.context.economic_center
         )
+        ray.get(self.context.economic_center.set_labor_market.remote(self.context.labor_market))
         logger.info("  ✓ LaborMarket initialized")
         
         # AbstractResourceMarket - will be set up after government

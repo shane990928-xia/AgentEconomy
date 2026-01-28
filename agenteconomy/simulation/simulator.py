@@ -15,6 +15,7 @@ from agenteconomy.simulation.agent_loader import create_firms, create_households
 from agenteconomy.market.AbstractResourceMarket import AbstractResourceMarket
 from datetime import datetime
 import asyncio
+import ray
 
 class Simulator:
     def __init__(self, config:SimulationConfig):
@@ -59,6 +60,7 @@ class Simulator:
             self.product_market = ProductMarket.remote()
             # LaborMarket needs economic_center for wage transfers
             self.labor_market = LaborMarket.remote(economic_center=self.economic_center)
+            ray.get(self.economic_center.set_labor_market.remote(self.labor_market))
             
             self.government = Government(
                     government_id="gov_main_simulation",
@@ -104,7 +106,7 @@ class Simulator:
 
     def _create_households(self):
         """Create households"""
-        self.households = [Household(household_id=f"household_{i}", name=f"Household {i}", description=f"Household {i} description", owner=f"owner_{i}") for i in range(self.config.num_households)]
+        self.households = create_households(limit=self.config.num_households)
 
     def _create_firms(self):
         """Create firms"""
