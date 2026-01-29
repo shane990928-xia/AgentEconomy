@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import os
@@ -9,6 +10,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
+import ray
+
 from agenteconomy.center.Model import Job, JobApplication, LaborHour, Product
 from agenteconomy.llm.llm import call_llm
 from agenteconomy.llm.prompt_template import (
@@ -17,6 +20,7 @@ from agenteconomy.llm.prompt_template import (
     PURCHASE_BY_CATEGORY_PROMPT,
     JOB_APPLICATION_DECISION_PROMPT,
     JOB_OFFER_DECISION_PROMPT,
+    PERSONA_UPDATE_PROMPT,
 )
 
 
@@ -122,6 +126,60 @@ class Household:
     # Also: ER82181 (RP) / ER82500 (SP) are 2010 Census occupation codes; we will map them via
     # census2010_to_soc2010_exploded.csv instead of using codebook big categories.
     NO_DECODE_FIELDS: set[str] = {"ER82017", "ER85780", "ER82181", "ER82500"}
+
+    MONTHLY_FLOW_FIELDS: set[str] = {"ER85629", "ER85701", "ER85747", "ER85768"}
+
+    MONTHLY_RESET_FIELDS: Tuple[str, ...] = (
+        "ER85629",
+        "RP_income",
+        "SP_income",
+        "ER85768",
+        "ER85701",
+        "ER85747",
+        "expenditure_retail_merchandise",
+        "expenditure_insurance",
+        "expenditure_utilities",
+        "expenditure_transportation",
+    )
+
+    SIMULATION_STATE_FIELDS: set[str] = {
+        "RP_income",
+        "SP_income",
+        "expenditure_retail_merchandise",
+        "expenditure_insurance",
+        "expenditure_utilities",
+        "expenditure_transportation",
+    }
+
+    PERSONA_PROMPT_FIELDS: Tuple[str, ...] = (
+        "persona_name",
+        "core_characteristics",
+        "behavior_patterns",
+    )
+
+    PAST_STATUS_LABEL_OVERRIDES: Dict[str, str] = {
+        "ER82017": "Household size (number of people)",
+        "ER82027": "Life satisfaction",
+        "ER84520": "General health status (reference person)",
+        "ER82800": "Time pressure frequency (reference person)",
+        "ER85629": "Monthly household income",
+        "ER85666": "Credit card / store card debt",
+        "ER85692": "Net wealth (including home equity)",
+        "ER85701": "Monthly housing expenditure",
+        "ER85747": "Monthly health care expenditure",
+        "ER85768": "Monthly total expenditure",
+        "ER85780": "Education level completed (reference person)",
+        "ER82181": "Occupation (reference person, main job)",
+        "ER82500": "Occupation (spouse/partner, main job)",
+        "ER82433": "Currently working (reference person)",
+        "SP_employment_status": "Currently working (spouse/partner)",
+        "RP_income": "Monthly income (reference person)",
+        "SP_income": "Monthly income (spouse/partner)",
+        "expenditure_retail_merchandise": "Monthly retail merchandise expenditure",
+        "expenditure_insurance": "Monthly insurance expenditure",
+        "expenditure_utilities": "Monthly utilities expenditure",
+        "expenditure_transportation": "Monthly transportation expenditure",
+    }
 
     # Employment status codes (PSID-style; keep numeric codes as requested)
     _EMPLOYED_CODE: int = 1
@@ -372,12 +430,16 @@ class Household:
         """
         # Occupation special-case: prefer fine-grained occupation_title, not codebook big category.
         if field_name == "ER82181":
+            if self.csv_values.get("ER82433") == self._NOT_EMPLOYED_CODE:
+                return "Not working"
             title = getattr(self, "ER82181_occupation_title", None)
             soc = getattr(self, "ER82181", None)
             if title:
                 return str(title)
             return str(soc)
         if field_name == "ER82500":
+            if self.csv_values.get("SP_employment_status") == self._NOT_EMPLOYED_CODE:
+                return "Not working"
             title = getattr(self, "ER82500_occupation_title", None)
             soc = getattr(self, "ER82500", None)
             if title:
@@ -386,6 +448,17 @@ class Household:
         v = self.csv_values.get(field_name, getattr(self, field_name, None))
         decoded = self.decode_field_value(field_name, v)
         return decoded if decoded else str(v)
+
+    def get_persona_prompt_view(self) -> Dict[str, Any]:
+        """
+        Prompt-facing persona view: only keep selected fields to reduce noise.
+        """
+        p = self.persona if isinstance(self.persona, dict) else {}
+        out: Dict[str, Any] = {k: p.get(k) for k in self.PERSONA_PROMPT_FIELDS if k in p}
+        if "persona_name" not in out:
+            pname = self.csv_values.get("persona_name_current") or self.csv_values.get("persona_name")
+            out["persona_name"] = pname
+        return out
 
     @classmethod
     def _parse_csv_value(cls, field_name: str, raw_value: Any) -> Any:
@@ -453,6 +526,19 @@ class Household:
             decoded = self.decode_field_value(str(k), parsed)
             if decoded:
                 self.csv_decoded[str(k)] = decoded
+
+        # Convert annual flow variables to monthly values (/12) for monthly simulation prompts.
+        for field in self.MONTHLY_FLOW_FIELDS:
+            v = self.csv_values.get(field)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            mv = fv / 12.0
+            self.csv_values[field] = mv
+            setattr(self, field, mv)
 
     def _normalize_household_lookup_keys(self) -> List[int]:
         """
@@ -567,6 +653,10 @@ class Household:
             self.csv_values["SP_employment_status"] = self._NOT_EMPLOYED_CODE
             self.csv_raw["SP_employment_status"] = str(self._NOT_EMPLOYED_CODE)
 
+            for k in self.SIMULATION_STATE_FIELDS:
+                setattr(self, k, None)
+                self.csv_values[k] = None
+
         # Build "past household status" (both structured and text)
         self.past_household_status = self._build_past_household_status()
         self.past_household_status_text = self.past_household_status.get("summary_text") or ""
@@ -587,30 +677,38 @@ class Household:
         Construct an extensible, human-readable view of the household's recent situation.
         In prompts, we describe this as: "Recent household situation: ...".
         """
-        row = self.profile_row or {}
+        row = self.csv_values or {}
         if not row:
             return {"summary_text": "Recent household situation: no historical profile data (no match in persona mapping CSV)."}
 
-        # For extensibility: keep *all* CSV fields in structured form
         all_fields: Dict[str, Dict[str, Any]] = {}
         for k, raw_v in (row or {}).items():
             label = None
-            if self._CODEBOOK_BY_VAR and k in self._CODEBOOK_BY_VAR:
+            if str(k) in self.PAST_STATUS_LABEL_OVERRIDES:
+                label = self.PAST_STATUS_LABEL_OVERRIDES[str(k)]
+            elif self._CODEBOOK_BY_VAR and k in self._CODEBOOK_BY_VAR:
                 label = self._CODEBOOK_BY_VAR[k].get("label") or self._CODEBOOK_BY_VAR[k].get("name")
-            # Decode based on stored parsed code (not raw string), to keep behavior consistent after updates
             decoded = self.decode_field_value(k, self.csv_values.get(str(k))) if str(k).startswith("ER") else None
             all_fields[str(k)] = {
-                "raw": raw_v,
+                "raw": self.csv_raw.get(str(k)) if hasattr(self, "csv_raw") else raw_v,
                 "value": self.csv_values.get(str(k)),
                 "decoded": decoded,
                 "label": label,
             }
 
-        # A small, high-signal subset for text summary (prompt-friendly)
+        for k in sorted(self.SIMULATION_STATE_FIELDS):
+            label = self.PAST_STATUS_LABEL_OVERRIDES.get(k)
+            v = self.csv_values.get(k)
+            all_fields[k] = {
+                "raw": None,
+                "value": v,
+                "decoded": None,
+                "label": label,
+            }
+
         focus_vars = [
             "ER82017",
             "ER82027",
-            "ER82150",
             "ER84520",
             "ER82800",
             "ER85629",
@@ -620,23 +718,27 @@ class Household:
             "ER85747",
             "ER85768",
             "ER85780",
-            "ER82181",  # RP occupation code
-            "ER82500",  # SP occupation code
+            "ER82181",
+            "ER82500",
+            "RP_income",
+            "SP_income",
+            "expenditure_retail_merchandise",
+            "expenditure_insurance",
+            "expenditure_utilities",
+            "expenditure_transportation",
         ]
 
         facts: List[Dict[str, Any]] = []
         lines: List[str] = []
         for var in focus_vars:
-            raw_val = row.get(var)
-            if raw_val is None or str(raw_val).strip() == "":
-                continue
+            raw_val = row.get(var) if var in row else None
             label = None
-            if self._CODEBOOK_BY_VAR and var in self._CODEBOOK_BY_VAR:
+            if var in self.PAST_STATUS_LABEL_OVERRIDES:
+                label = self.PAST_STATUS_LABEL_OVERRIDES[var]
+            elif self._CODEBOOK_BY_VAR and var in self._CODEBOOK_BY_VAR:
                 label = self._CODEBOOK_BY_VAR[var].get("label") or self._CODEBOOK_BY_VAR[var].get("name")
-            # Prompt-facing value should be category text when possible
             stored_v = self.csv_values.get(var)
             if var == "ER82181":
-                # Show fine-grained occupation title rather than big category
                 value_view = self.get_field_text("ER82181")
                 decoded = value_view
             elif var == "ER82500":
@@ -645,23 +747,31 @@ class Household:
             else:
                 decoded = self.decode_field_value(var, stored_v)
                 value_view = decoded if decoded else stored_v
+            if var not in self.SIMULATION_STATE_FIELDS:
+                if raw_val is None or str(raw_val).strip() == "":
+                    continue
+            if value_view is None:
+                value_view = "unknown"
             facts.append({"var": var, "label": label, "raw": raw_val, "value": stored_v, "decoded": decoded})
-            if label:
-                lines.append(f"- {label} ({var}): {value_view}")
-            else:
-                lines.append(f"- {var}: {value_view}")
+            display_label = label or var
+            lines.append(f"- {display_label}: {value_view}")
 
         persona_name = row.get("persona_name_current") or row.get("persona_name")
         persona_core = None
         if self.persona:
             persona_core = self.persona.get("core_characteristics")
 
-        # Explicit derived keys that downstream logic may use (not duplicated in the English lines below)
         total_assets = self.csv_values.get("ER85692")
-        head_occ = self.csv_values.get("ER82181")  # SOC code after mapping
-        spouse_occ = self.csv_values.get("ER82500")  # SOC code after mapping
+        head_occ = self.csv_values.get("ER82181")
+        spouse_occ = self.csv_values.get("ER82500")
         rp_employment_status = self.csv_values.get("ER82433")
         sp_employment_status = self.csv_values.get("SP_employment_status")
+        rp_income = self.csv_values.get("RP_income")
+        sp_income = self.csv_values.get("SP_income")
+        exp_retail = self.csv_values.get("expenditure_retail_merchandise")
+        exp_ins = self.csv_values.get("expenditure_insurance")
+        exp_util = self.csv_values.get("expenditure_utilities")
+        exp_trans = self.csv_values.get("expenditure_transportation")
 
         summary = "Recent household situation:\n"
         if persona_name:
@@ -678,6 +788,12 @@ class Household:
                 "spouse_occupation_code": spouse_occ,
                 "rp_employment_status": rp_employment_status,
                 "sp_employment_status": sp_employment_status,
+                "rp_income": rp_income,
+                "sp_income": sp_income,
+                "expenditure_retail_merchandise": exp_retail,
+                "expenditure_insurance": exp_ins,
+                "expenditure_utilities": exp_util,
+                "expenditure_transportation": exp_trans,
             },
             "all_fields": all_fields,
             "facts": facts,
@@ -687,6 +803,13 @@ class Household:
     # -------------------------------------------------------------------------
     # Public state update APIs (requested)
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _as_float(v: Any) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
 
     def get_rp_soc_occupation_code(self) -> Optional[str]:
         """
@@ -730,6 +853,73 @@ class Household:
         self.past_household_status_text = self.past_household_status.get("summary_text") or ""
         self.household_info["past_household_status"] = self.past_household_status
         return new_v
+
+    def update_rp_income(self, wage: float) -> float:
+        """
+        Record RP wage payment for this month.
+        """
+        w = float(wage or 0.0)
+        new_rp = w
+        setattr(self, "RP_income", new_rp)
+        self.csv_values["RP_income"] = new_rp
+
+        self.csv_values["ER85629"] = self._as_float(self.csv_values.get("ER85629")) + w
+        setattr(self, "ER85629", self.csv_values["ER85629"])
+
+        self.csv_values["ER85692"] = self._as_float(self.csv_values.get("ER85692")) + w
+        setattr(self, "ER85692", self.csv_values["ER85692"])
+        return new_rp
+
+    def update_sp_income(self, wage: float) -> float:
+        """
+        Record SP wage payment for this month.
+        """
+        w = float(wage or 0.0)
+        new_sp = w
+        setattr(self, "SP_income", new_sp)
+        self.csv_values["SP_income"] = new_sp
+
+        self.csv_values["ER85629"] = self._as_float(self.csv_values.get("ER85629")) + w
+        setattr(self, "ER85629", self.csv_values["ER85629"])
+
+        self.csv_values["ER85692"] = self._as_float(self.csv_values.get("ER85692")) + w
+        setattr(self, "ER85692", self.csv_values["ER85692"])
+        return new_sp
+
+    def apply_consumption(self, spending_by_bucket: Dict[str, float]) -> Dict[str, float]:
+        """
+        Set monthly consumption spending by bucket (absolute totals) and propagate to totals.
+        """
+        total_spend = 0.0
+        updated: Dict[str, float] = {}
+
+        bucket_to_field: Dict[str, str] = {
+            "Retail merchandise": "expenditure_retail_merchandise",
+            "insurance": "expenditure_insurance",
+            "utilities": "expenditure_utilities",
+            "transportation": "expenditure_transportation",
+            "housing": "ER85701",
+            "healthcare": "ER85747",
+        }
+
+        for bucket, new_total in (spending_by_bucket or {}).items():
+            if bucket not in bucket_to_field:
+                continue
+            field = bucket_to_field[bucket]
+            new_v = float(new_total or 0.0)
+            self.csv_values[field] = new_v
+            setattr(self, field, new_v)
+            updated[field] = new_v
+            total_spend += new_v
+
+        self.csv_values["ER85768"] = float(total_spend)
+        setattr(self, "ER85768", self.csv_values["ER85768"])
+        updated["ER85768"] = self.csv_values["ER85768"]
+
+        self.csv_values["ER85692"] = self._as_float(self.csv_values.get("ER85692")) - total_spend
+        setattr(self, "ER85692", self.csv_values["ER85692"])
+        updated["ER85692"] = self.csv_values["ER85692"]
+        return updated
 
     def update_head_occupation(self, new_occupation_code: str) -> None:
         """
@@ -781,6 +971,61 @@ class Household:
         self.past_household_status = self._build_past_household_status()
         self.past_household_status_text = self.past_household_status.get("summary_text") or ""
         self.household_info["past_household_status"] = self.past_household_status
+
+    @staticmethod
+    def _deep_merge_dict(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Deep-merge a JSON patch dict into base dict. Nested dicts are merged recursively.
+        """
+        out = dict(base or {})
+        for k, v in (patch or {}).items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = Household._deep_merge_dict(out.get(k) or {}, v)
+            else:
+                out[k] = v
+        return out
+
+    async def refresh_past_household_status_text_and_persona(self) -> Dict[str, Any]:
+        """
+        Rebuild past_household_status_text from the CURRENT internal variables, then ask the LLM
+        whether the persona should be updated given the changes.
+        """
+        old_status_text = str(self.past_household_status_text or "")
+        persona_before = copy.deepcopy(self.persona) if isinstance(self.persona, dict) else None
+
+        self.past_household_status_text = (self._build_past_household_status() or {}).get("summary_text") or ""
+
+        prompt = PERSONA_UPDATE_PROMPT.format(
+            persona_before=json.dumps(self.get_persona_prompt_view() if persona_before else {}, ensure_ascii=False),
+            past_household_status_text_before=old_status_text,
+            past_household_status_text_after=self.past_household_status_text,
+        )
+        raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
+        parsed = self._json_loads_loose(raw) or {}
+        persona_patch = parsed.get("persona_patch") or {}
+
+        if isinstance(persona_before, dict):
+            self.persona = self._deep_merge_dict(persona_before, persona_patch if isinstance(persona_patch, dict) else {})
+        else:
+            self.persona = persona_patch if isinstance(persona_patch, dict) and persona_patch else self.persona
+
+        if "persona" not in self.household_info:
+            self.household_info["persona"] = {"persona_name": None, "persona_id": None, "persona_record": None}
+        self.household_info["persona"]["persona_record"] = self.persona
+        if isinstance(persona_patch, dict) and "persona_name" in persona_patch:
+            self.household_info["persona"]["persona_name"] = persona_patch.get("persona_name")
+
+        result = {
+            "persona_patch": persona_patch if isinstance(persona_patch, dict) else {},
+            "note": str(parsed.get("note") or ""),
+            "raw_llm_output": raw,
+        }
+
+        for k in self.MONTHLY_RESET_FIELDS:
+            self.csv_values[k] = 0.0
+            setattr(self, k, 0.0)
+
+        return result
 
     # -------------------------------------------------------------------------
     # Dependency wiring
@@ -895,7 +1140,7 @@ class Household:
         cats = categories or self.consumption_categories
 
         prompt = CONSUMPTION_NEEDS_BY_CATEGORY_PROMPT.format(
-            household_info=json.dumps(self.household_info, ensure_ascii=False),
+            persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
             total_budget=json.dumps(float(total_budget), ensure_ascii=False),
             categories=json.dumps(list(cats), ensure_ascii=False),
@@ -951,7 +1196,7 @@ class Household:
         Allocate major budget buckets. Retail merchandise budget will be used as step1 total_budget.
         """
         prompt = CONSUMPTION_MAJOR_BUDGET_PROMPT.format(
-            household_info=json.dumps(self.household_info, ensure_ascii=False),
+            persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
@@ -1083,7 +1328,7 @@ class Household:
             candidates = list(bundle.get("candidates") or [])
 
             prompt = PURCHASE_BY_CATEGORY_PROMPT.format(
-                household_info=json.dumps(self.household_info, ensure_ascii=False),
+                persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
                 past_household_status=self.past_household_status_text,
                 category=json.dumps(cat, ensure_ascii=False),
                 category_budget=json.dumps(cat_budget, ensure_ascii=False),
@@ -1191,35 +1436,6 @@ class Household:
             seekers.append(lh)
         return seekers
 
-    def _compute_matching_loss(self, worker_profile: List[Dict[str, float]], required_profile: List[Dict[str, Dict[str, float]]]) -> float:
-        """
-        Mirror of LaborMarket._compute_matching_loss (rule-based).
-        Lower is better.
-        """
-        total_loss = 0.0
-        if len(worker_profile) != len(required_profile):
-            return float("inf")
-        for i in range(len(worker_profile)):
-            w = worker_profile[i] or {}
-            r = required_profile[i] or {}
-            for key, req in r.items():
-                mean = (req or {}).get("mean")
-                std = (req or {}).get("std")
-                importance = (req or {}).get("importance", 1.0)
-                if importance is None or float(importance) <= 0:
-                    continue
-                if std is None or float(std) <= 0:
-                    continue
-                if mean is None:
-                    continue
-                worker_value = float(w.get(key, 0.0) or 0.0)
-                distance = (worker_value - float(mean)) / float(std)
-                loss = float(importance) * (distance**2)
-                if distance > 0:
-                    loss *= 0.2
-                total_loss += loss
-        return total_loss
-
     def match_jobs_topk_by_loss(self, *, labor_hour: LaborHour, jobs: Sequence[Job], top_k: int = 3) -> List[JobMatch]:
         """
         Step: use loss to match topk jobs (rule-based).
@@ -1227,22 +1443,29 @@ class Household:
         - Caller must provide candidate jobs (e.g., already filtered by SOC elsewhere).
         - Loss is computed from LaborHour.skill_profile/ability_profile vs Job.required_skills/required_abilities.
         """
+        if self.labor_market is not None:
+            method = getattr(self.labor_market, "rank_jobs_for_labor", None)
+            if method is None:
+                ranked = []
+            elif hasattr(method, "remote"):
+                ranked = ray.get(method.remote(labor_hour, loss_threshold=float("inf")))
+            else:
+                ranked = method(labor_hour, loss_threshold=float("inf"))
+            job_set = {j.job_id for j in (jobs or [])}
+            matches = [JobMatch(job=j, loss=loss) for j, loss in ranked if j.job_id in job_set]
+            return matches[: max(1, int(top_k))]
 
         ## Todo: SOC->Skill mapping
         if getattr(labor_hour, "skill_profile", None) is None or getattr(labor_hour, "ability_profile", None) is None:
             return []
 
-        worker_profile = [dict(labor_hour.skill_profile or {}), dict(labor_hour.ability_profile or {})]
         matches: List[JobMatch] = []
         for job in jobs or []:
             if not getattr(job, "is_valid", True):
                 continue
             if int(getattr(job, "positions_available", 0) or 0) <= 0:
                 continue
-            req_profile = [dict(getattr(job, "required_skills", {}) or {}), dict(getattr(job, "required_abilities", {}) or {})]
-            loss = self._compute_matching_loss(worker_profile, req_profile)
-            matches.append(JobMatch(job=job, loss=loss))
-        matches.sort(key=lambda m: m.loss)
+            matches.append(JobMatch(job=job, loss=0.0))
         return matches[: max(1, int(top_k))]
 
     async def decide_job_applications(
@@ -1286,7 +1509,7 @@ class Household:
             for m in top_matches
         ]
         prompt = JOB_APPLICATION_DECISION_PROMPT.format(
-            household_info=json.dumps(self.household_info, ensure_ascii=False),
+            persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
             member_info=json.dumps(
                 {
@@ -1302,7 +1525,7 @@ class Household:
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         try:
-            parsed = json.loads(raw)
+            parsed = self._json_loads_loose(raw)
             chosen = [str(x) for x in (parsed.get("apply_job_ids") or [])]
         except Exception:
             chosen = [top_matches[0].job.job_id]
@@ -1357,7 +1580,7 @@ class Household:
             for j in offers
         ]
         prompt = JOB_OFFER_DECISION_PROMPT.format(
-            household_info=json.dumps(self.household_info, ensure_ascii=False),
+            persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
             member_info=json.dumps(
                 {
@@ -1373,7 +1596,7 @@ class Household:
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         try:
-            parsed = json.loads(raw)
+            parsed = self._json_loads_loose(raw)
             accept_job_id = parsed.get("accept_job_id")
         except Exception:
             accept_job_id = sorted(offers, key=lambda j: float(getattr(j, "wage_per_hour", 0.0) or 0.0), reverse=True)[0].job_id

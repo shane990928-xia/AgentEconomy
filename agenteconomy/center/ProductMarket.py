@@ -99,6 +99,8 @@ class ProductMarket:
         
         self.logger.debug(f"Product {product.product_id} ({product.name}) added to market")
     
+    def get_price(self, product_id):
+        pass
     def _calculate_industry_avg_prices(self):
         """
         计算各行业的平均价格
