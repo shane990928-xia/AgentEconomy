@@ -11,39 +11,42 @@ from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
 import os
 
-# 制造业代码 -> 零售商代码 映射
-# 基于 IO 表的行业关系
+# 制造业名称 -> 零售商代码 映射
+# 基于 Industry_fixed 列的行业名称（不是IO代码）
 MANUFACTURER_TO_RETAILER = {
     # 食品饮料相关 -> 445 Food and beverage stores
-    "311FT": "445",  # Food and beverage and tobacco products
-    "312": "445",    # Beverage and tobacco products (if separate)
+    "Food and beverage and tobacco products": "445",
     
     # 汽车相关 -> 441 Motor vehicle and parts dealers
-    "3361MV": "441",  # Motor vehicles
-    "3364OT": "441",  # Other transportation equipment
+    "Motor vehicles, bodies and trailers, and parts": "441",
+    "Other transportation equipment": "441",
+    
+    # 服装鞋帽 -> 448 Clothing and clothing accessories stores
+    "Apparel and leather and allied products": "448",
+    "Textile mills and textile product mills": "448",
+    
+    # 电子产品 -> 443 Electronics and appliance stores
+    "Computer and electronic products": "443",
+    "Electrical equipment, appliances, and components": "443",
     
     # 大部分制造业 -> 452 General merchandise stores
-    "325": "452",    # Chemical products (日化、药品等)
-    "339": "452",    # Miscellaneous manufacturing
-    "315AL": "452",  # Apparel and leather
-    "326": "452",    # Plastics and rubber products
-    "335": "452",    # Electrical equipment
-    "332": "452",    # Fabricated metal products
-    "333": "452",    # Machinery
-    "337": "452",    # Furniture
-    "334": "452",    # Computer and electronic products
-    "322": "452",    # Paper products
-    "321": "452",    # Wood products
-    "327": "452",    # Nonmetallic mineral products
-    "313TT": "452",  # Textiles
+    "Chemical products": "452",
+    "Miscellaneous manufacturing": "452",
+    "Plastics and rubber products": "452",
+    "Fabricated metal products": "452",
+    "Machinery": "452",
+    "Furniture and related products": "452",
+    "Paper products": "452",
+    "Wood products": "452",
+    "Nonmetallic mineral products": "452",
+    
+    # 农林渔牧 -> 445 Food stores (农产品) 或 4A0 Other
+    "Farms": "445",
+    "Forestry, fishing, and related activities": "4A0",
     
     # 工业/专业产品 -> 4A0 Other retail
-    "324": "4A0",    # Petroleum and coal products
-    "331": "4A0",    # Primary metals
-    "511": "4A0",    # Publishing industries
-    "113FF": "4A0",  # Forestry, fishing
-    "111CA": "4A0",  # Crop production
-    "211": "4A0",    # Oil and gas extraction
+    "Petroleum and coal products": "4A0",
+    "Publishing industries, except internet (includes software)": "4A0",
 }
 
 DEFAULT_RETAILER_CODE = "452"  # 默认综合百货
