@@ -270,21 +270,16 @@ class SimulationInitializer:
     async def _init_households(self, num_households: int = 100):
         """Initialize households"""
         logger.info(f"[Step 3.2] Initializing {num_households} Households...")
-        
-        from agenteconomy.agent.household import Household
-        
-        for i in range(num_households):
-            household = Household(
-                household_id=f"hh_{i:04d}",
-                name=f"Household {i}",
-                description=f"Household {i}",
-                owner=f"owner_{i}",
-                economic_center=self.context.economic_center,
-                labor_market=self.context.labor_market,
-                product_market=self.context.product_market,
-            )
-            self.context.households.append(household)
-            self.context.household_by_id[household.household_id] = household
+        from agenteconomy.simulation.agent_loader import create_households
+
+        households = create_households(
+            limit=num_households,
+            economic_center=self.context.economic_center,
+            labor_market=self.context.labor_market,
+            product_market=self.context.product_market,
+        )
+        self.context.households.extend(households)
+        self.context.household_by_id = {h.household_id: h for h in self.context.households}
         
         logger.info(f"  ✓ Created {len(self.context.households)} households")
     

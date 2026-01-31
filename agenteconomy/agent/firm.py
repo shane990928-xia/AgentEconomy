@@ -362,6 +362,8 @@ class Firm:
         # Firm financials
         self.capital_stock: float = 0.0 # Capital stock
         self.cash: float = 0.0 # Cash
+        self.cost_structure: Optional[Dict[str, float]] = None
+        self.compensation_ratio: float = 0.2
 
         # Market index
         self.economic_center: Optional[EconomicCenter] = economic_center # Economic center
@@ -375,6 +377,17 @@ class Firm:
         # Production tracking
         self.current_period: int = 0  # Current simulation period
         self.production_history: List[Dict[str, Any]] = []  # Production history
+        if self.industry:
+            try:
+                cost_structure = get_cost_structure(self.industry)
+                if cost_structure:
+                    self.cost_structure = cost_structure
+                    self.compensation_ratio = float(
+                        cost_structure.get("compensation", self.compensation_ratio) or self.compensation_ratio
+                    )
+            except Exception:
+                self.cost_structure = None
+                self.compensation_ratio = 0.2
 
     async def register(self):
         """Register the firm in the economic center"""
@@ -419,15 +432,7 @@ class Firm:
         if base_value <= 0:
             base_value = float(self.cash or 0.0)
 
-        compensation_ratio = 0.2
-        try:
-            cost_structure = get_cost_structure(self.industry)
-            if cost_structure:
-                compensation_ratio = float(cost_structure.get("compensation", compensation_ratio) or compensation_ratio)
-        except Exception:
-            compensation_ratio = 0.2
-
-        budget = base_value * compensation_ratio
+        budget = base_value * float(getattr(self, "compensation_ratio", 0.2) or 0.2)
         return max(0.0, budget)
 
     def _decide_job_postings_from_data(self, period: Optional[int] = None, max_job_types: int = 10) -> List[Job]:
@@ -590,7 +595,7 @@ class Firm:
                 self._call_labor_market("apply_job_plan", self.firm_id, to_post)
             return to_post
 
-        prompt = build_firm_post_job_prompt(self)
+        prompt = build_firm_post_job_prompt(self) # TODO
         response = await call_llm(prompt)
         return response
 
@@ -654,8 +659,26 @@ class ManufactureFirm(Firm):
     def procurement(self) -> IntermediateGoodsProcurement:
         """Lazy initialization of procurement tool"""
         if self._procurement is None and self.product_market is not None:
-            self._procurement = IntermediateGoodsProcurement(self.product_market)
+            self._procurement = IntermediateGoodsProcurement(
+                self.product_market,
+                receiver_id_resolver=self._resolve_intermediate_receiver_id,
+            )
         return self._procurement
+
+    def _resolve_intermediate_receiver_id(self, sku_id: str, industry_code: Optional[str], sku_obj: Optional[Any] = None) -> Optional[str]:
+        if self.economic_center is None:
+            return None
+        if sku_obj is not None:
+            owner_id = getattr(sku_obj, "owner_id", None)
+            if owner_id:
+                firm_id = self._call_economic_center("resolve_market_price_id", "intermediate_goods", owner_id)
+                if firm_id:
+                    return firm_id
+        if industry_code:
+            firm_id = self._call_economic_center("resolve_market_price_id", "intermediate_goods", industry_code)
+            if firm_id:
+                return firm_id
+        return None
     
     def calculate_production_value(self, production_plan: Dict[str, int], sku_base_prices: Dict[str, float]) -> float:
         """
@@ -765,17 +788,33 @@ class ManufactureFirm(Firm):
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
                     "total_cost": item.total_cost,
+                    "supplier_industry": getattr(item, "supplier_industry", None),
+                    "receiver_id": getattr(item, "receiver_id", None),
                 }
                 for item in result.get('items', [])
             ]
-            self._call_economic_center(
-                "record_intermediate_goods_purchase",
-                month=period,
-                buyer_id=self.firm_id,
-                total_cost=result['total_cost'],
-                costs_by_industry=result.get('by_industry', {}),
-                items=items_payload,
-            )
+            items_by_receiver: Dict[Optional[str], List[Dict[str, Any]]] = defaultdict(list)
+            for item in items_payload:
+                items_by_receiver[item.get("receiver_id")].append(item)
+
+            for receiver_id, group_items in items_by_receiver.items():
+                group_total = float(sum(float(it.get("total_cost") or 0.0) for it in group_items))
+                if group_total <= 0:
+                    continue
+                group_by_industry: Dict[str, float] = defaultdict(float)
+                for it in group_items:
+                    code = it.get("supplier_industry")
+                    if code:
+                        group_by_industry[str(code)] += float(it.get("total_cost") or 0.0)
+                self._call_economic_center(
+                    "record_intermediate_goods_purchase",
+                    month=period,
+                    buyer_id=self.firm_id,
+                    total_cost=group_total,
+                    costs_by_industry=dict(group_by_industry),
+                    items=group_items,
+                    receiver_id=receiver_id,
+                )
         
         logger.info(
             f"Firm {self.firm_id} procured intermediate goods: "
@@ -994,7 +1033,7 @@ class ManufactureFirm(Firm):
         logger.info(f"Firm {self.firm_id} starting production for period {period}")
         
         try:
-            # 1. 计算生产价值
+            # 1. 计算生产价值（计划值）
             production_value = self.calculate_production_value(production_plan, sku_base_prices)
             
             # 2. 获取IO表供应商
@@ -1007,6 +1046,21 @@ class ManufactureFirm(Firm):
                 period=period,
                 strategy="random"
             )
+
+            # 木桶效应：中间品供给不足则按最短板降低产量
+            bottleneck_ratio = float(intermediate_result.get("bottleneck_ratio", 1.0) or 1.0)
+            if bottleneck_ratio < 1.0:
+                scaled_plan: Dict[str, int] = {}
+                for sku_id, qty in production_plan.items():
+                    new_qty = int(float(qty) * bottleneck_ratio)
+                    if new_qty > 0:
+                        scaled_plan[sku_id] = new_qty
+                production_plan = scaled_plan
+                production_value = self.calculate_production_value(production_plan, sku_base_prices)
+                logger.info(
+                    f"Firm {self.firm_id} bottleneck_ratio={bottleneck_ratio:.4f} "
+                    f"scaled production to {sum(production_plan.values())} units"
+                )
             
             # 4. 采购抽象资源
             abstract_result = self.procure_abstract_resources(

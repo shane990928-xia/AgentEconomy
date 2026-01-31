@@ -24,6 +24,9 @@ Time period: one month. This budget allocation corresponds to the household's sp
 Inputs:
 - persona (selected fields): {persona}
 - Recent household situation: {past_household_status}
+- available_balance: {available_balance}
+- expected_income: {expected_income}
+- available_budget: {available_budget}
 
 Task:
 1) Infer the household's total consumption budget (total_budget).
@@ -38,6 +41,7 @@ Task:
 Rules:
 - All budgets are floats.
 - The sum of all bucket budgets MUST equal total_budget (allow a small floating error <= 0.01).
+- total_budget MUST be <= available_budget.
 - Use English only.
 
 Output STRICT JSON ONLY with this schema:
@@ -68,6 +72,9 @@ Inputs:
 - Recent household situation: {past_household_status}
 - total_budget: {total_budget}
 - categories: {categories}
+- available_balance: {available_balance}
+- expected_income: {expected_income}
+- available_budget: {available_budget}
 
 Task:
 For EACH category (by its category name), do both:
@@ -76,6 +83,7 @@ For EACH category (by its category name), do both:
 
 Rules:
 - Budgets MUST sum exactly to total_budget (allow a small floating error <= 0.01).
+- total_budget MUST be <= available_budget.
 - Each category must have at least 1 need description.
 - Use English only.
 

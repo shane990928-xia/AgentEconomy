@@ -49,16 +49,16 @@ class Bank:
         self.total_interest_paid = 0.0
         self.interest_history: List[Dict] = []
     
-    async def initialize(self):
+    def initialize(self):
         """
         ## Initialize Bank Agent
         Register bank ledger and products in the economic center
         """
         if self.economic_center:
             try:
-                await asyncio.gather(
+                ray.get([
                     self.economic_center.init_agent_ledger.remote(self.bank_id, self.initial_capital),
-                    self.economic_center.register_id.remote(self.bank_id, 'bank')
+                    self.economic_center.register_id.remote(self.bank_id, 'bank')]
                 ) 
                 logger.info(f"Bank {self.bank_id} registered in EconomicCenter with capital ${self.initial_capital:.2f}")
             except Exception as e:

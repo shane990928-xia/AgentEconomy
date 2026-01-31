@@ -68,6 +68,37 @@ class LaborMarket:
                 entry["unemployed"] += 1
         return snapshot
 
+    def get_labor_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for labor_hour in self.labor_hours:
+            household_id = labor_hour.agent_id
+            entry = snapshot.setdefault(household_id, {})
+            entry[labor_hour.lh_type] = {
+                "employed": (not labor_hour.is_valid) and (labor_hour.firm_id is not None),
+                "firm_id": labor_hour.firm_id,
+                "job_SOC": labor_hour.job_SOC,
+                "job_title": labor_hour.job_title,
+            }
+        return snapshot
+
+    def get_matched_jobs(self) -> List[Dict[str, Any]]:
+        matched: List[Dict[str, Any]] = []
+        for rec in self.matched_jobs:
+            job = rec.job
+            matched.append(
+                {
+                    "job_id": job.job_id,
+                    "firm_id": rec.firm_id,
+                    "household_id": rec.household_id,
+                    "lh_type": rec.lh_type,
+                    "wage_per_hour": rec.average_wage,
+                    "hours_per_period": job.hours_per_period,
+                    "soc": job.SOC,
+                    "title": job.title,
+                }
+            )
+        return matched
+
     def _is_worker_available(self, household_id: str, lh_type: str) -> bool:
         key = self._worker_key(household_id, lh_type)
         if key in self.matched_workers:

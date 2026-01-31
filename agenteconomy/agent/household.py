@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import ast
+import asyncio
 import copy
 import csv
 import json
 import os
+import random
 import re
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import ray
+
+_JOB_SKILLS_CSV = Path(__file__).resolve().parents[1] / "data" / "jobs_with_skills_abilities_IM_merged.csv"
 
 from agenteconomy.center.Model import Job, JobApplication, LaborHour, Product
 from agenteconomy.llm.llm import call_llm
@@ -22,6 +28,9 @@ from agenteconomy.llm.prompt_template import (
     JOB_OFFER_DECISION_PROMPT,
     PERSONA_UPDATE_PROMPT,
 )
+from agenteconomy.utils.logger import get_logger
+
+logger = get_logger(name="household")
 
 
 # =============================================================================
@@ -296,6 +305,7 @@ class Household:
         self.economic_center = None
         self.product_market = None
         self.labor_market = None
+        self.labor_hours: List[LaborHour] = []
 
         # LLM config: use agenteconomy.llm.llm Router ("simple" / "strong")
         self.llm_model_type: Literal["simple", "strong"] = "simple"
@@ -811,6 +821,108 @@ class Household:
         except Exception:
             return 0.0
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _load_job_skill_data() -> Dict[str, Dict[str, Any]]:
+        if not _JOB_SKILLS_CSV.exists():
+            return {}
+        data: Dict[str, Dict[str, Any]] = {}
+        with _JOB_SKILLS_CSV.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                soc = (row.get("O*NET-SOC Code") or "").strip()
+                if not soc or soc in data:
+                    continue
+                skills_raw = row.get("skills") or "{}"
+                abilities_raw = row.get("abilities") or "{}"
+                try:
+                    skills = ast.literal_eval(skills_raw) if skills_raw else {}
+                except Exception:
+                    skills = {}
+                try:
+                    abilities = ast.literal_eval(abilities_raw) if abilities_raw else {}
+                except Exception:
+                    abilities = {}
+                data[soc] = {
+                    "soc": soc,
+                    "title": (row.get("Title") or "").strip(),
+                    "skills": skills if isinstance(skills, dict) else {},
+                    "abilities": abilities if isinstance(abilities, dict) else {},
+                }
+        return data
+
+    @classmethod
+    def _mean_profile(cls, requirements: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+        profile: Dict[str, float] = {}
+        for name, meta in (requirements or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            mean = meta.get("mean")
+            if mean is None:
+                continue
+            try:
+                profile[name] = float(mean)
+            except Exception:
+                continue
+        return profile
+
+    @classmethod
+    def _sample_profile(cls, requirements: Dict[str, Dict[str, Any]], rng: random.Random) -> Dict[str, float]:
+        profile: Dict[str, float] = {}
+        for name, meta in (requirements or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            mean = meta.get("mean")
+            std = meta.get("std")
+            if mean is None:
+                continue
+            try:
+                mean_v = float(mean)
+            except Exception:
+                continue
+            try:
+                std_v = float(std) if std is not None else 0.0
+            except Exception:
+                std_v = 0.0
+            if std_v > 0.0:
+                value = rng.gauss(mean_v, std_v)
+            else:
+                value = mean_v
+            profile[name] = float(value)
+        return profile
+
+    def _build_labor_hour_from_soc(self, soc: Optional[str], lh_type: str, total_hours: float) -> Optional[LaborHour]:
+        if not soc:
+            return None
+        data = self._load_job_skill_data().get(str(soc))
+        rng = random.Random()
+        skill_profile = self._sample_profile(data.get("skills") or {}, rng) if data else {}
+        ability_profile = self._sample_profile(data.get("abilities") or {}, rng) if data else {}
+        labor_hour = LaborHour.create(
+            agent_id=self.household_id,
+            total_hours=float(total_hours),
+            template=f"labor_{lh_type}",
+            skill_profile=skill_profile,
+            ability_profile=ability_profile,
+            lh_type=lh_type,
+        )
+        labor_hour.job_SOC = str(soc)
+        labor_hour.job_title = (data.get("title") if data else None) or labor_hour.job_title
+        return labor_hour
+
+    def build_labor_hours(self, total_hours: float = 160.0) -> List[LaborHour]:
+        labor_hours: List[LaborHour] = []
+        head_soc = self.get_rp_soc_occupation_code()
+        spouse_soc = self.get_sp_soc_occupation_code()
+        head = self._build_labor_hour_from_soc(head_soc, "head", total_hours)
+        if head is not None:
+            labor_hours.append(head)
+        spouse = self._build_labor_hour_from_soc(spouse_soc, "spouse", total_hours)
+        if spouse is not None:
+            labor_hours.append(spouse)
+        self.labor_hours = labor_hours
+        return labor_hours
+
     def get_rp_soc_occupation_code(self) -> Optional[str]:
         """
         Public getter: RP (head) SOC occupation code.
@@ -848,10 +960,6 @@ class Household:
         # update member variable + dicts
         setattr(self, "ER85692", new_v)
         self.csv_values["ER85692"] = new_v
-        self.csv_raw["ER85692"] = str(new_v)
-        self.past_household_status = self._build_past_household_status()
-        self.past_household_status_text = self.past_household_status.get("summary_text") or ""
-        self.household_info["past_household_status"] = self.past_household_status
         return new_v
 
     def update_rp_income(self, wage: float) -> float:
@@ -935,18 +1043,12 @@ class Household:
             # If occupation is set, mark employed (requested)
             setattr(self, "ER82433", self._EMPLOYED_CODE)
             self.csv_values["ER82433"] = self._EMPLOYED_CODE
-            self.csv_raw["ER82433"] = str(self._EMPLOYED_CODE)
         else:
             setattr(self, "ER82181", None)
             self.csv_values["ER82181"] = None
             setattr(self, "ER82433", self._NOT_EMPLOYED_CODE)
             self.csv_values["ER82433"] = self._NOT_EMPLOYED_CODE
-            self.csv_raw["ER82433"] = str(self._NOT_EMPLOYED_CODE)
         setattr(self, "ER82181_occupation_title", title)
-        self.csv_raw["ER82181"] = str(new_occupation_code)
-        self.past_household_status = self._build_past_household_status()
-        self.past_household_status_text = self.past_household_status.get("summary_text") or ""
-        self.household_info["past_household_status"] = self.past_household_status
 
     def update_spouse_occupation(self, new_occupation_code: str) -> None:
         """
@@ -963,14 +1065,9 @@ class Household:
         if soc:
             setattr(self, "SP_employment_status", self._EMPLOYED_CODE)
             self.csv_values["SP_employment_status"] = self._EMPLOYED_CODE
-            self.csv_raw["SP_employment_status"] = str(self._EMPLOYED_CODE)
         else:
             setattr(self, "SP_employment_status", self._NOT_EMPLOYED_CODE)
             self.csv_values["SP_employment_status"] = self._NOT_EMPLOYED_CODE
-            self.csv_raw["SP_employment_status"] = str(self._NOT_EMPLOYED_CODE)
-        self.past_household_status = self._build_past_household_status()
-        self.past_household_status_text = self.past_household_status.get("summary_text") or ""
-        self.household_info["past_household_status"] = self.past_household_status
 
     @staticmethod
     def _deep_merge_dict(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -1036,6 +1133,52 @@ class Household:
         self.product_market = product_market
         self.labor_market = labor_market
 
+    def _call_market_method(self, market, method_name: str, *args, **kwargs):
+        if market is None:
+            return None
+        method = getattr(market, method_name, None)
+        if method is None:
+            return None
+        if hasattr(method, "remote"):
+            return ray.get(method.remote(*args, **kwargs))
+        return method(*args, **kwargs)
+
+    def _call_economic_center(self, method_name: str, *args, **kwargs):
+        return self._call_market_method(self.economic_center, method_name, *args, **kwargs)
+
+    def _call_product_market(self, method_name: str, *args, **kwargs):
+        return self._call_market_method(self.product_market, method_name, *args, **kwargs)
+
+    def _call_labor_market(self, method_name: str, *args, **kwargs):
+        return self._call_market_method(self.labor_market, method_name, *args, **kwargs)
+
+    def initialize_in_system(
+        self,
+        *,
+        economic_center=None,
+        labor_market=None,
+        product_market=None,
+        total_hours: float = 160.0,
+    ) -> List[LaborHour]:
+        if economic_center is not None:
+            self.economic_center = economic_center
+        if labor_market is not None:
+            self.labor_market = labor_market
+        if product_market is not None:
+            self.product_market = product_market
+
+        if self.economic_center is not None:
+            self._call_economic_center("register_id", self.household_id, "household")
+            savings = self._as_float(self.csv_values.get("ER85692"))
+            self._call_economic_center("init_agent_ledger", self.household_id, savings)
+
+        if not self.labor_hours:
+            self.build_labor_hours(total_hours=total_hours)
+        if self.labor_market is not None and self.labor_hours:
+            self._call_labor_market("register_labor_hours", self.labor_hours)
+
+        return list(self.labor_hours)
+
     def set_household_info(self, info: Dict[str, Any]):
         self.household_info = dict(info or {})
         self.household_info.setdefault("household_id", self.household_id)
@@ -1050,7 +1193,11 @@ class Household:
         Placeholder: query current price by product_id.
         For now returns a default value; later you can wire it to EconomicCenter/ProductMarket.
         """
-        _ = product_id
+        snapshot = self._call_product_market("get_product_snapshot", product_id)
+        if isinstance(snapshot, dict):
+            price = snapshot.get("retail_price")
+            if price is not None:
+                return float(price)
         return 1.0
 
     def get_product_stock(self, product_id: str) -> float:
@@ -1058,7 +1205,11 @@ class Household:
         Placeholder: query current stock by product_id.
         For now returns a default value; later you can wire it to EconomicCenter/ProductMarket.
         """
-        _ = product_id
+        snapshot = self._call_product_market("get_product_snapshot", product_id)
+        if isinstance(snapshot, dict):
+            stock = snapshot.get("available_stock")
+            if stock is not None:
+                return float(stock)
         return 100.0
 
     @staticmethod
@@ -1132,6 +1283,9 @@ class Household:
         *,
         total_budget: float,
         categories: Optional[List[str]] = None,
+        available_balance: Optional[float] = None,
+        expected_income: Optional[float] = None,
+        available_budget: Optional[float] = None,
     ) -> CategoryNeedsOutput:
         """
         Step1 (default LLM):
@@ -1139,13 +1293,18 @@ class Household:
         """
         cats = categories or self.consumption_categories
 
+        llm_start = time.perf_counter()
         prompt = CONSUMPTION_NEEDS_BY_CATEGORY_PROMPT.format(
             persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
             total_budget=json.dumps(float(total_budget), ensure_ascii=False),
             categories=json.dumps(list(cats), ensure_ascii=False),
+            available_balance=json.dumps(available_balance, ensure_ascii=False),
+            expected_income=json.dumps(expected_income, ensure_ascii=False),
+            available_budget=json.dumps(available_budget, ensure_ascii=False),
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
+        llm_elapsed = time.perf_counter() - llm_start
         parsed = self._json_loads_loose(raw)
 
         # Normalize: ensure all categories exist, budgets sum to total_budget, and each has >=1 description.
@@ -1183,6 +1342,7 @@ class Household:
                 for cp in plans:
                     cp.budget_amount = max(0.0, float(cp.budget_amount or 0.0)) * scale
 
+
         return CategoryNeedsOutput(
             total_budget=float(tb),
             category_plans=plans,
@@ -1190,7 +1350,13 @@ class Household:
             raw_llm_output=raw,
         )
 
-    async def consumption_step0_major_budget_allocation(self) -> MajorBudgetOutput:
+    async def consumption_step0_major_budget_allocation(
+        self,
+        *,
+        available_balance: Optional[float] = None,
+        expected_income: Optional[float] = None,
+        available_budget: Optional[float] = None,
+    ) -> MajorBudgetOutput:
         """
         Step0 (default LLM):
         Allocate major budget buckets. Retail merchandise budget will be used as step1 total_budget.
@@ -1198,6 +1364,9 @@ class Household:
         prompt = CONSUMPTION_MAJOR_BUDGET_PROMPT.format(
             persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
+            available_balance=json.dumps(available_balance, ensure_ascii=False),
+            expected_income=json.dumps(expected_income, ensure_ascii=False),
+            available_budget=json.dumps(available_budget, ensure_ascii=False),
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         parsed = self._json_loads_loose(raw)
@@ -1235,6 +1404,86 @@ class Household:
 
         return load_client()
 
+    def _consumption_step2_vector_match_sync(
+        self,
+        *,
+        category_plans: List[CategoryPlan],
+        top_k: int = 10,
+        product_market=None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Sync helper for step2 vector search."""
+        out: Dict[str, Dict[str, Any]] = {}
+        market = product_market or self.product_market
+        if market is None:
+            logger.warning(f"[消费检索] {self.household_id} no_product_market")
+            return out
+
+        search_method = getattr(market, "search_by_vector", None)
+        is_actor = hasattr(search_method, "remote")
+
+        for cp in category_plans:
+            cat = cp.category
+            cat_candidates: List[Dict[str, Any]] = []
+            need_descs = list(cp.need_descriptions or [])
+
+            products_by_desc: List[Tuple[str, List[Any]]] = []
+            if is_actor:
+                futures = []
+                for desc in need_descs:
+                    query = f"{cat}: {desc}"
+                    futures.append((desc, search_method.remote(query, top_k=int(top_k))))
+                if futures:
+                    results = ray.get([fut for _, fut in futures])
+                    for (desc, _), products_raw in zip(futures, results):
+                        products_by_desc.append((desc, list(products_raw or [])))
+            else:
+                for desc in need_descs:
+                    query = f"{cat}: {desc}"
+                    products_raw = self._call_market_method(market, "search_by_vector", query, top_k=int(top_k))
+                    products_by_desc.append((desc, list(products_raw or [])))
+
+            for desc, products in products_by_desc:
+                for product in products:
+                    product_id = getattr(product, "product_id", None)
+                    if not product_id:
+                        continue
+                    current_price = float(
+                        getattr(product, "retail_price", None)
+                        or self.get_product_price(str(product_id))
+                    )
+                    storage = float(
+                        getattr(product, "available_stock", None)
+                        or self.get_product_stock(str(product_id))
+                    )
+                    product_line = self._format_product_line(
+                        product_id=str(product_id),
+                        name=getattr(product, "name", None),
+                        description=getattr(product, "description", None),
+                        current_price=current_price,
+                        storage=storage,
+                    )
+                    cat_candidates.append(
+                        {
+                            "category": cat,
+                            "need_description": desc,
+                            "product_id": str(product_id),
+                            "name": getattr(product, "name", None),
+                            "description": getattr(product, "description", None),
+                            "current_price": current_price,
+                            "storage": storage,
+                            "product_line": product_line,
+                            "score": None,
+                        }
+                    )
+            out[cat] = {
+                "category": cat,
+                "budget_amount": float(cp.budget_amount or 0.0),
+                "need_descriptions": list(cp.need_descriptions or []),
+                "candidates": cat_candidates,
+            }
+
+        return out
+
     async def consumption_step2_vector_match(
         self,
         *,
@@ -1244,67 +1493,15 @@ class Household:
     ) -> Dict[str, Dict[str, Any]]:
         """
         Step2:
-        For each category, for each need description, retrieve top_k products via Qdrant,
-        and build a per-category candidate list.
-
-        Vector search code follows load_qdrant.py main (query_points).
-        Note: We do not hard-filter by category here because the Qdrant payload does not contain
-        the industry/category label; instead we bias retrieval by including the category name in the query text.
+        For each category, for each need description, retrieve top_k products via ProductMarket
+        when available (preferred), otherwise fallback to Qdrant.
         """
-        from agenteconomy.utils.embedding import embedding
-
-        client = self._get_qdrant_client()
-        collection = os.getenv("QDRANT_COLLECTION_NAME", "products")
-        _ = product_market  # kept for extensibility
-
-        out: Dict[str, Dict[str, Any]] = {}
-        for cp in category_plans:
-            cat = cp.category
-            cat_candidates: List[Dict[str, Any]] = []
-            for desc in cp.need_descriptions:
-                # Include category name in query to bias retrieval toward that category.
-                qv = embedding(f"{cat}: {desc}")
-                resp = client.query_points(collection_name=collection, query=qv, limit=int(top_k))
-                for pt in getattr(resp, "points", []) or []:
-                    payload = pt.payload or {}
-                    product_id = payload.get("product_id") or str(getattr(pt, "id", "") or "")
-                    if not product_id:
-                        continue
-
-                    # payload["price"] is a reference price; DO NOT pass it into prompts (use queried current_price instead)
-                    current_price = float(self.get_product_price(str(product_id)))
-                    storage = float(self.get_product_stock(str(product_id)))
-                    product_line = self._format_product_line(
-                        product_id=str(product_id),
-                        name=payload.get("name"),
-                        description=payload.get("description"),
-                        current_price=current_price,
-                        storage=storage,
-                    )
-                    cat_candidates.append(
-                        {
-                            "category": cat,
-                            "need_description": desc,
-                            "product_id": str(product_id),
-                            "name": payload.get("name"),
-                            "description": payload.get("description"),
-                            "current_price": current_price,
-                            "storage": storage,
-                            "product_line": product_line,
-                            "score": getattr(pt, "score", None),
-                        }
-                    )
-            out[cat] = {
-                "category": cat,
-                "budget_amount": float(cp.budget_amount or 0.0),
-                "need_descriptions": list(cp.need_descriptions or []),
-                "candidates": cat_candidates,
-            }
-        try:
-            client.close()
-        except Exception:
-            pass
-        return out
+        return await asyncio.to_thread(
+            self._consumption_step2_vector_match_sync,
+            category_plans=category_plans,
+            top_k=top_k,
+            product_market=product_market,
+        )
 
     async def consumption_step3_purchase_llm(
         self,
@@ -1377,24 +1574,61 @@ class Household:
         *,
         top_k: int = 10,
         product_market=None,
+        available_balance: Optional[float] = None,
+        expected_income: Optional[float] = None,
+        available_budget: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         New end-to-end consumption flow (step1-4).
         Step4 is stubbed.
         """
-        step0 = await self.consumption_step0_major_budget_allocation()
+
+        avail_balance = None if available_balance is None else float(available_balance)
+        exp_income = None if expected_income is None else float(expected_income)
+        avail_budget = available_budget
+        if avail_budget is None:
+            if avail_balance is not None:
+                base = float(avail_balance)
+                if exp_income is not None and exp_income > 0.0:
+                    base += float(exp_income)
+                avail_budget = base
+        if avail_budget is not None:
+            avail_budget = max(0.0, float(avail_budget))
+
+        step0 = await self.consumption_step0_major_budget_allocation(
+            available_balance=avail_balance,
+            expected_income=exp_income,
+            available_budget=avail_budget,
+        )
+        if avail_budget is not None:
+            if step0.total_budget > avail_budget and step0.total_budget > 0:
+                scale = avail_budget / float(step0.total_budget)
+                step0.budgets = {k: float(v) * scale for k, v in (step0.budgets or {}).items()}
+                step0.total_budget = float(avail_budget)
+            elif avail_budget <= 0.0:
+                step0.budgets = {k: 0.0 for k in (step0.budgets or {}).keys()}
+                step0.total_budget = 0.0
         retail_budget = float((step0.budgets or {}).get("Retail merchandise") or 0.0)
-        step1 = await self.consumption_step1_needs_by_category(total_budget=retail_budget)
+        step1 = await self.consumption_step1_needs_by_category(
+            total_budget=retail_budget,
+            available_balance=avail_balance,
+            expected_income=exp_income,
+            available_budget=avail_budget,
+        )
         step2 = await self.consumption_step2_vector_match(
             category_plans=step1.category_plans, top_k=top_k, product_market=product_market
         )
         step3 = await self.consumption_step3_purchase_llm(category_bundles=step2)
-        _ = self.consumption_step4_validate(step1, step2, step3)
+        # _ = self.consumption_step4_validate(step1, step2, step3)
+
         return {
             "step0": {
                 "total_budget": step0.total_budget,
                 "budgets": step0.budgets,
                 "note": step0.note,
+                "available_balance": avail_balance,
+                "expected_income": exp_income,
+                "available_budget": avail_budget,
             },
             "step1": {
                 "total_budget": step1.total_budget,

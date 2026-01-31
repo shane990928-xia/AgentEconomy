@@ -10,7 +10,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
 model = AutoModel.from_pretrained(os.getenv("MODEL_PATH")).to(device)
 
-def embedding(text: str) -> np.ndarray:
+def embedding(text: str):
     """
     Generate an embedding for the given text using the specified tokenizer and model.
     
@@ -27,11 +27,31 @@ def embedding(text: str) -> np.ndarray:
     
     # Mean pooling
     pooled_output = mean_pooling(outputs, inputs['attention_mask']).squeeze(0)
+    pooled_output = torch.nan_to_num(pooled_output.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Clip extreme values before normalization to prevent overflow
+    pooled_output = torch.clamp(pooled_output, min=-1e6, max=1e6)
 
     # Normalize the output
     normalized_embedding = F.normalize(pooled_output, p=2, dim=0)
+    vec = normalized_embedding.detach().cpu().numpy().astype(np.float32, copy=False)
     
-    return normalized_embedding.cpu().numpy().tolist()
+    # Additional safety: handle any remaining non-finite values
+    if not np.isfinite(vec).all():
+        vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Clip the final vector to prevent overflow in downstream operations
+    vec = np.clip(vec, -1.0, 1.0)
+    
+    # Final normalization with epsilon for numerical stability
+    norm = float(np.linalg.norm(vec))
+    if norm > 1e-8:
+        vec = vec / norm
+    else:
+        # If norm is too small, return a zero vector (will be handled by Qdrant)
+        vec = np.zeros_like(vec)
+    
+    return vec.tolist()
 
 # mean pooling
 def mean_pooling(model_output, attention_mask):

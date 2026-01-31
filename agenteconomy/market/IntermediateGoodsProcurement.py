@@ -15,6 +15,11 @@ from agenteconomy.data.industry_cate_map import industry_cate_map
 CATEGORY_1_CODES = frozenset(
     industry_cate_map["category_1_manufacturers"]["industries"].keys()
 )
+_CATEGORY_1_NUMERIC_PREFIXES = frozenset(
+    "".join(ch for ch in code if ch.isdigit())
+    for code in CATEGORY_1_CODES
+    if code and code[0].isdigit()
+)
 
 @dataclass
 class PurchaseItem:
@@ -28,11 +33,12 @@ class PurchaseItem:
 class IntermediateGoodsProcurement:
     """中间品采购策略"""
     
-    def __init__(self, product_market):
+    def __init__(self, product_market, receiver_id_resolver=None):
         self.product_market = product_market
         self.industry_avg_prices = {}  # 缓存行业平均价格
         # 检测是否为Ray Actor（检查类型名称）
         self.is_ray_actor = 'ActorHandle' in str(type(product_market))
+        self.receiver_id_resolver = receiver_id_resolver
     
     def _call_market_method(self, method_name: str, *args, **kwargs):
         """调用market方法，自动处理Ray Actor对象"""
@@ -141,6 +147,16 @@ class IntermediateGoodsProcurement:
                 # 执行采购
                 unit_price = sku.manufacturer_price
                 total_cost = unit_price * actual_quantity
+                receiver_id = None
+                if self.receiver_id_resolver is not None:
+                    try:
+                        receiver_id = self.receiver_id_resolver(
+                            getattr(sku, "product_id", None) or "",
+                            supplier_industry,
+                            sku,
+                        )
+                    except Exception:
+                        receiver_id = None
                 
                 item = PurchaseItem(
                     sku_id=sku.product_id,
@@ -148,6 +164,9 @@ class IntermediateGoodsProcurement:
                     unit_price=unit_price,
                     total_cost=total_cost
                 )
+                if receiver_id:
+                    setattr(item, "receiver_id", receiver_id)
+                setattr(item, "supplier_industry", supplier_industry)
                 purchased_items.append(item)
                 
                 # 更新已购买单位（使用等价单位）
@@ -187,6 +206,8 @@ class IntermediateGoodsProcurement:
         """
         all_items = []
         costs_by_industry = {}
+        target_value_by_industry = {}
+        fulfillment_ratio_by_industry = {}
         
         for supplier in io_suppliers:
             supplier_code = supplier['supplier']
@@ -201,6 +222,7 @@ class IntermediateGoodsProcurement:
                 production_value=production_value,
                 io_coefficient=supplier['coefficient']
             )
+            target_value_by_industry[supplier_code] = float(value_needed or 0.0)
             
             # 采购
             items = self.purchase_by_equivalent_units(
@@ -215,16 +237,42 @@ class IntermediateGoodsProcurement:
             industry_cost = sum(item.total_cost for item in items)
             costs_by_industry[supplier_code] = industry_cost
             all_items.extend(items)
+            if value_needed and value_needed > 0:
+                fulfillment_ratio_by_industry[supplier_code] = float(industry_cost) / float(value_needed)
+            else:
+                fulfillment_ratio_by_industry[supplier_code] = 1.0
+
+        if fulfillment_ratio_by_industry:
+            bottleneck_ratio = min(fulfillment_ratio_by_industry.values())
+        else:
+            bottleneck_ratio = 1.0
         
         return {
             "total_cost": sum(costs_by_industry.values()),
             "by_industry": costs_by_industry,
-            "items": all_items
+            "items": all_items,
+            "target_value_by_industry": target_value_by_industry,
+            "fulfillment_ratio_by_industry": fulfillment_ratio_by_industry,
+            "bottleneck_ratio": bottleneck_ratio,
         }
     
     def _is_category_1(self, industry_code: str) -> bool:
         """检查是否为制造业"""
-        return industry_code in CATEGORY_1_CODES
+        if not industry_code:
+            return False
+        code = str(industry_code).strip()
+        if code in CATEGORY_1_CODES:
+            return True
+        if code and code[0].isdigit():
+            i = 0
+            for ch in code:
+                if ch.isdigit():
+                    i += 1
+                else:
+                    break
+            if i:
+                return code[:i] in _CATEGORY_1_NUMERIC_PREFIXES
+        return False
 
 
 # ============================================================================

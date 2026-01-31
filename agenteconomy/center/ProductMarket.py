@@ -8,10 +8,9 @@ from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.embedding import embedding
 from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
-from agenteconomy.data.industry_cate_map import industry_cate_map
 import os
 
-@ray.remote(num_cpus=8)
+@ray.remote(num_cpus=8, max_concurrency=100)
 class ProductMarket:
     """
     产品市场（Product Market）
@@ -99,8 +98,34 @@ class ProductMarket:
         
         self.logger.debug(f"Product {product.product_id} ({product.name}) added to market")
     
-    def get_price(self, product_id):
-        pass
+    def get_price(self, product_id: str) -> float:
+        """
+        Get current retail price for a product.
+        """
+        product = self.products_by_id.get(product_id)
+        if not product:
+            return 0.0
+        return float(getattr(product, "retail_price", 0.0) or 0.0)
+
+    def get_product_snapshot(self, product_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return a lightweight snapshot for a product (price/stock/metadata).
+        """
+        product = self.products_by_id.get(product_id)
+        if not product:
+            return None
+        return {
+            "product_id": product.product_id,
+            "name": product.name,
+            "description": product.description,
+            "retail_price": float(getattr(product, "retail_price", 0.0) or 0.0),
+            "base_retail_price": float(getattr(product, "base_retail_price", 0.0) or 0.0),
+            "manufacturer_price": float(getattr(product, "manufacturer_price", 0.0) or 0.0),
+            "base_manufacturer_price": float(getattr(product, "base_manufacturer_price", 0.0) or 0.0),
+            "available_stock": float(getattr(product, "available_stock", 0.0) or 0.0),
+            "manufacturer_code": getattr(product, "manufacturer_code", None),
+            "retailer_code": getattr(product, "retailer_code", None),
+        }
     def _calculate_industry_avg_prices(self):
         """
         计算各行业的平均价格
@@ -340,21 +365,26 @@ class ProductMarket:
             products_by_id = self.products_by_id
 
             while len(results) < top_k and offset < max_fetch:
-                hits = self.client.search(
+                hits_resp = self.client.query_points(
                     collection_name=collection_name,
-                    query_vector=query_embedding,
+                    query=query_embedding,
                     limit=search_limit,
                     offset=offset,
                     with_payload=True,
                     with_vectors=False,
                 )
 
-                if not hits:
+                if hasattr(hits_resp, "points"):
+                    hits_list = list(getattr(hits_resp, "points") or [])
+                else:
+                    hits_list = list(hits_resp or [])
+
+                if not hits_list:
                     break
 
-                offset += len(hits)
+                offset += len(hits_list)
 
-                for hit in hits:
+                for hit in hits_list:
                     payload = hit.payload or {}
                     product_id = payload.get("product_id")
                     if not product_id:

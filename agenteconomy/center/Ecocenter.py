@@ -97,6 +97,7 @@ class EconomicCenter:
         self.period_statistics: Dict[int, PeriodStatistics] = {}
         self.wage_history: List[Wage] = []
         self.redistribution_record_per_person: Dict[int, float] = defaultdict(float)
+        self.market_price_registry: Dict[str, Dict[str, str]] = defaultdict(dict)
         
         # =========================================================================
         # 6️⃣ 企业财务追踪 (Firm Financial Tracking)
@@ -481,6 +482,16 @@ class EconomicCenter:
 
     def set_labor_market(self, labor_market):
         self.labor_market = labor_market
+
+    def register_market_price(self, market_type: str, industry_code: str, firm_id: str, price: float = 0.0) -> None:
+        if not market_type or not industry_code or not firm_id:
+            return
+        self.market_price_registry[str(market_type)][str(industry_code)] = str(firm_id)
+
+    def resolve_market_price_id(self, market_type: str, industry_code: str) -> Optional[str]:
+        if not market_type or not industry_code:
+            return None
+        return self.market_price_registry.get(str(market_type), {}).get(str(industry_code))
 
     def _call_labor_market(self, method_name: str, *args, **kwargs):
         if self.labor_market is None:
@@ -887,6 +898,40 @@ class EconomicCenter:
         self._update_period_statistics(tx)
         return tx
 
+    def reset_transactions(self) -> Dict[str, int]:
+        """
+        清空交易与月度统计，但保留账本与注册的主体/就业状态。
+        """
+        counts = {
+            "tx_history": len(self.tx_history),
+            "tx_by_month": len(self.tx_by_month),
+            "tx_by_type": len(self.tx_by_type),
+            "tx_by_party": len(self.tx_by_party),
+            "period_statistics": len(self.period_statistics),
+            "wage_history": len(self.wage_history),
+        }
+        self.tx_history.clear()
+        self.tx_by_month = defaultdict(list)
+        self.tx_by_type = defaultdict(list)
+        self.tx_by_party = defaultdict(list)
+        self.period_statistics = {}
+        self.wage_history = []
+        self.redistribution_record_per_person = defaultdict(float)
+
+        def _default_firm_month() -> Dict[str, float]:
+            return {"income": 0.0, "expenses": 0.0, "wage": 0.0, "tax": 0.0, "production_cost": 0.0}
+
+        self.firm_monthly_data = defaultdict(lambda: defaultdict(_default_firm_month))
+        self._corporate_tax_settled_months = set()
+        self.firm_monthly_depreciation = defaultdict(lambda: defaultdict(float))
+        self.firm_monthly_capital_investment = defaultdict(lambda: defaultdict(float))
+        self.unmet_demand_by_month = defaultdict(dict)
+
+        if hasattr(self, "production_stats_by_month"):
+            self.production_stats_by_month = {}
+
+        return counts
+
     def record_intermediate_goods_purchase(
         self,
         month: int,
@@ -912,7 +957,7 @@ class EconomicCenter:
                 f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
             )
         elif is_company and self.ledger[buyer_id].amount < total_cost:
-            self.self.logger.info(
+            self.logger.info(
                 f"💳 Company {buyer_id} intermediate goods purchase with negative balance: "
                 f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
             )
@@ -1280,6 +1325,93 @@ class EconomicCenter:
             #     monthly_income += tx.amount
 
         return monthly_income, monthly_expense, self.ledger[household_id].amount
+
+    def summarize_households_monthly(self, month: int) -> Dict[str, Any]:
+        """
+        汇总指定月份的家庭收入/消费/余额（按交易统计）。
+        - 收入：工资(税后)、利息、再分配
+        - 消费：购物金额(不含税) + 消费税
+        """
+        households = [hid for hid in (self.household_id or []) if hid and hid != "economic_center"]
+        by_household: Dict[str, Dict[str, Any]] = {}
+        for hid in households:
+            bal = float(self.ledger.get(hid).amount) if hid in self.ledger else 0.0
+            by_household[hid] = {
+                "income": {"wage": 0.0, "interest": 0.0, "redistribution": 0.0, "total": 0.0},
+                "consumption": {"purchase": 0.0, "tax": 0.0, "total": 0.0},
+                "balance": bal,
+            }
+
+        totals = {
+            "wage": 0.0,
+            "interest": 0.0,
+            "redistribution": 0.0,
+            "purchase": 0.0,
+            "tax": 0.0,
+        }
+        government_procurement_total = 0.0
+
+        transactions = self.tx_by_month.get(month)
+        if transactions is None:
+            transactions = self.tx_history
+        for tx in transactions:
+            if tx.month != month:
+                continue
+            ttype = getattr(tx, "type", None)
+            sender_id = getattr(tx, "sender_id", None)
+            receiver_id = getattr(tx, "receiver_id", None)
+            amount = float(getattr(tx, "amount", 0.0) or 0.0)
+
+            if ttype == "labor_payment" and receiver_id in by_household:
+                by_household[receiver_id]["income"]["wage"] += amount
+                totals["wage"] += amount
+            elif ttype == "interest" and receiver_id in by_household:
+                by_household[receiver_id]["income"]["interest"] += amount
+                totals["interest"] += amount
+            elif ttype == "redistribution" and receiver_id in by_household:
+                by_household[receiver_id]["income"]["redistribution"] += amount
+                totals["redistribution"] += amount
+            elif ttype == "purchase" and sender_id in by_household:
+                by_household[sender_id]["consumption"]["purchase"] += amount
+                totals["purchase"] += amount
+            elif ttype == "consume_tax" and sender_id in by_household:
+                by_household[sender_id]["consumption"]["tax"] += amount
+                totals["tax"] += amount
+            elif ttype == "government_procurement":
+                government_procurement_total += amount
+
+        for rec in by_household.values():
+            income_total = (
+                rec["income"]["wage"]
+                + rec["income"]["interest"]
+                + rec["income"]["redistribution"]
+            )
+            rec["income"]["total"] = income_total
+            cons_total = rec["consumption"]["purchase"] + rec["consumption"]["tax"]
+            rec["consumption"]["total"] = cons_total
+
+        aggregate_income_total = totals["wage"] + totals["interest"] + totals["redistribution"]
+        aggregate_consumption_total = totals["purchase"] + totals["tax"]
+        aggregate = {
+            "income": {
+                "wage": totals["wage"],
+                "interest": totals["interest"],
+                "redistribution": totals["redistribution"],
+                "total": aggregate_income_total,
+            },
+            "consumption": {
+                "purchase": totals["purchase"],
+                "tax": totals["tax"],
+                "total": aggregate_consumption_total,
+            },
+            "household_count": len(by_household),
+        }
+
+        return {
+            "aggregate": aggregate,
+            "by_household": by_household,
+            "government_procurement_total": government_procurement_total,
+        }
     
 
     # =========================================================================
@@ -1849,102 +1981,139 @@ class EconomicCenter:
         
         注意：使用 (product_id, seller_id) 作为key，支持竞争市场模式下同一商品由多个企业销售
         """
-        sales_stats = {}
-        
-        # 从交易历史中收集销售数据
+        sales_stats: Dict[tuple, Dict[str, float]] = {}
+
+        def _ensure_key(product_id: str, seller_id: str) -> Dict[str, float]:
+            key = (product_id, seller_id)
+            if key not in sales_stats:
+                sales_stats[key] = {
+                    "product_id": product_id,
+                    "seller_id": seller_id,
+                    "quantity_sold": 0.0,
+                    "revenue": 0.0,
+                    "demand_level": "normal",
+                    "household_quantity": 0.0,
+                    "household_revenue": 0.0,
+                    "inherent_market_quantity": 0.0,
+                    "inherent_market_revenue": 0.0,
+                    "government_procurement_quantity": 0.0,
+                    "government_procurement_revenue": 0.0,
+                }
+            return sales_stats[key]
+
+        def _accumulate(
+            *,
+            kind: str,
+            product_id: Optional[str],
+            seller_id: Optional[str],
+            quantity: Optional[float],
+            revenue: Optional[float],
+        ) -> None:
+            if not product_id or not seller_id:
+                return
+            qty = float(quantity or 0.0)
+            rev = float(revenue or 0.0)
+            stats = _ensure_key(product_id, seller_id)
+            stats["quantity_sold"] += qty
+            stats["revenue"] += rev
+            if kind == "household":
+                stats["household_quantity"] += qty
+                stats["household_revenue"] += rev
+            elif kind == "inherent":
+                stats["inherent_market_quantity"] += qty
+                stats["inherent_market_revenue"] += rev
+            elif kind == "government":
+                stats["government_procurement_quantity"] += qty
+                stats["government_procurement_revenue"] += rev
+
+        def _extract_from_metadata(tx) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+            meta = getattr(tx, "metadata", {}) or {}
+            product_id = meta.get("product_id")
+            quantity = meta.get("quantity")
+            unit_price = meta.get("unit_price")
+            revenue = float(getattr(tx, "amount", 0.0) or 0.0)
+            if (quantity is None or float(quantity or 0.0) <= 0.0) and unit_price:
+                try:
+                    quantity = float(revenue) / float(unit_price) if float(unit_price) > 0 else None
+                except Exception:
+                    quantity = quantity
+            if revenue <= 0.0 and quantity is not None and unit_price is not None:
+                try:
+                    revenue = float(quantity) * float(unit_price)
+                except Exception:
+                    revenue = float(revenue or 0.0)
+            return product_id, quantity, revenue
+
+        def _accumulate_from_assets(tx, kind: str) -> None:
+            seller_id = getattr(tx, "receiver_id", None)
+            for asset in getattr(tx, "assets", []) or []:
+                product_id = getattr(asset, "product_id", None)
+                if not product_id:
+                    continue
+                qty = getattr(asset, "amount", None)
+                price = getattr(asset, "price", None)
+                revenue = None
+                if qty is not None and price is not None:
+                    revenue = float(qty) * float(price)
+                else:
+                    revenue = float(getattr(tx, "amount", 0.0) or 0.0)
+                _accumulate(
+                    kind=kind,
+                    product_id=product_id,
+                    seller_id=seller_id,
+                    quantity=qty,
+                    revenue=revenue,
+                )
+
+        # 从交易历史中收集销售数据（当前流程以 metadata 为主）
         transactions = self.tx_by_month.get(month)
         if transactions is None:
             transactions = self.tx_history
+        tx_count = 0
         for tx in transactions:
-            if tx.month == month:
-                seller_id = tx.receiver_id
-                
-                # 处理家庭购买（purchase类型）
-                if tx.type == 'purchase':
-                    for asset in tx.assets:
-                        if hasattr(asset, 'product_id') and asset.product_id:
-                            product_id = asset.product_id
-                            key = (product_id, seller_id)
-                            
-                            if key not in sales_stats:
-                                sales_stats[key] = {
-                                    "product_id": product_id,
-                                    "seller_id": seller_id,
-                                    "quantity_sold": 0.0,
-                                    "revenue": 0.0,
-                                    "demand_level": "normal",
-                                    "household_quantity": 0.0,
-                                    "household_revenue": 0.0,  # 新增：家庭购买收入
-                                    "inherent_market_quantity": 0.0,
-                                    "inherent_market_revenue": 0.0,  # 新增：固有市场收入
-                                    "government_procurement_quantity": 0.0,
-                                    "government_procurement_revenue": 0.0,
-                                }
-                            
-                            # 累计家庭销量和收入
-                            household_revenue = asset.price * asset.amount
-                            sales_stats[key]["quantity_sold"] += asset.amount
-                            sales_stats[key]["household_quantity"] += asset.amount
-                            sales_stats[key]["revenue"] += household_revenue
-                            sales_stats[key]["household_revenue"] += household_revenue
+            if tx.month != month:
+                continue
+            tx_count += 1
+            seller_id = getattr(tx, "receiver_id", None)
 
-                
-                # 处理固定市场消耗（inherent_market类型）
-                elif tx.type == 'inherent_market':
-                    for asset in tx.assets:
-                        if hasattr(asset, 'product_id') and asset.product_id:
-                            product_id = asset.product_id
-                            key = (product_id, seller_id)
-                            
-                            if key not in sales_stats:
-                                sales_stats[key] = {
-                                    "product_id": product_id,
-                                    "seller_id": seller_id,
-                                    "quantity_sold": 0.0,
-                                    "revenue": 0.0,
-                                    "demand_level": "normal",
-                                    "household_quantity": 0.0,
-                                    "household_revenue": 0.0,  # 新增：家庭购买收入
-                                    "inherent_market_quantity": 0.0,
-                                    "inherent_market_revenue": 0.0,  # 新增：固有市场收入
-                                    "government_procurement_quantity": 0.0,
-                                    "government_procurement_revenue": 0.0,
-                                }
-                            
-                            # 累计固定市场销量和收入
-                            inherent_revenue = tx.amount  # 固定市场交易的总金额
-                            sales_stats[key]["quantity_sold"] += asset.amount
-                            sales_stats[key]["inherent_market_quantity"] += asset.amount
-                            sales_stats[key]["revenue"] += inherent_revenue
-                            sales_stats[key]["inherent_market_revenue"] += inherent_revenue
+            if tx.type == 'purchase':
+                product_id, quantity, revenue = _extract_from_metadata(tx)
+                if product_id:
+                    _accumulate(
+                        kind="household",
+                        product_id=product_id,
+                        seller_id=seller_id,
+                        quantity=quantity,
+                        revenue=revenue,
+                    )
+                else:
+                    _accumulate_from_assets(tx, "household")
 
-                # 处理政府采购（government_procurement类型，不含税）
-                elif tx.type == 'government_procurement':
-                    for asset in tx.assets:
-                        if hasattr(asset, 'product_id') and asset.product_id:
-                            product_id = asset.product_id
-                            key = (product_id, seller_id)
+            elif tx.type == 'inherent_market':
+                product_id, quantity, revenue = _extract_from_metadata(tx)
+                if product_id:
+                    _accumulate(
+                        kind="inherent",
+                        product_id=product_id,
+                        seller_id=seller_id,
+                        quantity=quantity,
+                        revenue=revenue,
+                    )
+                else:
+                    _accumulate_from_assets(tx, "inherent")
 
-                            if key not in sales_stats:
-                                sales_stats[key] = {
-                                    "product_id": product_id,
-                                    "seller_id": seller_id,
-                                    "quantity_sold": 0.0,
-                                    "revenue": 0.0,
-                                    "demand_level": "normal",
-                                    "household_quantity": 0.0,
-                                    "household_revenue": 0.0,
-                                    "inherent_market_quantity": 0.0,
-                                    "inherent_market_revenue": 0.0,
-                                    "government_procurement_quantity": 0.0,
-                                    "government_procurement_revenue": 0.0,
-                                }
-
-                            gp_revenue = asset.price * asset.amount
-                            sales_stats[key]["quantity_sold"] += asset.amount
-                            sales_stats[key]["government_procurement_quantity"] += asset.amount
-                            sales_stats[key]["revenue"] += gp_revenue
-                            sales_stats[key]["government_procurement_revenue"] += gp_revenue
+            elif tx.type == 'government_procurement':
+                product_id, quantity, revenue = _extract_from_metadata(tx)
+                if product_id:
+                    _accumulate(
+                        kind="government",
+                        product_id=product_id,
+                        seller_id=seller_id,
+                        quantity=quantity,
+                        revenue=revenue,
+                    )
+                else:
+                    _accumulate_from_assets(tx, "government")
         
         # 根据销量确定需求水平
         # ===== Unmet Demand Tracking =====
@@ -1967,7 +2136,7 @@ class EconomicCenter:
             else:
                 stats["demand_level"] = "normal"
         
-        print(f"📊 销售数据收集: 月份{month}, 交易记录{len(self.tx_history)}条, 销售商品-企业组合{len(sales_stats)}种")
+        print(f"📊 销售数据收集: 月份{month}, 交易记录{tx_count}条, 销售商品-企业组合{len(sales_stats)}种")
         
         # 计算总收入统计
         total_revenue = sum(s['revenue'] for s in sales_stats.values())

@@ -25,6 +25,10 @@ def create_households(
     household_id_prefix: str = "household_",
     limit: Optional[int] = None,
     household_kwargs: Optional[Dict[str, Any]] = None,
+    economic_center=None,
+    labor_market=None,
+    product_market=None,
+    total_hours: float = 160.0,
 ) -> List[Household]:
     households = load_all_households(
         data_dir=data_dir,
@@ -36,7 +40,16 @@ def create_households(
         limit=limit,
         household_kwargs=household_kwargs,
     )
-    return list(households.values())
+    out = list(households.values())
+    if economic_center is not None or labor_market is not None or product_market is not None:
+        for household in out:
+            household.initialize_in_system(
+                economic_center=economic_center,
+                labor_market=labor_market,
+                product_market=product_market,
+                total_hours=total_hours,
+            )
+    return out
 
 
 def load_household_rows(csv_path: str) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
@@ -150,6 +163,42 @@ def load_all_households(
         census2010_to_soc2010_csv=census2010_to_soc2010_csv,
     )
     by_idx = bundle["household_row_by_household_idx"]
+    by_fid = bundle["household_row_by_fid"]
+
+    # Filter negative net wealth households and cap extreme wealth at 90th percentile.
+    wealth_rows: List[Tuple[int, Dict[str, Any], float]] = []
+    for hh_idx, row in (by_idx or {}).items():
+        raw = row.get("ER85692")
+        try:
+            wealth = float(raw)
+        except Exception:
+            wealth = 0.0
+        if wealth < 0.0:
+            continue
+        wealth_rows.append((hh_idx, row, wealth))
+
+    wealth_values = [w for _, _, w in wealth_rows]
+    p90 = None
+    if wealth_values:
+        wealth_values.sort()
+        p90 = wealth_values[int((len(wealth_values) - 1) * 0.9)]
+
+    filtered_by_idx: Dict[int, Dict[str, Any]] = {}
+    kept_row_ids = set()
+    for hh_idx, row, wealth in wealth_rows:
+        if p90 is not None and wealth > p90:
+            row["ER85692"] = str(p90)
+        filtered_by_idx[hh_idx] = row
+        kept_row_ids.add(id(row))
+
+    filtered_by_fid: Dict[int, Dict[str, Any]] = {}
+    for fid, row in (by_fid or {}).items():
+        if id(row) in kept_row_ids:
+            filtered_by_fid[fid] = row
+
+    bundle["household_row_by_household_idx"] = filtered_by_idx
+    bundle["household_row_by_fid"] = filtered_by_fid
+    by_idx = filtered_by_idx
     out: Dict[str, Household] = {}
     kwargs = dict(household_kwargs or {})
     n = 0
