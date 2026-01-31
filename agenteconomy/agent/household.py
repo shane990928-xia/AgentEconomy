@@ -1246,7 +1246,10 @@ class Household:
           ```json
           {...}
           ```
+        Also handles common LLM JSON errors like trailing commas.
         """
+        import re
+        
         s = (text or "").strip()
         if s.startswith("```"):
             # strip leading fence line
@@ -1260,8 +1263,23 @@ class Household:
             # if first token is "json", drop it
             if s.lower().startswith("json"):
                 s = s[4:].strip()
+        
+        def try_parse(json_str: str) -> Any:
+            """Try to parse JSON, fixing common errors."""
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                # Fix trailing commas before } or ]
+                fixed = re.sub(r',\s*([}\]])', r'\1', json_str)
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    # Fix missing commas between values (e.g., "key": value\n"key2")
+                    fixed2 = re.sub(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*"', r'\1,\n"', fixed)
+                    return json.loads(fixed2)
+        
         try:
-            return json.loads(s)
+            return try_parse(s)
         except Exception:
             # fallback: extract first JSON object/array substring
             start_obj = s.find("{")
@@ -1272,7 +1290,7 @@ class Household:
             end = s.rfind("}") if start == start_obj else s.rfind("]")
             if end == -1:
                 raise
-            return json.loads(s[start : end + 1])
+            return try_parse(s[start : end + 1])
 
     # -------------------------------------------------------------------------
     # Consumption decision (NEW workflow): step1-4
