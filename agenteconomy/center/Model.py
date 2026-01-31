@@ -711,7 +711,6 @@ class Transaction(BaseModel):
         'fica_tax',           # FICA/social security tax
         'corporate_tax',      # Corporate income tax
         'labor_payment',      # Wage payment
-        'inherent_market',    # Internal market transaction
         'government_procurement',  # Government purchase
         'transfer',           # Simple money transfer
         'product_sale',       # Product sale (manufacturer/retailer)

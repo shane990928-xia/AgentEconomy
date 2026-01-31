@@ -574,7 +574,8 @@ class Government:
         """
         计算政府采购预算
         
-        基于税收收入的一部分作为采购预算
+        基于上个月税收收入的一部分作为采购预算
+        （因为本月税收在月末才征收，采购在中间执行）
         
         Args:
             period: 当前期数
@@ -585,33 +586,36 @@ class Government:
         if self.economic_center is None:
             return 0.0
         
-        # 获取税收收入
-        try:
-            tax_summary = self._call_economic_center(
-                "get_monthly_tax_collection", period or 0
-            )
-            if not tax_summary:
-                tax_summary = {}
-        except Exception as e:
-            self.logger.warning(f"获取税收汇总失败: {e}")
-            tax_summary = {}
+        current_period = period or 0
         
-        # 计算总税收
-        total_tax = tax_summary.get("total_tax", 0.0) if isinstance(tax_summary, dict) else 0.0
+        # 获取上个月的税收收入（本月税收在月末才有）
+        prev_period = current_period - 1
+        total_tax = 0.0
+        
+        if prev_period >= 0:
+            try:
+                tax_summary = self._call_economic_center(
+                    "get_monthly_tax_collection", prev_period
+                )
+                if isinstance(tax_summary, dict):
+                    total_tax = float(tax_summary.get("total_tax", 0.0) or 0.0)
+            except Exception as e:
+                self.logger.warning(f"获取上月税收汇总失败: {e}")
         
         if total_tax <= 0:
-            # 尝试从余额推算
-            balance = self.get_balance()
-            # 使用余额的一部分作为预算（保守策略）
-            procurement_budget = balance * GOVERNMENT_PROCUREMENT_RATIO * 0.5
+            # 第一个月或没有税收，使用政府初始预算
+            INITIAL_PROCUREMENT_BUDGET = 10000.0  # 初始采购预算
+            procurement_budget = INITIAL_PROCUREMENT_BUDGET
+            self.logger.info(
+                f"政府采购预算: {procurement_budget:.2f} (使用初始预算，上月税收=0)"
+            )
         else:
-            # 税收 × 采购比例 = 采购预算
+            # 上月税收 × 采购比例 = 采购预算
             procurement_budget = total_tax * GOVERNMENT_PROCUREMENT_RATIO
-        
-        self.logger.info(
-            f"政府采购预算: {procurement_budget:.2f} "
-            f"(税收={total_tax:.2f}, 比例={GOVERNMENT_PROCUREMENT_RATIO})"
-        )
+            self.logger.info(
+                f"政府采购预算: {procurement_budget:.2f} "
+                f"(上月税收={total_tax:.2f}, 比例={GOVERNMENT_PROCUREMENT_RATIO})"
+            )
         
         return max(0.0, procurement_budget)
     

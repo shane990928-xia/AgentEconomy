@@ -850,7 +850,7 @@ class EconomicCenter:
         stats.total_transactions += 1
         stats.total_volume += amount
 
-        if tx_type in ("purchase", "product_sale", "inherent_market", "government_procurement"):
+        if tx_type in ("purchase", "product_sale", "government_procurement"):
             stats.product_volume += amount
             if tx_type == "purchase" and getattr(tx, "sender_id", None) in self.household_id:
                 stats.total_consumption += amount
@@ -1888,95 +1888,6 @@ class EconomicCenter:
        
         return tx.id
     
-    def add_inherent_market_transaction(
-        self,
-        month: int,
-        sender_id: str,
-        receiver_id: str,
-        amount: float,
-        product_id: str,
-        quantity: float,
-        product_name: str = "Unknown",
-        product_price: float = 0.0,
-        product_classification: str = "Unknown",
-        consume_inventory: bool = False,
-    ) -> str:
-        """
-        添加固有市场交易记录（纯转账，商品库存由商品市场管理）
-        
-        Args:
-            month: 交易月份
-            sender_id: 付款方ID (通常是政府)
-            receiver_id: 收款方ID (企业)
-            amount: 交易金额
-            product_id: 商品ID
-            quantity: 购买数量
-            product_name: 商品名称
-            product_price: 商品单价
-            product_classification: 商品分类
-            consume_inventory: 已废弃，库存由商品市场管理
-            
-        Returns:
-            str: 交易ID
-        """
-        # 检查余额
-        is_company = sender_id in self.firm_id
-        
-        if not is_company and self.ledger[sender_id].amount < amount:
-            raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
-        elif is_company and self.ledger[sender_id].amount < amount:
-            self.logger.info(f"Company {sender_id} inherent market transaction with negative balance: "
-                      f"${self.ledger[sender_id].amount:.2f} -> ${self.ledger[sender_id].amount - amount:.2f}")
-
-        # 转账
-        self.ledger[sender_id].amount -= amount
-        self.ledger[receiver_id].amount += amount
-
-        # VAT（消费税）
-        tax_amount = float(amount or 0.0) * float(self.vat_rate or 0.0)
-        if tax_amount > 0:
-            gov_id = "gov_main_simulation"
-            if gov_id in self.ledger:
-                self.ledger[sender_id].amount -= tax_amount
-                self.ledger[gov_id].amount += tax_amount
-            self._record_transaction(
-                sender_id=sender_id,
-                receiver_id=gov_id,
-                amount=tax_amount,
-                tx_type='consume_tax',
-                month=month,
-                metadata={
-                    "tax_base": amount,
-                    "tax_rate": self.vat_rate,
-                    "product_id": product_id,
-                    "quantity": float(quantity or 0.0),
-                },
-            )
-        
-        # 企业收入
-        self.record_firm_income(receiver_id, amount)
-        self.record_firm_monthly_income(receiver_id, month, amount)
-        
-        # 创建交易记录
-        unit_price = product_price if product_price > 0 else (amount / quantity if quantity > 0 else 0.01)
-        
-        tx = self._record_transaction(
-            sender_id=sender_id,
-            receiver_id=receiver_id,
-            amount=amount,
-            tx_type='inherent_market',
-            month=month,
-            metadata={
-                "product_id": product_id,
-                "product_name": product_name,
-                "quantity": float(quantity or 0.0),
-                "unit_price": float(unit_price or 0.0),
-                "product_classification": product_classification,
-            },
-        )
-        
-        return tx.id
-
     def add_government_procurement_transaction(
         self,
         month: int,
@@ -2044,8 +1955,6 @@ class EconomicCenter:
             "demand_level": str,
             "household_quantity": float,  # 家庭购买数量
             "household_revenue": float,  # 家庭购买收入
-            "inherent_market_quantity": float,  # 固定市场消耗数量
-            "inherent_market_revenue": float,  # 固有市场收入
             "government_procurement_quantity": float,  # 政府采购数量（不含税）
             "government_procurement_revenue": float,  # 政府采购收入（不含税）
         }}
@@ -2065,8 +1974,6 @@ class EconomicCenter:
                     "demand_level": "normal",
                     "household_quantity": 0.0,
                     "household_revenue": 0.0,
-                    "inherent_market_quantity": 0.0,
-                    "inherent_market_revenue": 0.0,
                     "government_procurement_quantity": 0.0,
                     "government_procurement_revenue": 0.0,
                 }
@@ -2090,9 +1997,6 @@ class EconomicCenter:
             if kind == "household":
                 stats["household_quantity"] += qty
                 stats["household_revenue"] += rev
-            elif kind == "inherent":
-                stats["inherent_market_quantity"] += qty
-                stats["inherent_market_revenue"] += rev
             elif kind == "government":
                 stats["government_procurement_quantity"] += qty
                 stats["government_procurement_revenue"] += rev
@@ -2160,19 +2064,6 @@ class EconomicCenter:
                 else:
                     _accumulate_from_assets(tx, "household")
 
-            elif tx.type == 'inherent_market':
-                product_id, quantity, revenue = _extract_from_metadata(tx)
-                if product_id:
-                    _accumulate(
-                        kind="inherent",
-                        product_id=product_id,
-                        seller_id=seller_id,
-                        quantity=quantity,
-                        revenue=revenue,
-                    )
-                else:
-                    _accumulate_from_assets(tx, "inherent")
-
             elif tx.type == 'government_procurement':
                 product_id, quantity, revenue = _extract_from_metadata(tx)
                 if product_id:
@@ -2212,34 +2103,29 @@ class EconomicCenter:
         # 计算总收入统计
         total_revenue = sum(s['revenue'] for s in sales_stats.values())
         total_household_revenue = sum(s.get('household_revenue', 0) for s in sales_stats.values())
-        total_inherent_revenue = sum(s.get('inherent_market_revenue', 0) for s in sales_stats.values())
         total_gp_revenue = sum(s.get('government_procurement_revenue', 0) for s in sales_stats.values())
         
         if total_revenue > 0:
             household_ratio = (total_household_revenue / total_revenue) * 100
-            inherent_ratio = (total_inherent_revenue / total_revenue) * 100
             gp_ratio = (total_gp_revenue / total_revenue) * 100
             print(f"💰 收入统计: 总收入${total_revenue:.2f} | "
                   f"家庭购买${total_household_revenue:.2f} ({household_ratio:.1f}%) | "
-                  f"政府采购${total_gp_revenue:.2f} ({gp_ratio:.1f}%) | "
-                  f"固有市场${total_inherent_revenue:.2f} ({inherent_ratio:.1f}%)")
+                  f"政府采购${total_gp_revenue:.2f} ({gp_ratio:.1f}%)")
         
         if sales_stats:
-            # 显示销量最高的3个商品-企业组合，并区分家庭和固定市场
+            # 显示销量最高的3个商品-企业组合
             top_sales = sorted(sales_stats.items(), key=lambda x: x[1]['quantity_sold'], reverse=True)[:3]
             for (product_id, seller_id), stats in top_sales:
                 household_rev = stats.get('household_revenue', 0)
-                inherent_rev = stats.get('inherent_market_revenue', 0)
                 gp_rev = stats.get('government_procurement_revenue', 0)
                 total_rev = stats['revenue']
                 hh_ratio = (household_rev / total_rev * 100) if total_rev > 0 else 0
-                in_ratio = (inherent_rev / total_rev * 100) if total_rev > 0 else 0
                 gp_ratio = (gp_rev / total_rev * 100) if total_rev > 0 else 0
                 
                 print(f"   - {product_id}@{seller_id}: 总销量{stats['quantity_sold']:.1f} "
-                      f"(家庭:{stats['household_quantity']:.1f} | 政府采购:{stats.get('government_procurement_quantity', 0.0):.1f} | 固有市场:{stats['inherent_market_quantity']:.1f}), "
+                      f"(家庭:{stats['household_quantity']:.1f} | 政府采购:{stats.get('government_procurement_quantity', 0.0):.1f}), "
                       f"总收入${total_rev:.2f} (家庭:${household_rev:.2f} {hh_ratio:.1f}% | "
-                      f"政府:${gp_rev:.2f} {gp_ratio:.1f}% | 固有:${inherent_rev:.2f} {in_ratio:.1f}%)")
+                      f"政府:${gp_rev:.2f} {gp_ratio:.1f}%)")
         return sales_stats
 
     def settle_monthly_corporate_tax(self, month: int) -> Dict[str, float]:
@@ -2361,7 +2247,7 @@ class EconomicCenter:
         """
         计算"名义GDP"及系统健康度指标
         
-        名义GDP定义：家庭消费 + 固有市场销售（含税，反映实际交易规模）
+        名义GDP定义：家庭消费 + 政府采购（含税，反映实际交易规模）
         同时输出生产总值作为对比指标
         
         这不是严格的国民核算GDP，而是系统活跃度/规模的代理指标。
@@ -2370,9 +2256,8 @@ class EconomicCenter:
         # 1) 主指标：名义GDP（交易总额法）
         sales_stats = self.collect_sales_statistics(month)
         household_sales_ex_tax = float(sum((s.get("household_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
-        inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
         gov_sales_ex_tax = float(sum((s.get("government_procurement_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
-        total_sales_ex_tax = household_sales_ex_tax + inherent_sales_ex_tax + gov_sales_ex_tax
+        total_sales_ex_tax = household_sales_ex_tax + gov_sales_ex_tax
 
         transactions = self.tx_by_month.get(month)
         if transactions is None:
@@ -2462,7 +2347,6 @@ class EconomicCenter:
             "gdp_components": {
                 "household_consumption": household_sales_ex_tax + (household_sales_ex_tax * self.vat_rate),
                 "government_procurement": gov_sales_ex_tax,  # 不含税（政府采购不缴VAT）
-                "inherent_market_sales": inherent_sales_ex_tax + (inherent_sales_ex_tax * self.vat_rate),
                 "vat_collected": vat_collected
             },
             "production_metrics": {
@@ -2507,12 +2391,12 @@ class EconomicCenter:
         ⚠️ 注意：此方法计算的三种GDP方法在数学上是恒等的（由于采用同一套数据源），
         不代表真实的国民核算。如需系统健康度指标，建议使用 calculate_nominal_gdp_and_health()
 
-        - 产品税：按"总消费（家庭+固有市场/政府等购买，均为不含税金额）× VAT税率"估算；
+        - 产品税：按"总消费（家庭+政府采购，均为不含税金额）× VAT税率"估算；
                  同时也会尝试从 tx_history 的 consume_tax 取"实际VAT"，若存在则优先使用。
         - 生产总价值（output）：优先使用生产阶段直接统计的“产出总价值”（例如统一CD生产的 total_output_value / firm_production_value）；
           若缺失才回退用"投入成本/ (1-毛利率)"粗略估算（仅用于兼容旧统计）。
         - 中间消耗：基础生产投入成本（production_cost）。
-        - 库存投资：output - sales（sales 为不含税销售额，含家庭+固有市场等）。
+        - 库存投资：output - sales（sales 为不含税销售额，含家庭+政府采购）。
         - 收入法：税金 + 工资 + 营业盈余，其中营业盈余 = (output - 中间消耗) - 工资。
         """
         ps = production_stats
@@ -2524,7 +2408,7 @@ class EconomicCenter:
         sales_stats = self.collect_sales_statistics(month)
         total_sales_ex_tax = float(sum((s.get("revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
         household_sales_ex_tax = float(sum((s.get("household_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
-        inherent_sales_ex_tax = float(sum((s.get("inherent_market_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
+        gov_sales_ex_tax = float(sum((s.get("government_procurement_revenue", 0.0) or 0.0) for s in (sales_stats or {}).values()) or 0.0)
 
         transactions = self.tx_by_month.get(month)
         if transactions is None:
@@ -2620,7 +2504,7 @@ class EconomicCenter:
             "consumption": {
                 "total_sales_ex_tax": total_sales_ex_tax,
                 "household_sales_ex_tax": household_sales_ex_tax,
-                "inherent_market_sales_ex_tax": inherent_sales_ex_tax,
+                "government_sales_ex_tax": gov_sales_ex_tax,
             },
             "taxes": {
                 "vat_estimated_from_sales": vat_estimated,
