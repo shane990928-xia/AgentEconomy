@@ -13,23 +13,21 @@ import os
 
 # 制造业名称 -> 零售商代码 映射
 # 基于 Industry_fixed 列的行业名称（不是IO代码）
+# 注意：零售商只有 441, 445, 452, 4A0, 722 这几个
 MANUFACTURER_TO_RETAILER = {
     # 食品饮料相关 -> 445 Food and beverage stores
     "Food and beverage and tobacco products": "445",
+    "Farms": "445",
     
     # 汽车相关 -> 441 Motor vehicle and parts dealers
     "Motor vehicles, bodies and trailers, and parts": "441",
     "Other transportation equipment": "441",
     
-    # 服装鞋帽 -> 448 Clothing and clothing accessories stores
-    "Apparel and leather and allied products": "448",
-    "Textile mills and textile product mills": "448",
-    
-    # 电子产品 -> 443 Electronics and appliance stores
-    "Computer and electronic products": "443",
-    "Electrical equipment, appliances, and components": "443",
-    
-    # 大部分制造业 -> 452 General merchandise stores
+    # 其他所有制造业 -> 452 General merchandise stores
+    "Apparel and leather and allied products": "452",
+    "Textile mills and textile product mills": "452",
+    "Computer and electronic products": "452",
+    "Electrical equipment, appliances, and components": "452",
     "Chemical products": "452",
     "Miscellaneous manufacturing": "452",
     "Plastics and rubber products": "452",
@@ -40,11 +38,8 @@ MANUFACTURER_TO_RETAILER = {
     "Wood products": "452",
     "Nonmetallic mineral products": "452",
     
-    # 农林渔牧 -> 445 Food stores (农产品) 或 4A0 Other
-    "Farms": "445",
-    "Forestry, fishing, and related activities": "4A0",
-    
     # 工业/专业产品 -> 4A0 Other retail
+    "Forestry, fishing, and related activities": "4A0",
     "Petroleum and coal products": "4A0",
     "Publishing industries, except internet (includes software)": "4A0",
 }

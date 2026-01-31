@@ -1936,7 +1936,6 @@ class Simulator:
             result = await self.economic_center.redistribute_monthly_taxes.remote(
                 month=month,
                 strategy="equal",  # 人均平等分配
-                household_ids=household_ids
             )
             result = ray.get(result) if hasattr(result, '__ray_terminate__') else result
             
