@@ -8,7 +8,7 @@ from agenteconomy.center.Ecocenter import EconomicCenter
 from agenteconomy.center.LaborMarket import LaborMarket
 from agenteconomy.center.ProductMarket import ProductMarket
 from agenteconomy.agent.firm import Firm, ManufactureFirm, RetailFirm
-from agenteconomy.agent.household import Household
+from agenteconomy.agent.household import Household, consumption_progress
 from agenteconomy.agent.government import Government
 from agenteconomy.agent.bank import Bank
 from agenteconomy.simulation.agent_loader import create_firms, create_households
@@ -640,6 +640,17 @@ class Simulator:
         results: List[Tuple[Household, Dict[str, Any]]] = []
         if not self.households:
             return results
+        
+        # 初始化消费进度追踪器
+        # log_interval: 每完成 10% 的家庭打印一次进度
+        log_interval = max(1, len(self.households) // 10)
+        consumption_progress.reset(
+            total=len(self.households),
+            log_interval=log_interval,
+            logger_instance=logger
+        )
+        logger.info(f"[消费进度] 开始收集 {len(self.households)} 个家庭的消费计划...")
+        
         balance_by_household: Dict[str, float] = {}
         if self.economic_center is not None:
             for hh in self.households:
@@ -683,6 +694,18 @@ class Simulator:
                 )
             )
         outputs = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 禁用进度追踪并打印最终状态
+        status = consumption_progress.get_status()
+        consumption_progress.disable()
+        logger.info(
+            f"[消费进度] 完成! "
+            f"Step0:{status['step0_done']}/{status['total']} "
+            f"Step1:{status['step1_done']}/{status['total']} "
+            f"Step2:{status['step2_done']}/{status['total']} "
+            f"Step3:{status['step3_done']}/{status['total']}"
+        )
+        
         for hh, out in zip(self.households, outputs):
             if isinstance(out, Exception):
                 logger.error(f"Household {hh.household_id} consumption failed: {out}")

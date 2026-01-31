@@ -9,12 +9,123 @@ import os
 import random
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import ray
+
+
+# =============================================================================
+# 消费进度追踪器（线程安全）
+# =============================================================================
+
+class ConsumptionProgressTracker:
+    """追踪 household 消费流程各步骤的完成进度"""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._step0_done = 0
+        self._step1_done = 0
+        self._step2_done = 0
+        self._step3_done = 0
+        self._all_done = 0
+        self._enabled = False
+        self._log_interval = 10  # 每完成 N 个家庭打印一次日志
+        self._logger = None
+    
+    def reset(self, total: int, log_interval: int = 10, logger_instance=None):
+        """重置进度追踪器"""
+        with self._lock:
+            self._total = total
+            self._step0_done = 0
+            self._step1_done = 0
+            self._step2_done = 0
+            self._step3_done = 0
+            self._all_done = 0
+            self._enabled = True
+            self._log_interval = max(1, log_interval)
+            self._logger = logger_instance
+    
+    def disable(self):
+        """禁用进度追踪"""
+        with self._lock:
+            self._enabled = False
+    
+    def _should_log(self, count: int) -> bool:
+        """检查是否应该打印日志"""
+        return count % self._log_interval == 0 or count == self._total
+    
+    def _log(self, msg: str):
+        """打印日志"""
+        if self._logger:
+            self._logger.info(msg)
+        else:
+            print(msg)
+    
+    def step0_complete(self):
+        """标记 step0 完成"""
+        with self._lock:
+            if not self._enabled:
+                return
+            self._step0_done += 1
+            if self._should_log(self._step0_done):
+                self._log(f"[消费进度] Step0(预算分配): {self._step0_done}/{self._total}")
+    
+    def step1_complete(self):
+        """标记 step1 完成"""
+        with self._lock:
+            if not self._enabled:
+                return
+            self._step1_done += 1
+            if self._should_log(self._step1_done):
+                self._log(f"[消费进度] Step1(需求分类): {self._step1_done}/{self._total}")
+    
+    def step2_complete(self):
+        """标记 step2 完成"""
+        with self._lock:
+            if not self._enabled:
+                return
+            self._step2_done += 1
+            if self._should_log(self._step2_done):
+                self._log(f"[消费进度] Step2(向量搜索): {self._step2_done}/{self._total}")
+    
+    def step3_complete(self):
+        """标记 step3 完成"""
+        with self._lock:
+            if not self._enabled:
+                return
+            self._step3_done += 1
+            if self._should_log(self._step3_done):
+                self._log(f"[消费进度] Step3(LLM决策): {self._step3_done}/{self._total}")
+    
+    def all_complete(self):
+        """标记全部完成"""
+        with self._lock:
+            if not self._enabled:
+                return
+            self._all_done += 1
+            if self._should_log(self._all_done):
+                self._log(f"[消费进度] 完成: {self._all_done}/{self._total}")
+    
+    def get_status(self) -> Dict[str, int]:
+        """获取当前进度"""
+        with self._lock:
+            return {
+                "total": self._total,
+                "step0_done": self._step0_done,
+                "step1_done": self._step1_done,
+                "step2_done": self._step2_done,
+                "step3_done": self._step3_done,
+                "all_done": self._all_done,
+            }
+
+
+# 全局进度追踪器实例
+consumption_progress = ConsumptionProgressTracker()
 
 _JOB_SKILLS_CSV = Path(__file__).resolve().parents[1] / "data" / "jobs_with_skills_abilities_IM_merged.csv"
 
@@ -1626,6 +1737,8 @@ class Household:
             elif avail_budget <= 0.0:
                 step0.budgets = {k: 0.0 for k in (step0.budgets or {}).keys()}
                 step0.total_budget = 0.0
+        consumption_progress.step0_complete()
+        
         retail_budget = float((step0.budgets or {}).get("Retail merchandise") or 0.0)
         step1 = await self.consumption_step1_needs_by_category(
             total_budget=retail_budget,
@@ -1633,12 +1746,18 @@ class Household:
             expected_income=exp_income,
             available_budget=avail_budget,
         )
+        consumption_progress.step1_complete()
+        
         step2 = await self.consumption_step2_vector_match(
             category_plans=step1.category_plans, top_k=top_k, product_market=product_market
         )
+        consumption_progress.step2_complete()
+        
         step3 = await self.consumption_step3_purchase_llm(category_bundles=step2)
+        consumption_progress.step3_complete()
         # _ = self.consumption_step4_validate(step1, step2, step3)
 
+        consumption_progress.all_complete()
         return {
             "step0": {
                 "total_budget": step0.total_budget,
