@@ -2007,10 +2007,16 @@ class Simulator:
             
             step0 = plan.get("step0", {})
             for cat, alloc in step0.items():
-                if cat in HOUSEHOLD_SERVICE_CATEGORY_TO_INDUSTRY:
-                    total_service += alloc.get("budget", 0.0)
+                # alloc 可能是 dict 或 float
+                if isinstance(alloc, dict):
+                    amount = alloc.get("budget", 0.0)
                 else:
-                    total_goods += alloc.get("budget", 0.0)
+                    amount = float(alloc) if alloc else 0.0
+                
+                if cat in HOUSEHOLD_SERVICE_CATEGORY_TO_INDUSTRY:
+                    total_service += amount
+                else:
+                    total_goods += amount
         
         logger.info(f"  🛍️  消费计划: 家庭数={len(results)}, 总预算=${total_budget:,.2f}")
         logger.info(f"      - 商品消费预算: ${total_goods:,.2f}")

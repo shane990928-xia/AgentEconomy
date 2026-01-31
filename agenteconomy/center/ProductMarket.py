@@ -11,6 +11,50 @@ from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
 import os
 
+# 制造业代码 -> 零售商代码 映射
+# 基于 IO 表的行业关系
+MANUFACTURER_TO_RETAILER = {
+    # 食品饮料相关 -> 445 Food and beverage stores
+    "311FT": "445",  # Food and beverage and tobacco products
+    "312": "445",    # Beverage and tobacco products (if separate)
+    
+    # 汽车相关 -> 441 Motor vehicle and parts dealers
+    "3361MV": "441",  # Motor vehicles
+    "3364OT": "441",  # Other transportation equipment
+    
+    # 大部分制造业 -> 452 General merchandise stores
+    "325": "452",    # Chemical products (日化、药品等)
+    "339": "452",    # Miscellaneous manufacturing
+    "315AL": "452",  # Apparel and leather
+    "326": "452",    # Plastics and rubber products
+    "335": "452",    # Electrical equipment
+    "332": "452",    # Fabricated metal products
+    "333": "452",    # Machinery
+    "337": "452",    # Furniture
+    "334": "452",    # Computer and electronic products
+    "322": "452",    # Paper products
+    "321": "452",    # Wood products
+    "327": "452",    # Nonmetallic mineral products
+    "313TT": "452",  # Textiles
+    
+    # 工业/专业产品 -> 4A0 Other retail
+    "324": "4A0",    # Petroleum and coal products
+    "331": "4A0",    # Primary metals
+    "511": "4A0",    # Publishing industries
+    "113FF": "4A0",  # Forestry, fishing
+    "111CA": "4A0",  # Crop production
+    "211": "4A0",    # Oil and gas extraction
+}
+
+DEFAULT_RETAILER_CODE = "452"  # 默认综合百货
+
+
+def get_retailer_from_manufacturer(manufacturer_code: str) -> str:
+    """根据制造商行业代码获取对应的零售商代码"""
+    if not manufacturer_code:
+        return DEFAULT_RETAILER_CODE
+    return MANUFACTURER_TO_RETAILER.get(str(manufacturer_code), DEFAULT_RETAILER_CODE)
+
 @ray.remote(num_cpus=8, max_concurrency=100)
 class ProductMarket:
     """
@@ -76,13 +120,15 @@ class ProductMarket:
         
         for _, row in products_df.iterrows():
             try:
-                # 直接使用CSV中的Retailer_Code和Manufacturer_Code
-                retailer_code = str(row['Retailer_Code']) if pd.notna(row['Retailer_Code']) else '452'
-                manufacturer_code = str(row['Manufacturer_Code']) if pd.notna(row['Manufacturer_Code']) else None
+                # 使用 Industry_fixed 作为制造商代码
+                manufacturer_code = str(row['Industry_fixed']) if pd.notna(row.get('Industry_fixed')) else None
                 
                 if not manufacturer_code:
-                    self.logger.warning(f"Skipping product {row['Uniq Id']}: no Manufacturer_Code")
+                    self.logger.warning(f"Skipping product {row['Uniq Id']}: no Industry_fixed")
                     continue
+                
+                # 根据制造商代码映射零售商代码
+                retailer_code = get_retailer_from_manufacturer(manufacturer_code)
                 
                 product = Product.create(
                     name=row['Product Name'],
@@ -98,11 +144,11 @@ class ProductMarket:
                     retailer_code=retailer_code,
                     owner_id=manufacturer_code,  # 初始拥有者为制造商
                     amount=1000,
-                    classification=str(row['Industry_fixed']) if pd.notna(row.get('Industry_fixed')) else None,
+                    classification=manufacturer_code,  # classification 也用 Industry_fixed
                     description=str(row['Description']) if pd.notna(row.get('Description')) else None,
                     brand=str(row['Brand']) if pd.notna(row.get('Brand')) else None,
                     available_stock=100,  # 初始库存
-                    category=str(row['Category']) if pd.notna(row.get('Category')) else None,
+                    category=None,  # 不再使用 Category 字段
                 )
                 self.add_product(product)
                 
