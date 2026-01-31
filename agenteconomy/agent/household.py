@@ -1550,28 +1550,43 @@ class Household:
         search_method = getattr(market, "search_by_vector", None)
         is_actor = hasattr(search_method, "remote")
 
+        # 收集所有 category 的所有 need_desc，一次性发出所有请求
+        # 优化：避免 category 之间串行等待 ray.get()
+        all_futures: List[Tuple[str, str, Any]] = []  # (cat, desc, future)
+        
+        for cp in category_plans:
+            cat = cp.category
+            need_descs = list(cp.need_descriptions or [])
+            for desc in need_descs:
+                query = f"{cat}: {desc}"
+                if is_actor:
+                    future = search_method.remote(query, top_k=int(top_k))
+                    all_futures.append((cat, desc, future))
+                else:
+                    # 非 actor 模式，直接调用（无法并发）
+                    products_raw = self._call_market_method(market, "search_by_vector", query, top_k=int(top_k))
+                    all_futures.append((cat, desc, products_raw))
+        
+        # 一次性等待所有 ray futures
+        if is_actor and all_futures:
+            futures_only = [f for _, _, f in all_futures]
+            all_results = ray.get(futures_only)
+            # 重建 all_futures 为 (cat, desc, result)
+            all_futures = [(cat, desc, result) for (cat, desc, _), result in zip(all_futures, all_results)]
+        
+        # 按 category 组织结果
+        results_by_cat: Dict[str, List[Tuple[str, List[Any]]]] = {}
+        for cat, desc, products_raw in all_futures:
+            if cat not in results_by_cat:
+                results_by_cat[cat] = []
+            results_by_cat[cat].append((desc, list(products_raw or [])))
+        
+        # 构建输出
         for cp in category_plans:
             cat = cp.category
             cat_candidates: List[Dict[str, Any]] = []
-            need_descs = list(cp.need_descriptions or [])
-
-            products_by_desc: List[Tuple[str, List[Any]]] = []
-            if is_actor:
-                futures = []
-                for desc in need_descs:
-                    query = f"{cat}: {desc}"
-                    futures.append((desc, search_method.remote(query, top_k=int(top_k))))
-                if futures:
-                    results = ray.get([fut for _, fut in futures])
-                    for (desc, _), products_raw in zip(futures, results):
-                        products_by_desc.append((desc, list(products_raw or [])))
-            else:
-                for desc in need_descs:
-                    query = f"{cat}: {desc}"
-                    products_raw = self._call_market_method(market, "search_by_vector", query, top_k=int(top_k))
-                    products_by_desc.append((desc, list(products_raw or [])))
-
-            for desc, products in products_by_desc:
+            
+            for desc, products in results_by_cat.get(cat, []):
                 for product in products:
                     product_id = getattr(product, "product_id", None)
                     if not product_id:

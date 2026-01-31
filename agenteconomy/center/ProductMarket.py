@@ -53,7 +53,9 @@ def get_retailer_from_manufacturer(manufacturer_code: str) -> str:
         return DEFAULT_RETAILER_CODE
     return MANUFACTURER_TO_RETAILER.get(str(manufacturer_code), DEFAULT_RETAILER_CODE)
 
-@ray.remote(num_cpus=8, max_concurrency=100)
+# 增大 max_concurrency 以支持大量家庭并发向量搜索
+# 400 个家庭 × 4 个 category × 3 个 need_desc ≈ 4800 个请求
+@ray.remote(num_cpus=8, max_concurrency=1000)
 class ProductMarket:
     """
     产品市场（Product Market）
