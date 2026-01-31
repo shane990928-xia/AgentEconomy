@@ -349,7 +349,7 @@ class Simulator:
         prefix = "preheat" if preheat else "month"
         path = os.path.join(record_dir, f"{prefix}_{month:04d}.json")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True)
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
 
     async def run_simulation(self):
         """Run simulation"""
@@ -507,15 +507,21 @@ class Simulator:
     async def _run_month(self, month: int):
         """Run a single month"""
         econ_month = self._econ_month(month, preheat=False)
-        logger.info(f"{'='*60}")
-        logger.info(f"🗓️  开始运行月份 {month} (经济月份 {econ_month})")
-        logger.info(f"{'='*60}")
+        
+        # 月份标题
+        title = f" 月份 {month} (经济周期 M{econ_month}) "
+        padding = (60 - len(title)) // 2
+        logger.info(f"\n{'━' * 60}")
+        logger.info(f"{'━' * padding}{title}{'━' * (60 - padding - len(title))}")
+        logger.info(f"{'━' * 60}")
         
         # 月初重置供需追踪
         self._call_actor(self.product_market, "reset_supply_demand_tracking")
         
         # ========== 劳动力市场 ==========
-        logger.info(f"\n{'─'*40}\n📋 [劳动力市场]\n{'─'*40}")
+        logger.info(f"\n┌{'─' * 38}┐")
+        logger.info(f"│ 📋 劳动力市场                        │")
+        logger.info(f"└{'─' * 38}┘")
         with self._time_block("发布岗位", month=month, preheat=False):
             await self._post_jobs(econ_month)  # 使用 econ_month 以便正确查询上月数据
         with self._time_block("招聘匹配", month=month, preheat=False):
@@ -525,13 +531,17 @@ class Simulator:
         self._log_wage_stats(wage_stats)
 
         # ========== 企业所得税（工资发放后、生产前） ==========
-        logger.info(f"\n{'─'*40}\n💰 [税收]\n{'─'*40}")
+        logger.info(f"\n┌{'─' * 38}┐")
+        logger.info(f"│ 💰 税收结算                          │")
+        logger.info(f"└{'─' * 38}┘")
         with self._time_block("企业所得税", month=month, preheat=False):
             corporate_tax_stats = self._settle_corporate_tax(econ_month)
         self._log_corporate_tax_stats(corporate_tax_stats)
 
         # ========== 商品市场 ==========
-        logger.info(f"\n{'─'*40}\n🛒 [商品市场]\n{'─'*40}")
+        logger.info(f"\n┌{'─' * 38}┐")
+        logger.info(f"│ 🛒 商品市场                          │")
+        logger.info(f"└{'─' * 38}┘")
         with self._time_block("消费决策", month=month, preheat=False):
             consumption_results = await self._collect_consumption_plans(top_k=10)
         self._log_consumption_plans(consumption_results)
@@ -564,7 +574,9 @@ class Simulator:
         self._log_service_consumption_stats(service_consumption_stats)
 
         # ========== 政府采购 ==========
-        logger.info(f"\n{'─'*40}\n🏛️  [政府采购]\n{'─'*40}")
+        logger.info(f"\n┌{'─' * 38}┐")
+        logger.info(f"│ 🏛️  政府采购                          │")
+        logger.info(f"└{'─' * 38}┘")
         with self._time_block("政府采购", month=month, preheat=False):
             government_procurement_stats = await self._execute_government_procurement(econ_month)
         self._log_government_procurement_stats(government_procurement_stats)
@@ -573,7 +585,9 @@ class Simulator:
         self._update_last_sales(econ_month, consumption_stats)
 
         # ========== 月末结算 ==========
-        logger.info(f"\n{'─'*40}\n📊 [月末结算]\n{'─'*40}")
+        logger.info(f"\n┌{'─' * 38}┐")
+        logger.info(f"│ 📊 月末结算                          │")
+        logger.info(f"└{'─' * 38}┘")
         with self._time_block("银行利息", month=month, preheat=False):
             interest_stats = await self._pay_bank_interest(econ_month)
         
@@ -1673,12 +1687,20 @@ class Simulator:
         labor_summary = self._call_actor(self.labor_market, "summary") or {}
         firm_financials = {}
         gdp_stats = {}
+        gdp_comprehensive = {}
         tax_stats = {}
         household_summary = {}
         redistribution_per_person = 0.0
         if self.economic_center is not None:
             firm_financials = self._call_actor(self.economic_center, "query_all_firms_monthly_financials", econ_month)
             gdp_stats = self._call_actor(self.economic_center, "calculate_monthly_gdp", econ_month, production_stats)
+            # 使用新的综合 GDP 计算
+            gdp_comprehensive = self._call_actor(
+                self.economic_center, "calculate_gdp_comprehensive", econ_month, production_stats, 0
+            )
+            # 缓存 GDP 结果用于增长率计算
+            if gdp_comprehensive:
+                self._call_actor(self.economic_center, "cache_gdp_result", econ_month, gdp_comprehensive)
             tax_stats = self._call_actor(self.economic_center, "get_monthly_tax_collection", econ_month)
             household_summary = self._call_actor(self.economic_center, "summarize_households_monthly", econ_month)
             redistribution_per_person = self._call_actor(
@@ -1775,10 +1797,24 @@ class Simulator:
                 "redistribution_per_person": float(redistribution_per_person or 0.0),
             },
             "macro": {
+                # 旧版 GDP 统计（保持兼容）
                 "gdp": gdp_stats or {},
                 "gdp_value": float(((gdp_stats or {}).get("gdp", {}) or {}).get("production_approach", 0.0) or 0.0),
+                # 新版综合 GDP 统计
+                "gdp_comprehensive": gdp_comprehensive or {},
+                "nominal_gdp": float((gdp_comprehensive or {}).get("nominal_gdp", 0.0) or 0.0),
+                "real_gdp": float((gdp_comprehensive or {}).get("real_gdp", 0.0) or 0.0),
+                "gdp_growth_rate": (gdp_comprehensive or {}).get("growth_rates", {}).get("nominal_gdp_growth"),
+                "real_gdp_growth_rate": (gdp_comprehensive or {}).get("growth_rates", {}).get("real_gdp_growth"),
+                # 价格指标
                 "price_index": price_index,
+                "gdp_deflator": float((gdp_comprehensive or {}).get("deflator", 1.0) or 1.0),
                 "inflation_rate": inflation_rate,
+                # 关键比率
+                "consumption_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("consumption_rate", 0.0) or 0.0),
+                "investment_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("investment_rate", 0.0) or 0.0),
+                "government_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("government_rate", 0.0) or 0.0),
+                "labor_share": float((gdp_comprehensive or {}).get("ratios", {}).get("labor_share", 0.0) or 0.0),
             },
             "details": {
                 "labor_market_raw": labor_summary,
@@ -2152,45 +2188,159 @@ class Simulator:
         logger.info(f"  💸 税收再分配: 总额=${total:,.2f}, 受益人数={recipients}, 人均=${per_person:,.2f}")
     
     def _log_month_end_summary(self, month: int) -> None:
-        """打印月末汇总"""
-        logger.info(f"\n{'─'*40}\n📈 [月末汇总]\n{'─'*40}")
+        """打印美化的月末汇总报告"""
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # 月度经济报告
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        box_width = 70
+        
+        def box_line(char: str = "═") -> str:
+            return char * box_width
+        
+        def box_title(title: str) -> str:
+            padding = (box_width - len(title) - 4) // 2
+            return f"║{'─' * padding} {title} {'─' * (box_width - padding - len(title) - 4)}║"
+        
+        def box_row(label: str, value: str, indent: int = 2) -> str:
+            content = f"{' ' * indent}{label}: {value}"
+            return f"║ {content:<{box_width - 4}} ║"
+        
+        def box_row_pair(label1: str, val1: str, label2: str, val2: str) -> str:
+            half = (box_width - 6) // 2
+            left = f"  {label1}: {val1}"
+            right = f"  {label2}: {val2}"
+            return f"║ {left:<{half}}{right:<{half}} ║"
+        
+        def box_separator() -> str:
+            return f"╟{'─' * (box_width - 2)}╢"
+        
+        def format_money(v: float) -> str:
+            if abs(v) >= 1_000_000:
+                return f"${v / 1_000_000:,.2f}M"
+            elif abs(v) >= 1_000:
+                return f"${v / 1_000:,.1f}K"
+            else:
+                return f"${v:,.2f}"
+        
+        def format_pct(v: float) -> str:
+            if v is None:
+                return "N/A"
+            return f"{v * 100:.1f}%"
+        
+        # 获取数据
         if self.economic_center is None:
             logger.info("  ⚠️  经济中心未初始化")
             return
         
         try:
+            # 获取 GDP 综合数据
+            gdp_data = self._call_actor(self.economic_center, "calculate_gdp_comprehensive", month, None, 0) or {}
+            
             # 获取税收汇总
-            tax_summary = self._call_actor(self.economic_center, "get_monthly_tax_collection", month)
-            if tax_summary:
-                logger.info(f"  📊 本月税收汇总:")
-                logger.info(f"      - 消费税(VAT): ${tax_summary.get('consume_tax', 0):,.2f}")
-                logger.info(f"      - 个人所得税: ${tax_summary.get('labor_tax', 0):,.2f}")
-                logger.info(f"      - FICA税: ${tax_summary.get('fica_tax', 0):,.2f}")
-                logger.info(f"      - 企业所得税: ${tax_summary.get('corporate_tax', 0):,.2f}")
-                logger.info(f"      - 总计: ${tax_summary.get('total_tax', 0):,.2f}")
+            tax_summary = self._call_actor(self.economic_center, "get_monthly_tax_collection", month) or {}
             
-            # 获取主要账户余额
-            gov_balance = self._call_actor(self.economic_center, "query_balance", "gov_main_simulation")
-            logger.info(f"  💰 政府余额: ${gov_balance:,.2f}")
+            # 获取账户余额
+            gov_balance = self._call_actor(self.economic_center, "query_balance", "gov_main_simulation") or 0.0
             
-            # 家庭余额汇总
+            # 家庭和企业余额
+            total_hh_balance = 0.0
             if self.households:
-                total_hh_balance = 0.0
                 for hh in self.households:
                     bal = self._call_actor(self.economic_center, "query_balance", hh.household_id)
                     total_hh_balance += float(bal or 0)
-                avg_hh_balance = total_hh_balance / len(self.households)
-                logger.info(f"  👨‍👩‍👧‍👦 家庭余额: 总计=${total_hh_balance:,.2f}, 平均=${avg_hh_balance:,.2f}")
+            avg_hh_balance = total_hh_balance / len(self.households) if self.households else 0
             
-            # 企业余额汇总
+            total_firm_balance = 0.0
             if self.firms:
-                total_firm_balance = 0.0
                 for firm in self.firms:
                     bal = self._call_actor(self.economic_center, "query_balance", firm.firm_id)
                     total_firm_balance += float(bal or 0)
-                avg_firm_balance = total_firm_balance / len(self.firms) if self.firms else 0
-                logger.info(f"  🏢 企业余额: 总计=${total_firm_balance:,.2f}, 平均=${avg_firm_balance:,.2f}")
+            avg_firm_balance = total_firm_balance / len(self.firms) if self.firms else 0
+            
+            # 劳动力市场数据
+            labor_summary = self._call_actor(self.labor_market, "summary") or {}
+            total_labor = float(labor_summary.get("total_labor_hours", 0.0) or 0.0)
+            employed = float(labor_summary.get("total_matched_jobs", 0.0) or 0.0)
+            employment_rate = employed / total_labor if total_labor > 0 else 0.0
+            
+            # 提取 GDP 分项
+            nominal_gdp = float(gdp_data.get("nominal_gdp", 0.0) or 0.0)
+            real_gdp = float(gdp_data.get("real_gdp", 0.0) or 0.0)
+            gdp_growth = gdp_data.get("growth_rates", {}).get("nominal_gdp_growth")
+            
+            exp_comp = gdp_data.get("expenditure_components", {})
+            consumption = float(exp_comp.get("consumption", {}).get("total", 0.0) or 0.0)
+            gov_spending = float(exp_comp.get("government", {}).get("total", 0.0) or 0.0)
+            investment = float(exp_comp.get("investment", {}).get("inventory_investment", 0.0) or 0.0)
+            
+            income_comp = gdp_data.get("income_components", {})
+            total_wages = float(income_comp.get("compensation_of_employees", {}).get("total", 0.0) or 0.0)
+            operating_surplus = float(income_comp.get("operating_surplus", 0.0) or 0.0)
+            
+            ratios = gdp_data.get("ratios", {})
+            consumption_rate = ratios.get("consumption_rate", 0)
+            labor_share = ratios.get("labor_share", 0)
+            
+            # 税收数据
+            total_tax = float(tax_summary.get("total_tax", 0.0) or 0.0)
+            vat = float(tax_summary.get("consume_tax", 0.0) or 0.0)
+            labor_tax = float(tax_summary.get("labor_tax", 0.0) or 0.0)
+            corp_tax = float(tax_summary.get("corporate_tax", 0.0) or 0.0)
+            
+            # 构建报告
+            lines = []
+            lines.append("")
+            lines.append(f"╔{box_line()}╗")
+            lines.append(f"║{' ' * ((box_width - 20) // 2)}📊 月度经济报告 (M{month}){' ' * ((box_width - 21) // 2)}║")
+            lines.append(f"╠{box_line()}╣")
+            
+            # GDP 概览
+            lines.append(box_title("GDP 概览"))
+            lines.append(box_row("名义 GDP", format_money(nominal_gdp)))
+            lines.append(box_row("实际 GDP", format_money(real_gdp)))
+            lines.append(box_row("GDP 增长率", format_pct(gdp_growth) if gdp_growth else "首月"))
+            lines.append(box_separator())
+            
+            # 支出分解
+            lines.append(box_title("支出法分解 (C + G + I)"))
+            lines.append(box_row("消费 (C)", f"{format_money(consumption)} ({format_pct(consumption_rate)})"))
+            lines.append(box_row("政府 (G)", format_money(gov_spending)))
+            lines.append(box_row("投资 (I)", format_money(investment)))
+            lines.append(box_separator())
+            
+            # 收入分配
+            lines.append(box_title("收入分配"))
+            lines.append(box_row("劳动报酬", f"{format_money(total_wages)} ({format_pct(labor_share)})"))
+            lines.append(box_row("营业盈余", format_money(operating_surplus)))
+            lines.append(box_separator())
+            
+            # 税收
+            lines.append(box_title("税收"))
+            lines.append(box_row_pair("总税收", format_money(total_tax), "VAT", format_money(vat)))
+            lines.append(box_row_pair("个人所得税", format_money(labor_tax), "企业所得税", format_money(corp_tax)))
+            lines.append(box_separator())
+            
+            # 就业
+            lines.append(box_title("劳动力市场"))
+            lines.append(box_row_pair("就业率", format_pct(employment_rate), "就业人数", f"{int(employed):,}"))
+            lines.append(box_separator())
+            
+            # 账户余额
+            lines.append(box_title("账户余额"))
+            lines.append(box_row("政府", format_money(gov_balance)))
+            lines.append(box_row_pair("家庭总计", format_money(total_hh_balance), "家庭平均", format_money(avg_hh_balance)))
+            lines.append(box_row_pair("企业总计", format_money(total_firm_balance), "企业平均", format_money(avg_firm_balance)))
+            
+            lines.append(f"╚{box_line()}╝")
+            lines.append("")
+            
+            # 输出报告
+            for line in lines:
+                logger.info(line)
                 
         except Exception as e:
-            logger.error(f"  ❌ 获取月末汇总失败: {e}")
+            logger.error(f"  ❌ 生成月度报告失败: {e}")
+            import traceback
+            traceback.print_exc()
