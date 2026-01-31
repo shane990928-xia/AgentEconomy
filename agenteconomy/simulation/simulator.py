@@ -8,7 +8,7 @@ from agenteconomy.center.Ecocenter import EconomicCenter
 from agenteconomy.center.LaborMarket import LaborMarket
 from agenteconomy.center.ProductMarket import ProductMarket
 from agenteconomy.agent.firm import Firm, ManufactureFirm, RetailFirm
-from agenteconomy.agent.household import Household, consumption_progress
+from agenteconomy.agent.household import Household, consumption_progress, set_llm_max_concurrency
 from agenteconomy.agent.government import Government
 from agenteconomy.agent.bank import Bank
 from agenteconomy.simulation.agent_loader import create_firms, create_households

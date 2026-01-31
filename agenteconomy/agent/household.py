@@ -1662,15 +1662,15 @@ class Household:
     ) -> BudgetedPurchasePlan:
         """
         Step3:
-        Call LLM once per category. Each call chooses product_ids from that category's candidate list
+        Call LLM once per category IN PARALLEL. Each call chooses product_ids from that category's candidate list
         and allocates per-product budgets. Then we merge all categories into one purchase plan.
         """
         purchases: List[BudgetedPurchase] = []
         notes: List[str] = []
         raw_map: Dict[str, str] = {}
 
-        # Deterministic order for easier debugging
-        for cat in sorted(category_bundles.keys()):
+        # 并发调用所有品类的 LLM（而不是串行）
+        async def process_category(cat: str) -> Tuple[str, str, Any]:
             bundle = category_bundles.get(cat) or {}
             cat_budget = float(bundle.get("budget_amount") or 0.0)
             need_descs = list(bundle.get("need_descriptions") or [])
@@ -1685,8 +1685,20 @@ class Household:
                 candidates=json.dumps(candidates, ensure_ascii=False),
             )
             raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
-            raw_map[cat] = raw
             parsed = self._json_loads_loose(raw)
+            return (cat, raw, parsed, cat_budget)
+        
+        # 并发执行所有品类
+        sorted_cats = sorted(category_bundles.keys())
+        results = await asyncio.gather(*[process_category(cat) for cat in sorted_cats], return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"[Step3] {self.household_id} 品类处理异常: {result}")
+                continue
+            
+            cat, raw, parsed, cat_budget = result
+            raw_map[cat] = raw
             notes.append(f"{cat}: {str(parsed.get('note') or '').strip()}")
             recs = list(parsed.get("purchases") or [])
             shares: List[float] = []
