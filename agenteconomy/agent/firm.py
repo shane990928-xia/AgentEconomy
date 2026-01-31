@@ -1097,7 +1097,18 @@ class ManufactureFirm(Firm):
                 for sku_id, quantity in production_plan.items():
                     ray.get(self.product_market.update_stock.remote(sku_id, quantity))
             
-            # 9. 记录生产历史
+            # 9. 根据实际成本更新价格
+            if update_inventory and self.product_market is not None and total_quantity > 0:
+                avg_unit_cost = cost_breakdown['total_cost'] / total_quantity
+                # 批量更新该行业所有产品的价格
+                ray.get(self.product_market.batch_update_prices_by_industry.remote(
+                    manufacturer_code=self.industry,
+                    avg_unit_cost=avg_unit_cost,
+                    manufacturer_margin=0.15,  # 制造商利润率15%
+                    retail_margin=0.25         # 零售商利润率25%
+                ))
+            
+            # 10. 记录生产历史
             production_record = {
                 'period': period,
                 'production_plan': production_plan.copy(),
@@ -1106,7 +1117,8 @@ class ManufactureFirm(Firm):
                 'unit_costs': unit_costs.copy(),
                 'cost_breakdown': cost_breakdown.copy(),
                 'intermediate_items': len(intermediate_result['items']),
-                'abstract_resources': len(abstract_result)
+                'abstract_resources': len(abstract_result),
+                'avg_unit_cost': cost_breakdown['total_cost'] / total_quantity if total_quantity > 0 else 0
             }
             self.production_history.append(production_record)
             

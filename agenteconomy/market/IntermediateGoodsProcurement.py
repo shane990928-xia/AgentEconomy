@@ -173,7 +173,14 @@ class IntermediateGoodsProcurement:
                 purchased_value = total_cost
                 units_purchased += purchased_value / self.get_industry_average_price(supplier_industry)
                 
-                # 更新库存
+                # 更新ProductMarket中的库存（同步到Ray Actor）
+                try:
+                    self._call_market_method('update_stock', sku.product_id, -actual_quantity)
+                except Exception as e:
+                    # 如果同步失败，仍然继续（本地对象已更新）
+                    pass
+                
+                # 同时更新本地对象以保持一致性
                 sku.available_stock -= actual_quantity
             
             # 移除已尝试的SKU

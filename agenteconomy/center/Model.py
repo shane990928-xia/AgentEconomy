@@ -268,6 +268,7 @@ class Product(Asset):
     
     # === Product Attributes ===
     brand: Optional[str] = Field(None, description="Brand of the product")
+    category: Optional[str] = Field(None, description="Product category (e.g., 'Food | Beverages')")
     attributes: Optional[Dict[str, Any]] = Field(default=None, description="Raw attribute payload")
     is_food: Optional[bool] = Field(default=None, description="Whether the product is food")
     nutrition_supply: Optional[Dict[str, float]] = Field(default=None, description="Nutrition data for food")
@@ -311,7 +312,8 @@ class Product(Asset):
         nutrition_supply: Optional[Dict[str, float]] = None,
         satisfaction_attributes: Optional[Dict[str, Any]] = None,
         duration_months: Optional[int] = None,
-        unit_cost: Optional[float] = None
+        unit_cost: Optional[float] = None,
+        category: Optional[str] = None
     ) -> 'Product':
         """
         Create a new product with supply chain pricing.
@@ -397,7 +399,8 @@ class Product(Asset):
             is_food=is_food,
             nutrition_supply=nutrition_supply,
             satisfaction_attributes=satisfaction_attributes,
-            duration_months=duration_months
+            duration_months=duration_months,
+            category=category
         )
 
 

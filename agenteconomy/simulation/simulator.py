@@ -23,6 +23,24 @@ import time
 from contextlib import contextmanager
 import ray
 
+# 家庭服务消费类别 → 行业代码映射
+# 用于将 step0 的预算分配类别映射到 AbstractResourceMarket 的行业代码
+# 格式: {类别: [(行业代码, 权重), ...]}
+# 权重基于 IO 表中各行业占该类别总消费的比例（近似值）
+HOUSEHOLD_SERVICE_CATEGORY_TO_INDUSTRY = {
+    # Housing: HS 是主要住房支出，ORE 是其他房产相关（如物业管理）
+    "housing": [("HS", 0.85), ("ORE", 0.15)],
+    # Healthcare: 门诊最多，医院次之
+    "healthcare": [("621", 0.45), ("622", 0.35), ("623", 0.12), ("624", 0.08)],
+    # Transportation: 卡车运输（网购配送）、航空、公交
+    "transportation": [("484", 0.40), ("481", 0.25), ("485", 0.25), ("487OS", 0.10)],
+    # Utilities: 只有电力/燃气/水
+    "utilities": [("22", 1.0)],
+    # Insurance: 只有保险
+    "insurance": [("524", 1.0)],
+}
+
+
 class Simulator:
     def __init__(self, config:SimulationConfig):
         """
@@ -43,6 +61,7 @@ class Simulator:
         self.bank: Optional[Bank] = None
         self.manufacturers_by_industry: Dict[str, ManufactureFirm] = {}
         self.retailers_by_industry: Dict[str, RetailFirm] = {}
+        self.abstract_resource_market: Optional[AbstractResourceMarket] = None
         self._firm_by_id: Dict[str, Firm] = {}
         self._household_by_id: Dict[str, Household] = {}
         
@@ -87,6 +106,7 @@ class Simulator:
                 )
 
             self.government.initialize()
+            self.government.set_labor_market(self.labor_market)  # 设置劳动力市场引用
             
             # Initialize bank
             self.bank = Bank(
@@ -136,15 +156,21 @@ class Simulator:
         # 初始化抽象资源市场
         # 传入 EconomicCenter 以记录所有交易
         # 传入政府 ID 以将政府服务费路由到政府账户
-        abstract_resource_market = AbstractResourceMarket(
+        self.abstract_resource_market = AbstractResourceMarket(
             economic_center=self.economic_center,
             government_id=self.government.government_id
         )
+        
+        # 初始化抽象资源的基准价格和供给能力
+        from agenteconomy.market.initialize_resources import initialize_abstract_resource_market
+        economy_scale = float(getattr(self.config, "economy_scale", 10_000_000) or 10_000_000)
+        initialize_abstract_resource_market(self.abstract_resource_market, economy_scale)
+        
         self.firms = create_firms(
             economic_center=self.economic_center, 
             labor_market=self.labor_market, 
             product_market=self.product_market, 
-            abstract_resource_market=abstract_resource_market
+            abstract_resource_market=self.abstract_resource_market
         )
         self._firm_by_id = {f.firm_id: f for f in (self.firms or [])}
         self._index_firms()
@@ -152,6 +178,10 @@ class Simulator:
             for firm in self.firms or []:
                 self._call_actor(self.economic_center, "register_id", firm.firm_id, "firm")
                 self._call_actor(self.economic_center, "init_agent_ledger", firm.firm_id, 0.0)
+        
+        # 预注册所有制造商到中间品市场价格注册表
+        # 这样在生产时可以正确解析receiver_id
+        self._register_manufacturers_for_intermediate_goods()
 
     def _call_actor(self, actor, method_name: str, *args, **kwargs):
         if actor is None:
@@ -173,6 +203,28 @@ class Simulator:
                 self.manufacturers_by_industry[firm.industry] = firm
             elif isinstance(firm, RetailFirm):
                 self.retailers_by_industry[firm.industry] = firm
+    
+    def _register_manufacturers_for_intermediate_goods(self):
+        """
+        预注册所有制造商到中间品市场价格注册表
+        这样在中间品采购时可以正确解析receiver_id
+        """
+        if self.economic_center is None:
+            return
+        
+        registered_count = 0
+        for industry_code, firm in self.manufacturers_by_industry.items():
+            self._call_actor(
+                self.economic_center, 
+                "register_market_price", 
+                "intermediate_goods", 
+                industry_code, 
+                firm.firm_id, 
+                1.0
+            )
+            registered_count += 1
+        
+        logger.info(f"Pre-registered {registered_count} manufacturers for intermediate goods market")
 
     def _debug_enabled(self) -> bool:
         return bool(getattr(self.config, "debug_logging", True))
@@ -311,12 +363,98 @@ class Simulator:
             await self._run_month(month)
             
     async def _run_preheat(self, months: int):
+        """
+        两阶段预热：
+        Phase 0: 需求发现 - 关闭活跃过滤，家庭搜索全部SKU，收集被需求的SKU，初始化企业资金
+        Phase 1+: 正常预热 - 激活被需求SKU，开启过滤，只在活跃SKU中搜索
+        """
+        # ====== Phase 0: 需求发现 ======
+        logger.info("Preheat Phase 0: Demand Discovery (no active filter)...")
+        
+        # 确保关闭活跃过滤
+        if self.product_market is not None:
+            self._call_actor(self.product_market, "set_active_filter_mode", False)
+        
+        # 收集家庭消费需求（搜索全部30K SKU）
+        # 家庭有初始储蓄(CSV中的ER85692字段)，所以可以直接使用
+        with self._time_block("Phase0-需求发现", month=0, preheat=True):
+            consumption_results = await self._collect_consumption_plans(top_k=10)
+            demand_by_product, _, snapshot_cache, demand_stats = self._build_orders(consumption_results)
+        
+        # 激活被需求的SKU
+        demanded_sku_ids = list(demand_by_product.keys())
+        if demanded_sku_ids and self.product_market is not None:
+            activated_count = self._call_actor(self.product_market, "activate_skus", demanded_sku_ids)
+            logger.info(f"Preheat Phase 0: Activated {activated_count} demanded SKUs")
+        else:
+            logger.warning("Preheat Phase 0: No demanded SKUs found! Check household savings.")
+        
+        # 根据需求初始化企业资金
+        # 企业需要初始资金来支付第一个月的工资
+        with self._time_block("Phase0-初始化企业资金", month=0, preheat=True):
+            self._initialize_firm_capital_from_demand(demand_stats)
+        
+        # 开启活跃过滤
+        if self.product_market is not None:
+            self._call_actor(self.product_market, "set_active_filter_mode", True)
+        
+        logger.info(f"Preheat Phase 0 complete. Active SKUs: {len(demanded_sku_ids)}")
+        
+        # ====== Phase 1+: 正常预热月 ======
         for idx in range(1, int(months) + 1):
             logger.info(f"Preheat month {idx}...")
             await self._run_warmup_month(idx)
+    
+    def _initialize_firm_capital_from_demand(self, demand_stats: Dict[str, Any]):
+        """
+        根据Phase 0发现的需求，为企业分配初始资金
+        
+        逻辑：企业初始cash = 预期月收入 * 系数（用于支付首月工资）
+        系数默认为 1.5（足够支付 1.5 个月的运营成本）
+        """
+        capital_multiplier = float(getattr(self.config, "firm_initial_capital_multiplier", 1.5) or 1.5)
+        
+        # 从demand_stats中获取各企业的预期收入
+        demand_by_mfg = demand_stats.get("by_mfg_firm", {})
+        demand_by_retail = demand_stats.get("by_retail_firm", {})
+        
+        total_initialized = 0
+        
+        # 为制造商分配初始资金
+        for firm_id, stats in demand_by_mfg.items():
+            expected_revenue = float(stats.get("value", 0.0))
+            initial_cash = expected_revenue * capital_multiplier
+            
+            firm = self._firm_by_id.get(firm_id)
+            if firm is not None and initial_cash > 0:
+                firm.cash = initial_cash
+                total_initialized += 1
+                logger.debug(f"Initialized {firm_id} cash: {initial_cash:.2f} (from demand {expected_revenue:.2f})")
+        
+        # 为零售商分配初始资金
+        for firm_id, stats in demand_by_retail.items():
+            expected_revenue = float(stats.get("value", 0.0))
+            initial_cash = expected_revenue * capital_multiplier
+            
+            firm = self._firm_by_id.get(firm_id)
+            if firm is not None and initial_cash > 0:
+                firm.cash = initial_cash
+                total_initialized += 1
+                logger.debug(f"Initialized {firm_id} cash: {initial_cash:.2f} (from demand {expected_revenue:.2f})")
+        
+        # 为没有需求的企业设置最低资金（用于基本运营）
+        min_cash = float(getattr(self.config, "firm_min_initial_cash", 1000.0) or 1000.0)
+        for firm in (self.firms or []):
+            if firm.cash <= 0:
+                firm.cash = min_cash
+                total_initialized += 1
+        
+        logger.info(f"Phase 0: Initialized capital for {total_initialized} firms")
 
     async def _run_warmup_month(self, month: int):
         econ_month = self._econ_month(month, preheat=True)
+        
+        # ========== 商品市场 ==========
         with self._time_block("消费决策", month=month, preheat=True):
             consumption_results = await self._collect_consumption_plans(top_k=10)
         with self._time_block("构建订单", month=month, preheat=True):
@@ -324,15 +462,36 @@ class Simulator:
         with self._time_block("生产补货", month=month, preheat=True):
             production_demand = self._last_sales_by_product or demand_by_product
             production_stats = self._ensure_production(production_demand, snapshot_cache, econ_month, record_transactions=True)
+        with self._time_block("零售商进货", month=month, preheat=True):
+            procurement_stats = self._retailer_procurement(demand_by_product, snapshot_cache, econ_month, record_transactions=True)
         with self._time_block("执行购买", month=month, preheat=True):
             consumption_stats = self._execute_orders(orders_by_household, snapshot_cache, econ_month, record_transactions=True)
+        with self._time_block("服务消费", month=month, preheat=True):
+            service_consumption_stats = self._execute_service_consumption(consumption_results, econ_month)
+        
+        # ========== 政府采购 ==========
+        with self._time_block("政府采购", month=month, preheat=True):
+            government_procurement_stats = await self._execute_government_procurement(econ_month)
+        
+        # 更新销售记录（在政府采购之后，以便包含政府采购数据）
         self._update_last_sales(econ_month, consumption_stats)
+        
+        # ========== 劳动力市场 ==========
         with self._time_block("发布岗位", month=month, preheat=True):
             await self._post_jobs(month)
         with self._time_block("招聘匹配", month=month, preheat=True):
             await self._match_jobs(month, use_llm=False)
         with self._time_block("发放工资", month=month, preheat=True):
             wage_stats = self._pay_wages(econ_month, record_transactions=True)
+        
+        # ========== 月末结算 ==========
+        with self._time_block("企业所得税", month=month, preheat=True):
+            self._settle_corporate_tax(econ_month)
+        with self._time_block("银行利息", month=month, preheat=True):
+            await self._pay_bank_interest(econ_month)
+        with self._time_block("税收再分配", month=month, preheat=True):
+            await self._redistribute_taxes(econ_month)
+        
         with self._time_block("月度汇总", month=month, preheat=True):
             self._record_month_summary(
                 month=month,
@@ -342,29 +501,86 @@ class Simulator:
                 production_stats=production_stats,
                 consumption_stats=consumption_stats,
                 wage_stats=wage_stats,
+                procurement_stats=procurement_stats,
             )
 
     async def _run_month(self, month: int):
         """Run a single month"""
         econ_month = self._econ_month(month, preheat=False)
-        logger.info(f"Running month {month}...")
+        logger.info(f"{'='*60}")
+        logger.info(f"🗓️  开始运行月份 {month} (经济月份 {econ_month})")
+        logger.info(f"{'='*60}")
+        
+        # 月初重置供需追踪
+        self._call_actor(self.product_market, "reset_supply_demand_tracking")
+        
+        # ========== 劳动力市场 ==========
+        logger.info(f"\n{'─'*40}\n📋 [劳动力市场]\n{'─'*40}")
         with self._time_block("发布岗位", month=month, preheat=False):
             await self._post_jobs(month)
         with self._time_block("招聘匹配", month=month, preheat=False):
             await self._match_jobs(month, use_llm=False)
         with self._time_block("发放工资", month=month, preheat=False):
             wage_stats = self._pay_wages(econ_month, record_transactions=True)
+        self._log_wage_stats(wage_stats)
 
+        # ========== 企业所得税（工资发放后、生产前） ==========
+        logger.info(f"\n{'─'*40}\n💰 [税收]\n{'─'*40}")
+        with self._time_block("企业所得税", month=month, preheat=False):
+            corporate_tax_stats = self._settle_corporate_tax(econ_month)
+        self._log_corporate_tax_stats(corporate_tax_stats)
+
+        # ========== 商品市场 ==========
+        logger.info(f"\n{'─'*40}\n🛒 [商品市场]\n{'─'*40}")
         with self._time_block("消费决策", month=month, preheat=False):
             consumption_results = await self._collect_consumption_plans(top_k=10)
+        self._log_consumption_plans(consumption_results)
+        
         with self._time_block("构建订单", month=month, preheat=False):
             demand_by_product, orders_by_household, snapshot_cache, demand_stats = self._build_orders(consumption_results)
+        self._log_demand_stats(demand_stats)
+        
+        # 记录需求到ProductMarket
+        self._record_demand_to_market(demand_by_product, snapshot_cache)
+        
         with self._time_block("生产补货", month=month, preheat=False):
             production_demand = self._last_sales_by_product or demand_by_product
             production_stats = self._ensure_production(production_demand, snapshot_cache, econ_month, record_transactions=True)
+        self._log_production_stats(production_stats)
+        
+        # 记录供给并根据供需调整价格
+        self._record_supply_and_adjust_prices(production_stats)
+        
+        with self._time_block("零售商进货", month=month, preheat=False):
+            procurement_stats = self._retailer_procurement(demand_by_product, snapshot_cache, econ_month, record_transactions=True)
+        self._log_procurement_stats(procurement_stats)
+        
         with self._time_block("执行购买", month=month, preheat=False):
             consumption_stats = self._execute_orders(orders_by_household, snapshot_cache, econ_month, record_transactions=True)
+        self._log_consumption_stats(consumption_stats)
+        
+        with self._time_block("服务消费", month=month, preheat=False):
+            service_consumption_stats = self._execute_service_consumption(consumption_results, econ_month)
+        self._log_service_consumption_stats(service_consumption_stats)
+
+        # ========== 政府采购 ==========
+        logger.info(f"\n{'─'*40}\n🏛️  [政府采购]\n{'─'*40}")
+        with self._time_block("政府采购", month=month, preheat=False):
+            government_procurement_stats = await self._execute_government_procurement(econ_month)
+        self._log_government_procurement_stats(government_procurement_stats)
+        
+        # 更新销售记录（在政府采购之后，以便包含政府采购数据）
         self._update_last_sales(econ_month, consumption_stats)
+
+        # ========== 月末结算 ==========
+        logger.info(f"\n{'─'*40}\n📊 [月末结算]\n{'─'*40}")
+        with self._time_block("银行利息", month=month, preheat=False):
+            interest_stats = await self._pay_bank_interest(econ_month)
+        
+        with self._time_block("税收再分配", month=month, preheat=False):
+            redistribution_stats = await self._redistribute_taxes(econ_month)
+        self._log_redistribution_stats(redistribution_stats)
+
         if self._debug_enabled() and self.economic_center is not None:
             self._log_firm_financials(econ_month)
         with self._time_block("月度汇总", month=month, preheat=False):
@@ -376,7 +592,11 @@ class Simulator:
                 production_stats=production_stats,
                 consumption_stats=consumption_stats,
                 wage_stats=wage_stats,
+                procurement_stats=procurement_stats,
             )
+        
+        # 月末余额汇总
+        self._log_month_end_summary(econ_month)
 
     async def _collect_consumption_plans(self, top_k: int = 10) -> List[Tuple[Household, Dict[str, Any]]]:
         results: List[Tuple[Household, Dict[str, Any]]] = []
@@ -812,8 +1032,8 @@ class Simulator:
             production_stats["total_qty"] += firm_qty
             production_stats["total_value"] += firm_value
             if record_transactions:
-                if self.economic_center is not None:
-                    self._call_actor(self.economic_center, "register_market_price", "intermediate_goods", firm.industry, firm.firm_id, 1.0)
+                # 注意：制造商已在初始化时预注册到中间品市场
+                # 不再需要每次生产时重复注册
                 firm.produce(
                     production_plan=plan,
                     sku_base_prices=sku_base_prices,
@@ -847,14 +1067,301 @@ class Simulator:
             }
         )
 
+    def _retailer_procurement(
+        self,
+        demand_by_product: Dict[str, float],
+        snapshot_cache: Dict[str, Optional[Dict[str, Any]]],
+        month: int,
+        record_transactions: bool
+    ) -> Dict[str, Any]:
+        """
+        零售商进货阶段：根据预测需求，零售商从制造商批发采购商品
+        
+        流程：
+        1. 按零售商汇总需要进货的产品
+        2. 零售商支付批发价（manufacturer_price）给制造商
+        3. 更新零售商库存记录
+        
+        Args:
+            demand_by_product: 各产品的需求量
+            snapshot_cache: 产品快照缓存
+            month: 当前月份
+            record_transactions: 是否记录交易
+            
+        Returns:
+            进货统计 {total_qty, total_value, by_retailer, by_manufacturer}
+        """
+        # 按零售商汇总进货需求: {retailer_code: {product_id: qty}}
+        procurement_by_retailer: Dict[str, Dict[str, int]] = defaultdict(dict)
+        
+        for product_id, demand_qty in (demand_by_product or {}).items():
+            if demand_qty <= 0:
+                continue
+            snapshot = self._get_product_snapshot_cached(product_id, snapshot_cache)
+            if not snapshot:
+                continue
+            
+            retailer_code = snapshot.get("retailer_code")
+            if not retailer_code or retailer_code not in self.retailers_by_industry:
+                continue
+            
+            # 检查库存是否充足（制造商已生产）
+            available = int(snapshot.get("available_stock") or 0)
+            qty_to_procure = min(int(demand_qty), available)
+            if qty_to_procure <= 0:
+                continue
+            
+            procurement_by_retailer[retailer_code][product_id] = qty_to_procure
+        
+        # 统计数据
+        procurement_stats = {
+            "total_qty": 0.0,
+            "total_value": 0.0,
+            "by_retailer": {},
+            "by_manufacturer": defaultdict(lambda: {"qty": 0.0, "value": 0.0}),
+        }
+        
+        # 执行进货
+        for retailer_code, products in procurement_by_retailer.items():
+            retailer = self.retailers_by_industry.get(retailer_code)
+            if retailer is None:
+                continue
+            
+            retailer_qty = 0.0
+            retailer_value = 0.0
+            
+            for product_id, qty in products.items():
+                snapshot = self._get_product_snapshot_cached(product_id, snapshot_cache)
+                if not snapshot:
+                    continue
+                
+                # 批发价 = manufacturer_price
+                wholesale_price = float(
+                    snapshot.get("base_manufacturer_price")
+                    or snapshot.get("manufacturer_price")
+                    or 0.0
+                )
+                if wholesale_price <= 0:
+                    continue
+                
+                manufacturer_code = snapshot.get("manufacturer_code")
+                manufacturer = self.manufacturers_by_industry.get(manufacturer_code)
+                if manufacturer is None:
+                    continue
+                
+                amount = wholesale_price * qty
+                
+                if record_transactions and self.economic_center is not None:
+                    # 零售商支付给制造商
+                    tx_id = self._call_actor(
+                        self.economic_center,
+                        "process_wholesale",
+                        month,
+                        retailer.firm_id,
+                        manufacturer.firm_id,
+                        amount,
+                        qty,
+                        product_id,
+                        snapshot.get("name"),
+                        wholesale_price,
+                    )
+                    if tx_id:
+                        retailer_qty += qty
+                        retailer_value += amount
+                        procurement_stats["by_manufacturer"][manufacturer.firm_id]["qty"] += qty
+                        procurement_stats["by_manufacturer"][manufacturer.firm_id]["value"] += amount
+                else:
+                    # 不记录交易模式：直接转移资金
+                    if retailer.cash >= amount:
+                        retailer.cash -= amount
+                        manufacturer.cash += amount
+                        retailer_qty += qty
+                        retailer_value += amount
+                        procurement_stats["by_manufacturer"][manufacturer.firm_id]["qty"] += qty
+                        procurement_stats["by_manufacturer"][manufacturer.firm_id]["value"] += amount
+            
+            if retailer_qty > 0:
+                procurement_stats["by_retailer"][retailer.firm_id] = {
+                    "qty": retailer_qty,
+                    "value": retailer_value,
+                }
+                procurement_stats["total_qty"] += retailer_qty
+                procurement_stats["total_value"] += retailer_value
+        
+        if self._debug_enabled():
+            logger.info(
+                f"[零售商进货] 总数量={procurement_stats['total_qty']:.0f}, "
+                f"总金额={procurement_stats['total_value']:.2f}, "
+                f"零售商数={len(procurement_stats['by_retailer'])}"
+            )
+        
+        return procurement_stats
+
     def _resolve_seller_firm(self, order: Dict[str, Any]) -> Optional[Firm]:
+        """
+        解析订单的卖家企业
+        
+        在新的流程中，零售商是主要销售渠道：
+        1. 优先返回零售商（如果有）
+        2. 只有在没有零售商信息时才回退到制造商（用于直销场景）
+        
+        注意：制造商在零售商进货阶段已经获得收入，
+        所以家庭购买时应该付款给零售商
+        """
         retailer_code = order.get("retailer_code")
         if retailer_code and retailer_code in self.retailers_by_industry:
             return self.retailers_by_industry[retailer_code]
-        manufacturer_code = order.get("manufacturer_code")
-        if manufacturer_code and manufacturer_code in self.manufacturers_by_industry:
-            return self.manufacturers_by_industry[manufacturer_code]
+        
+        # 只有在没有 retailer_code 的情况下，才回退到制造商（直销）
+        # 如果有 retailer_code 但找不到对应零售商，不应回退到制造商
+        if not retailer_code:
+            manufacturer_code = order.get("manufacturer_code")
+            if manufacturer_code and manufacturer_code in self.manufacturers_by_industry:
+                return self.manufacturers_by_industry[manufacturer_code]
+        
         return None
+
+    def _execute_service_consumption(
+        self,
+        consumption_results: List[Tuple[Household, Dict[str, Any]]],
+        month: int,
+    ) -> Dict[str, Any]:
+        """
+        执行家庭服务类消费（housing, healthcare, utilities 等）
+        
+        将 step0 中分配的服务类预算通过 AbstractResourceMarket 转化为实际消费，
+        资金流向对应的 ServiceFirm 或 Government。
+        
+        Args:
+            consumption_results: [(Household, consume_v2 输出), ...]
+            month: 当前经济月
+            
+        Returns:
+            {
+                "total_service_consumption": float,
+                "by_category": {category: total_amount},
+                "by_industry": {industry_code: total_amount},
+                "household_count": int
+            }
+        """
+        if self.abstract_resource_market is None:
+            logger.warning("AbstractResourceMarket 未初始化，跳过服务消费")
+            return {"total_service_consumption": 0.0, "by_category": {}, "by_industry": {}, "household_count": 0}
+        
+        total_consumption = 0.0
+        by_category: Dict[str, float] = defaultdict(float)
+        by_industry: Dict[str, float] = defaultdict(float)
+        household_count = 0
+        
+        for hh, out in consumption_results:
+            step0 = out.get("step0", {}) if isinstance(out, dict) else {}
+            budgets = step0.get("budgets", {}) if isinstance(step0, dict) else {}
+            
+            has_service_consumption = False
+            
+            # 遍历服务类别
+            for category, industry_weights in HOUSEHOLD_SERVICE_CATEGORY_TO_INDUSTRY.items():
+                category_budget = float(budgets.get(category) or 0.0)
+                if category_budget <= 0:
+                    continue
+                
+                # 按权重分配预算到各行业
+                for industry_code, weight in industry_weights:
+                    industry_budget = category_budget * weight
+                    if industry_budget <= 0:
+                        continue
+                    
+                    # 检查该行业是否在 AbstractResourceMarket 中注册
+                    if industry_code not in self.abstract_resource_market.resources:
+                        logger.debug(f"行业 {industry_code} 未在 AbstractResourceMarket 注册，跳过")
+                        continue
+                    
+                    try:
+                        # 使用 purchase_by_budget 执行消费
+                        transaction = self.abstract_resource_market.purchase_by_budget(
+                            industry_code=industry_code,
+                            buyer_id=hh.household_id,
+                            budget=industry_budget,
+                            period=month,
+                        )
+                        
+                        if transaction:
+                            actual_cost = float(transaction.get("total_cost") or 0.0)
+                            total_consumption += actual_cost
+                            by_category[category] += actual_cost
+                            by_industry[industry_code] += actual_cost
+                            has_service_consumption = True
+                            
+                    except Exception as e:
+                        logger.error(f"家庭 {hh.household_id} 消费 {industry_code} 失败: {e}")
+            
+            if has_service_consumption:
+                household_count += 1
+        
+        if total_consumption > 0:
+            logger.info(
+                f"[服务消费] 总额=${total_consumption:.2f}, "
+                f"家庭数={household_count}, "
+                f"分类={dict(by_category)}"
+            )
+        
+        return {
+            "total_service_consumption": total_consumption,
+            "by_category": dict(by_category),
+            "by_industry": dict(by_industry),
+            "household_count": household_count,
+        }
+    
+    async def _execute_government_procurement(self, month: int) -> Dict[str, Any]:
+        """
+        执行政府采购
+        
+        政府从制造商和服务商采购商品和服务：
+        - 使用IO表系数决定各行业的采购比例
+        - 预算来自税收收入的一部分
+        - 不收取VAT（避免政府自我征税）
+        
+        Args:
+            month: 当前经济月份
+            
+        Returns:
+            采购统计信息
+        """
+        if self.government is None:
+            return {
+                "total_spent": 0.0,
+                "by_industry": {},
+                "items_count": 0,
+                "success": False,
+                "error": "no government"
+            }
+        
+        # 确保政府有产品市场引用
+        if self.product_market is not None and not hasattr(self.government, 'product_market'):
+            self.government.set_product_market(self.product_market)
+        
+        # 执行采购
+        try:
+            result = self.government.procure_goods_and_services(period=month)
+            
+            if result.get("success") and result.get("total_spent", 0) > 0:
+                logger.info(
+                    f"[政府采购] 总支出=${result['total_spent']:.2f}, "
+                    f"涉及{len(result.get('by_industry', {}))}个行业, "
+                    f"{result.get('items_count', 0)}个采购项"
+                )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[政府采购] 执行失败: {e}")
+            return {
+                "total_spent": 0.0,
+                "by_industry": {},
+                "items_count": 0,
+                "success": False,
+                "error": str(e)
+            }
 
     def _execute_orders(
         self,
@@ -986,6 +1493,7 @@ class Simulator:
         }
 
     async def _post_jobs(self, month: int) -> None:
+        # 企业发布岗位
         tasks = [firm.post_jobs(period=month) for firm in (self.firms or [])]
         postings_by_firm: Dict[str, List[Job]] = {}
         if tasks:
@@ -998,6 +1506,17 @@ class Simulator:
                 if isinstance(res, list):
                     jobs = [j for j in res if isinstance(j, Job)]
                 postings_by_firm[firm.firm_id] = jobs
+        
+        # 政府发布岗位
+        if self.government:
+            try:
+                gov_jobs = await self.government.post_jobs(period=month)
+                if gov_jobs:
+                    postings_by_firm[self.government.government_id] = gov_jobs
+                    logger.info(f"[岗位发布] 政府发布 {len(gov_jobs)} 个职位类型")
+            except Exception as e:
+                logger.error(f"[岗位发布] 政府发布失败: {e}")
+        
         if self._debug_enabled():
             self._log_job_postings(postings_by_firm)
 
@@ -1089,9 +1608,20 @@ class Simulator:
                     ppm,
                 )
             else:
+                # 企业或政府支付工资（非交易记录模式）
                 firm = self._firm_by_id.get(firm_id)
                 if firm is not None:
                     firm.cash -= gross
+                elif self.government and firm_id == self.government.government_id:
+                    # 政府支付工资时，通过 EconomicCenter 扣减余额
+                    if self.economic_center:
+                        self._call_actor(
+                            self.economic_center,
+                            "transfer",
+                            self.government.government_id,
+                            household_id,
+                            gross,
+                        )
         if self._debug_enabled():
             self._log_wage_summary(wage_by_firm, wage_by_household)
         household_wages = list(wage_by_household.values())
@@ -1110,6 +1640,7 @@ class Simulator:
         production_stats: Optional[Dict[str, Any]],
         consumption_stats: Optional[Dict[str, Any]],
         wage_stats: Optional[Dict[str, Any]],
+        procurement_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._recording_enabled():
             return
@@ -1227,6 +1758,7 @@ class Simulator:
                 "labor_market_raw": labor_summary,
                 "demand": demand_stats or {},
                 "production": production_stats or {},
+                "procurement": procurement_stats or {},
                 "consumption": consumption_stats or {},
                 "wages": wage_stats or {},
                 "firm_financials": firm_financials or {},
@@ -1261,4 +1793,373 @@ class Simulator:
                 sales_by_product[str(pid)] = sales_by_product.get(str(pid), 0.0) + qty
 
         self._last_sales_by_product = sales_by_product
+
+    def _record_demand_to_market(
+        self,
+        demand_by_product: Dict[str, float],
+        snapshot_cache: Dict[str, Optional[Dict[str, Any]]]
+    ) -> None:
+        """
+        将需求数据记录到商品市场，用于供需比计算
+        """
+        if not self.product_market:
+            return
         
+        # 按制造商行业汇总需求
+        demand_by_industry: Dict[str, float] = defaultdict(float)
+        for product_id, qty in (demand_by_product or {}).items():
+            snapshot = self._get_product_snapshot_cached(product_id, snapshot_cache)
+            if not snapshot:
+                continue
+            mfg_code = snapshot.get("manufacturer_code")
+            if mfg_code:
+                demand_by_industry[mfg_code] += float(qty)
+        
+        # 记录到商品市场
+        for mfg_code, total_demand in demand_by_industry.items():
+            self._call_actor(self.product_market, "record_demand", mfg_code, total_demand)
+        
+        if self._debug_enabled():
+            logger.info(f"[供需追踪] 记录需求: {len(demand_by_industry)} 个行业")
+
+    def _record_supply_and_adjust_prices(
+        self,
+        production_stats: Dict[str, Any]
+    ) -> None:
+        """
+        记录供给数据并根据供需比调整价格
+        """
+        if not self.product_market:
+            return
+        
+        by_firm = production_stats.get("by_firm", {}) if isinstance(production_stats, dict) else {}
+        
+        # 记录供给量
+        for firm_id, stats in by_firm.items():
+            firm = self._firm_by_id.get(firm_id)
+            if firm is None:
+                continue
+            mfg_code = getattr(firm, "industry", None)
+            if not mfg_code:
+                continue
+            supply_qty = float(stats.get("qty", 0.0) or 0.0)
+            if supply_qty > 0:
+                self._call_actor(self.product_market, "record_supply", mfg_code, supply_qty)
+        
+        # 根据供需比调整价格
+        industries_adjusted = set()
+        for firm_id in by_firm.keys():
+            firm = self._firm_by_id.get(firm_id)
+            if firm is None:
+                continue
+            mfg_code = getattr(firm, "industry", None)
+            if not mfg_code or mfg_code in industries_adjusted:
+                continue
+            
+            self._call_actor(
+                self.product_market,
+                "adjust_prices_by_supply_demand",
+                mfg_code,
+                0.05,  # base_adjustment
+                0.15   # max_adjustment
+            )
+            industries_adjusted.add(mfg_code)
+        
+        if self._debug_enabled():
+            logger.info(f"[供需追踪] 调整价格: {len(industries_adjusted)} 个行业")
+
+    def _settle_corporate_tax(self, month: int) -> Dict[str, Any]:
+        """
+        征收企业所得税
+        
+        时机：工资发放后、生产前
+        税基：当月收入 - 当月支出（不含企业税）
+        """
+        if self.economic_center is None:
+            return {}
+        
+        try:
+            result = self._call_actor(self.economic_center, "settle_monthly_corporate_tax", month)
+            total_tax = sum(result.values()) if isinstance(result, dict) else 0.0
+            
+            if self._debug_enabled():
+                logger.info(f"[企业所得税] 月份={month}, 总额={total_tax:.2f}, 企业数={len(result or {})}")
+            
+            return {
+                "total_tax": total_tax,
+                "by_firm": result or {},
+                "firm_count": len(result or {})
+            }
+        except Exception as e:
+            logger.error(f"企业所得税征收失败: {e}")
+            return {}
+
+    async def _pay_bank_interest(self, month: int) -> Dict[str, Any]:
+        """
+        银行发放存款利息
+        
+        年利率0.5%，按月计算
+        """
+        if self.bank is None:
+            return {}
+        
+        try:
+            total_interest = await self.bank.calculate_and_pay_monthly_interest(month)
+            
+            if self._debug_enabled():
+                logger.info(f"[银行利息] 月份={month}, 总额={total_interest:.2f}")
+            
+            return {
+                "total_interest": total_interest,
+                "month": month
+            }
+        except Exception as e:
+            logger.error(f"银行利息发放失败: {e}")
+            return {}
+
+    async def _redistribute_taxes(self, month: int) -> Dict[str, Any]:
+        """
+        税收再分配
+        
+        将当月税收收入按人均分配给所有家庭
+        """
+        if self.economic_center is None:
+            return {}
+        
+        try:
+            # 获取所有家庭ID
+            household_ids = [hh.household_id for hh in (self.households or [])]
+            if not household_ids:
+                return {}
+            
+            # 调用再分配方法
+            result = await self.economic_center.redistribute_monthly_taxes.remote(
+                month=month,
+                strategy="equal",  # 人均平等分配
+                household_ids=household_ids
+            )
+            result = ray.get(result) if hasattr(result, '__ray_terminate__') else result
+            
+            if self._debug_enabled():
+                total = float((result or {}).get("total_redistributed", 0.0))
+                recipients = int((result or {}).get("recipients", 0))
+                per_person = float((result or {}).get("per_person", 0.0))
+                logger.info(f"[税收再分配] 月份={month}, 总额={total:.2f}, 人数={recipients}, 人均={per_person:.2f}")
+            
+            return result or {}
+        except Exception as e:
+            logger.error(f"税收再分配失败: {e}")
+            return {}
+    
+    # =========================================================================
+    # 调试日志辅助方法
+    # =========================================================================
+    
+    def _log_wage_stats(self, wage_stats: Optional[Dict[str, Any]]) -> None:
+        """打印工资发放统计"""
+        if not wage_stats:
+            logger.info("  ⚠️  工资统计为空")
+            return
+        total = wage_stats.get("total", 0.0)
+        by_firm = wage_stats.get("by_firm", {})
+        count = len(by_firm)
+        household_stats = wage_stats.get("household_stats", {})
+        avg = household_stats.get("mean", 0) if household_stats else (total / count if count > 0 else 0)
+        
+        logger.info(f"  💵 工资发放: 总额=${total:,.2f}, 雇主数={count}, 人均=${avg:,.2f}")
+        
+        # 按企业/政府分类
+        if by_firm:
+            top_employers = sorted(by_firm.items(), key=lambda x: x[1], reverse=True)[:5]
+            for emp_id, amount in top_employers:
+                logger.info(f"    - {emp_id}: ${amount:,.2f}")
+    
+    def _log_corporate_tax_stats(self, tax_stats: Optional[Dict[str, Any]]) -> None:
+        """打印企业所得税统计"""
+        if not tax_stats:
+            logger.info("  ⚠️  企业所得税统计为空")
+            return
+        total = tax_stats.get("total_tax", 0.0)
+        count = tax_stats.get("firm_count", 0)
+        by_firm = tax_stats.get("by_firm", {})
+        logger.info(f"  🏢 企业所得税: 总额=${total:,.2f}, 企业数={count}")
+        
+        # 打印缴税最多的前5个企业
+        if by_firm:
+            top_firms = sorted(by_firm.items(), key=lambda x: x[1], reverse=True)[:5]
+            for firm_id, amount in top_firms:
+                if amount > 0:
+                    logger.info(f"    - {firm_id}: ${amount:,.2f}")
+    
+    def _log_consumption_plans(self, results: List[Tuple[Any, Dict[str, Any]]]) -> None:
+        """打印消费计划统计"""
+        if not results:
+            logger.info("  ⚠️  消费计划为空")
+            return
+        
+        total_budget = 0.0
+        total_service = 0.0
+        total_goods = 0.0
+        
+        for hh, plan in results:
+            budget = plan.get("available_budget", 0.0)
+            total_budget += budget
+            
+            step0 = plan.get("step0", {})
+            for cat, alloc in step0.items():
+                if cat in HOUSEHOLD_SERVICE_CATEGORY_TO_INDUSTRY:
+                    total_service += alloc.get("budget", 0.0)
+                else:
+                    total_goods += alloc.get("budget", 0.0)
+        
+        logger.info(f"  🛍️  消费计划: 家庭数={len(results)}, 总预算=${total_budget:,.2f}")
+        logger.info(f"      - 商品消费预算: ${total_goods:,.2f}")
+        logger.info(f"      - 服务消费预算: ${total_service:,.2f}")
+    
+    def _log_demand_stats(self, demand_stats: Optional[Dict[str, Any]]) -> None:
+        """打印需求统计"""
+        if not demand_stats:
+            logger.info("  ⚠️  需求统计为空")
+            return
+        total_qty = demand_stats.get("total_qty", 0)
+        total_value = demand_stats.get("total_value", 0.0)
+        by_retail = demand_stats.get("by_retail_firm", {})
+        by_mfg = demand_stats.get("by_mfg_firm", {})
+        sku_count = len(by_retail) + len(by_mfg)
+        logger.info(f"  📦 商品需求: 零售商数={len(by_retail)}, 制造商数={len(by_mfg)}, 总数量={total_qty:,.0f}, 总价值=${total_value:,.2f}")
+    
+    def _log_production_stats(self, production_stats: Optional[Dict[str, Any]]) -> None:
+        """打印生产统计"""
+        if not production_stats:
+            logger.info("  ⚠️  生产统计为空")
+            return
+        total_qty = production_stats.get("total_qty", 0)
+        total_value = production_stats.get("total_value", 0.0)
+        by_firm = production_stats.get("by_firm", {})
+        logger.info(f"  🏭 生产补货: 企业数={len(by_firm)}, 总数量={total_qty:,.0f}, 总价值=${total_value:,.2f}")
+        
+        # 打印前5个生产企业
+        if by_firm:
+            top_firms = sorted(by_firm.items(), key=lambda x: x[1].get("value", 0), reverse=True)[:5]
+            for firm_id, stats in top_firms:
+                logger.info(f"    - {firm_id}: 数量={stats.get('qty', 0):,.0f}, 价值=${stats.get('value', 0):,.2f}")
+    
+    def _log_procurement_stats(self, procurement_stats: Optional[Dict[str, Any]]) -> None:
+        """打印零售商进货统计"""
+        if not procurement_stats:
+            logger.info("  ⚠️  进货统计为空")
+            return
+        total = procurement_stats.get("total_cost", 0.0)
+        count = procurement_stats.get("retailers_count", 0)
+        logger.info(f"  📥 零售商进货: 零售商数={count}, 总成本=${total:,.2f}")
+    
+    def _log_consumption_stats(self, consumption_stats: Optional[Dict[str, Any]]) -> None:
+        """打印家庭消费统计"""
+        if not consumption_stats:
+            logger.info("  ⚠️  消费统计为空")
+            return
+        total_qty = consumption_stats.get("total_qty", 0)
+        total_value = consumption_stats.get("total_value", 0.0)
+        household_count = len(consumption_stats.get("by_household", {}))
+        logger.info(f"  🛒 家庭商品消费: 家庭数={household_count}, 总数量={total_qty:,.0f}, 总金额=${total_value:,.2f}")
+    
+    def _log_service_consumption_stats(self, stats: Optional[Dict[str, Any]]) -> None:
+        """打印服务消费统计"""
+        if not stats:
+            logger.info("  ⚠️  服务消费统计为空")
+            return
+        total = stats.get("total_service_consumption", 0.0)
+        household_count = stats.get("household_count", 0)
+        by_category = stats.get("by_category", {})
+        by_industry = stats.get("by_industry", {})
+        
+        logger.info(f"  🏠 家庭服务消费: 家庭数={household_count}, 总金额=${total:,.2f}")
+        if by_category:
+            logger.info(f"      按类别:")
+            for cat, amount in sorted(by_category.items(), key=lambda x: -x[1]):
+                logger.info(f"        - {cat}: ${amount:,.2f}")
+        if by_industry:
+            logger.info(f"      按行业:")
+            for ind, amount in sorted(by_industry.items(), key=lambda x: -x[1])[:5]:
+                logger.info(f"        - {ind}: ${amount:,.2f}")
+    
+    def _log_government_procurement_stats(self, stats: Optional[Dict[str, Any]]) -> None:
+        """打印政府采购统计"""
+        if not stats:
+            logger.info("  ⚠️  政府采购统计为空")
+            return
+        
+        success = stats.get("success", False)
+        total_spent = stats.get("total_spent", 0.0)
+        items_count = stats.get("items_count", 0)
+        by_industry = stats.get("by_industry", {})
+        error = stats.get("error")
+        
+        if error:
+            logger.info(f"  ❌ 政府采购失败: {error}")
+            return
+        
+        if not success or total_spent <= 0:
+            logger.info(f"  ℹ️  政府采购: 本月无采购 (可能税收不足或无可采购商品)")
+            return
+        
+        logger.info(f"  🏛️  政府采购: 总支出=${total_spent:,.2f}, 采购项数={items_count}, 涉及行业={len(by_industry)}")
+        if by_industry:
+            logger.info(f"      按行业:")
+            for ind, amount in sorted(by_industry.items(), key=lambda x: -x[1])[:10]:
+                pct = amount / total_spent * 100 if total_spent > 0 else 0
+                logger.info(f"        - {ind}: ${amount:,.2f} ({pct:.1f}%)")
+    
+    def _log_redistribution_stats(self, stats: Optional[Dict[str, Any]]) -> None:
+        """打印税收再分配统计"""
+        if not stats:
+            logger.info("  ⚠️  税收再分配统计为空")
+            return
+        total = stats.get("total_redistributed", 0.0)
+        recipients = stats.get("recipients", 0)
+        per_person = stats.get("per_person", 0.0)
+        logger.info(f"  💸 税收再分配: 总额=${total:,.2f}, 受益人数={recipients}, 人均=${per_person:,.2f}")
+    
+    def _log_month_end_summary(self, month: int) -> None:
+        """打印月末汇总"""
+        logger.info(f"\n{'─'*40}\n📈 [月末汇总]\n{'─'*40}")
+        
+        if self.economic_center is None:
+            logger.info("  ⚠️  经济中心未初始化")
+            return
+        
+        try:
+            # 获取税收汇总
+            tax_summary = self._call_actor(self.economic_center, "get_monthly_tax_collection", month)
+            if tax_summary:
+                logger.info(f"  📊 本月税收汇总:")
+                logger.info(f"      - 消费税(VAT): ${tax_summary.get('consume_tax', 0):,.2f}")
+                logger.info(f"      - 个人所得税: ${tax_summary.get('labor_tax', 0):,.2f}")
+                logger.info(f"      - FICA税: ${tax_summary.get('fica_tax', 0):,.2f}")
+                logger.info(f"      - 企业所得税: ${tax_summary.get('corporate_tax', 0):,.2f}")
+                logger.info(f"      - 总计: ${tax_summary.get('total_tax', 0):,.2f}")
+            
+            # 获取主要账户余额
+            gov_balance = self._call_actor(self.economic_center, "query_balance", "gov_main_simulation")
+            logger.info(f"  💰 政府余额: ${gov_balance:,.2f}")
+            
+            # 家庭余额汇总
+            if self.households:
+                total_hh_balance = 0.0
+                for hh in self.households:
+                    bal = self._call_actor(self.economic_center, "query_balance", hh.household_id)
+                    total_hh_balance += float(bal or 0)
+                avg_hh_balance = total_hh_balance / len(self.households)
+                logger.info(f"  👨‍👩‍👧‍👦 家庭余额: 总计=${total_hh_balance:,.2f}, 平均=${avg_hh_balance:,.2f}")
+            
+            # 企业余额汇总
+            if self.firms:
+                total_firm_balance = 0.0
+                for firm in self.firms:
+                    bal = self._call_actor(self.economic_center, "query_balance", firm.firm_id)
+                    total_firm_balance += float(bal or 0)
+                avg_firm_balance = total_firm_balance / len(self.firms) if self.firms else 0
+                logger.info(f"  🏢 企业余额: 总计=${total_firm_balance:,.2f}, 平均=${avg_firm_balance:,.2f}")
+                
+        except Exception as e:
+            logger.error(f"  ❌ 获取月末汇总失败: {e}")

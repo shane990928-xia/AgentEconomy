@@ -1,13 +1,15 @@
 from dotenv import load_dotenv
 load_dotenv()
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 import ray
 import pandas as pd
+from qdrant_client.models import Filter, FieldCondition, MatchValue, PointIdsList
 from agenteconomy.center.Model import *
 from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.embedding import embedding
 from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
+from agenteconomy.data.category_to_retailer import get_retailer_code
 import os
 
 @ray.remote(num_cpus=8, max_concurrency=100)
@@ -26,7 +28,8 @@ class ProductMarket:
     def __init__(self):
         self.products: List[Product] = []  # 所有SKU
         self.products_by_id: Dict[str, Product] = {}  # product_id -> Product
-        self.products_by_industry: Dict[str, List[Product]] = {}  # industry_code -> [Product]
+        self.products_by_industry: Dict[str, List[Product]] = {}  # manufacturer_code -> [Product]
+        self.products_by_retailer: Dict[str, List[Product]] = {}  # retailer_code -> [Product]
         
         self.client = load_client()
         self.purchase_records: Dict[str, List[PurchaseRecord]] = {}
@@ -35,6 +38,20 @@ class ProductMarket:
         # 行业平均价格缓存（用于中间品采购的等价单位计算）
         self.industry_avg_prices: Dict[str, Dict[str, float]] = {}
         # 格式: {"manufacturer": {"315AL": 50.0}, "retail": {"441": 80.0}}
+        
+        # Qdrant collection name
+        self._collection_name = os.getenv("QDRANT_COLLECTION_NAME", "products")
+        
+        # 活跃SKU追踪
+        self._active_sku_set: Set[str] = set()
+        self._require_active_filter: bool = False  # 是否在搜索时强制过滤is_active
+        
+        # 零售商库存追踪 (retailer_id -> {product_id -> stock})
+        self.retailer_inventory: Dict[str, Dict[str, float]] = {}
+        
+        # 供需追踪（按行业）：用于价格调整
+        # {manufacturer_code: {"demand": float, "supply": float}}
+        self.industry_supply_demand: Dict[str, Dict[str, float]] = {}
         
         self.logger.info(f"ProductMarket initialized")
 
@@ -53,8 +70,16 @@ class ProductMarket:
         
         self.logger.info(f"Loading products from {csv_path}")
         products_df = pd.read_csv(csv_path)
+        
+        # 统计零售商分布
+        retailer_counts = {}
+        
         for _, row in products_df.iterrows():
             try:
+                # 根据产品分类动态确定零售商
+                category = row.get('Category', '') or ''
+                retailer_code = get_retailer_code(category)
+                
                 product = Product.create(
                     name=row['Product Name'],
                     product_id=row['Uniq Id'],
@@ -66,15 +91,19 @@ class ProductMarket:
                     base_retail_price=float(row['List Price']),
                     has_wholesale_layer=bool(row['Has_Wholesale_Layer']),
                     manufacturer_code=row['Manufacturer_Code'],
-                    retailer_code=row['Retailer_Code'],
+                    retailer_code=retailer_code,  # 使用动态映射的零售商代码
                     owner_id=row['Manufacturer_Code'],  # 初始拥有者为制造商
                     amount=1000,
                     classification=row.get('Industry', None),
                     description=row.get('Description', None),
                     brand=row.get('Brand', None),
-                    available_stock=100,  # 初始库存为0，由制造商生产后添加
+                    available_stock=100,  # 初始库存
+                    category=category,  # 保存原始分类用于调试
                 )
                 self.add_product(product)
+                
+                # 统计
+                retailer_counts[retailer_code] = retailer_counts.get(retailer_code, 0) + 1
             except Exception as e:
                 self.logger.error(f"Failed to create product from row: {e}")
                 continue
@@ -83,7 +112,8 @@ class ProductMarket:
         self._calculate_industry_avg_prices()
         
         self.logger.info(f"Loaded {len(self.products)} products")
-        self.logger.info(f"Covered {len(self.products_by_industry)} industries")
+        self.logger.info(f"Covered {len(self.products_by_industry)} manufacturer industries")
+        self.logger.info(f"Retailer distribution: {retailer_counts}")
 
     def add_product(self, product: Product):
         """添加产品到市场"""
@@ -96,7 +126,14 @@ class ProductMarket:
             self.products_by_industry[mfg_code] = []
         self.products_by_industry[mfg_code].append(product)
         
-        self.logger.debug(f"Product {product.product_id} ({product.name}) added to market")
+        # 按零售商分类
+        retailer_code = product.retailer_code
+        if retailer_code:
+            if retailer_code not in self.products_by_retailer:
+                self.products_by_retailer[retailer_code] = []
+            self.products_by_retailer[retailer_code].append(product)
+        
+        self.logger.debug(f"Product {product.product_id} ({product.name}) added to market, retailer={retailer_code}")
     
     def get_price(self, product_id: str) -> float:
         """
@@ -125,7 +162,45 @@ class ProductMarket:
             "available_stock": float(getattr(product, "available_stock", 0.0) or 0.0),
             "manufacturer_code": getattr(product, "manufacturer_code", None),
             "retailer_code": getattr(product, "retailer_code", None),
+            "category": getattr(product, "category", None),
         }
+
+    # ========== 零售商相关方法 ==========
+    
+    def get_products_by_retailer(self, retailer_code: str) -> List[Dict[str, Any]]:
+        """
+        获取某零售商负责销售的所有产品列表
+        Returns: List of product snapshots
+        """
+        products = self.products_by_retailer.get(retailer_code, [])
+        return [self.get_product_snapshot(p.product_id) for p in products]
+    
+    def get_retailer_product_ids(self, retailer_code: str) -> List[str]:
+        """
+        获取某零售商负责销售的所有产品ID列表
+        """
+        products = self.products_by_retailer.get(retailer_code, [])
+        return [p.product_id for p in products]
+    
+    def get_retailer_statistics(self) -> Dict[str, Dict[str, Any]]:
+        """
+        获取各零售商的统计信息
+        Returns: {retailer_code: {product_count, total_stock, avg_price, categories}}
+        """
+        stats = {}
+        for retailer_code, products in self.products_by_retailer.items():
+            total_stock = sum(p.available_stock for p in products)
+            prices = [p.retail_price for p in products if p.retail_price > 0]
+            categories = set(p.category for p in products if p.category)
+            
+            stats[retailer_code] = {
+                "product_count": len(products),
+                "total_stock": total_stock,
+                "avg_price": sum(prices) / len(prices) if prices else 0.0,
+                "categories": list(categories)
+            }
+        return stats
+
     def _calculate_industry_avg_prices(self):
         """
         计算各行业的平均价格
@@ -253,7 +328,306 @@ class ProductMarket:
                 self.logger.warning(f"Product {product_id} has negative stock: {product.available_stock}")
         else:
             self.logger.error(f"Product {product_id} not found")
+
+    # ========== 价格动态调整方法 ==========
     
+    def update_manufacturer_price(
+        self,
+        product_id: str,
+        new_price: float,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        更新制造商价格（批发价）
+        
+        Args:
+            product_id: 产品ID
+            new_price: 新的制造商价格
+            reason: 调价原因（用于日志）
+            
+        Returns:
+            是否成功更新
+        """
+        product = self.products_by_id.get(product_id)
+        if not product:
+            self.logger.warning(f"Product {product_id} not found for price update")
+            return False
+        
+        old_price = product.manufacturer_price
+        product.manufacturer_price = max(0.01, new_price)  # 价格不能低于0.01
+        
+        self.logger.debug(
+            f"Updated manufacturer price for {product_id}: "
+            f"{old_price:.2f} -> {new_price:.2f} ({reason or 'no reason'})"
+        )
+        return True
+    
+    def update_retail_price(
+        self,
+        product_id: str,
+        new_price: float,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        更新零售价格
+        
+        Args:
+            product_id: 产品ID
+            new_price: 新的零售价格
+            reason: 调价原因（用于日志）
+            
+        Returns:
+            是否成功更新
+        """
+        product = self.products_by_id.get(product_id)
+        if not product:
+            self.logger.warning(f"Product {product_id} not found for price update")
+            return False
+        
+        old_price = product.retail_price
+        product.retail_price = max(0.01, new_price)  # 价格不能低于0.01
+        
+        self.logger.debug(
+            f"Updated retail price for {product_id}: "
+            f"{old_price:.2f} -> {new_price:.2f} ({reason or 'no reason'})"
+        )
+        return True
+    
+    def update_prices_by_cost(
+        self,
+        product_id: str,
+        actual_unit_cost: float,
+        manufacturer_margin: float = 0.15,
+        retail_margin: float = 0.25
+    ) -> bool:
+        """
+        根据实际成本更新制造商价格和零售价格
+        
+        价格计算逻辑：
+        - manufacturer_price = actual_unit_cost * (1 + manufacturer_margin)
+        - retail_price = manufacturer_price * (1 + retail_margin)
+        
+        Args:
+            product_id: 产品ID
+            actual_unit_cost: 实际单位成本（中间品 + 劳动力）
+            manufacturer_margin: 制造商利润率（默认15%）
+            retail_margin: 零售商利润率（默认25%）
+            
+        Returns:
+            是否成功更新
+        """
+        product = self.products_by_id.get(product_id)
+        if not product:
+            return False
+        
+        # 计算新价格
+        new_mfg_price = actual_unit_cost * (1 + manufacturer_margin)
+        new_retail_price = new_mfg_price * (1 + retail_margin)
+        
+        # 更新产品的 unit_cost 记录
+        product.unit_cost = actual_unit_cost
+        
+        # 更新价格
+        old_mfg = product.manufacturer_price
+        old_retail = product.retail_price
+        
+        product.manufacturer_price = max(0.01, new_mfg_price)
+        product.retail_price = max(0.01, new_retail_price)
+        
+        self.logger.debug(
+            f"Updated prices for {product_id} based on cost {actual_unit_cost:.2f}: "
+            f"mfg {old_mfg:.2f}->{new_mfg_price:.2f}, retail {old_retail:.2f}->{new_retail_price:.2f}"
+        )
+        return True
+    
+    def batch_update_prices_by_industry(
+        self,
+        manufacturer_code: str,
+        avg_unit_cost: float,
+        manufacturer_margin: float = 0.15,
+        retail_margin: float = 0.25,
+        smoothing_factor: float = 0.3,
+        max_change_ratio: float = 0.2
+    ) -> int:
+        """
+        批量更新某制造业行业所有产品的价格
+        
+        用于制造商在生产后统一调整价格
+        
+        价格调整机制：
+        1. 根据实际成本计算目标价格
+        2. 使用平滑因子避免价格剧烈波动：new = old * (1-α) + target * α
+        3. 限制单次调整幅度不超过 max_change_ratio
+        
+        Args:
+            manufacturer_code: 制造商行业代码
+            avg_unit_cost: 平均单位成本
+            manufacturer_margin: 制造商利润率
+            retail_margin: 零售商利润率
+            smoothing_factor: 平滑因子（0-1），越大越接近目标价格
+            max_change_ratio: 单次最大调整比例（如0.2表示最多涨跌20%）
+            
+        Returns:
+            更新的产品数量
+        """
+        products = self.products_by_industry.get(manufacturer_code, [])
+        if not products:
+            return 0
+        
+        updated_count = 0
+        for product in products:
+            # 根据基准价格比例调整（保持产品间的相对价格差异）
+            base_mfg = product.base_manufacturer_price
+            if base_mfg > 0:
+                # 计算基准成本（基准价格 / (1 + margin)）
+                base_cost = base_mfg / (1 + manufacturer_margin)
+                # 成本变化比例
+                cost_ratio = avg_unit_cost / base_cost if base_cost > 0 else 1.0
+                # 目标价格 = 基准价格 * 成本变化比例
+                target_mfg_price = base_mfg * cost_ratio
+                target_retail_price = product.base_retail_price * cost_ratio
+            else:
+                target_mfg_price = avg_unit_cost * (1 + manufacturer_margin)
+                target_retail_price = target_mfg_price * (1 + retail_margin)
+            
+            # 平滑调整：new = old * (1-α) + target * α
+            old_mfg = product.manufacturer_price
+            old_retail = product.retail_price
+            
+            smoothed_mfg = old_mfg * (1 - smoothing_factor) + target_mfg_price * smoothing_factor
+            smoothed_retail = old_retail * (1 - smoothing_factor) + target_retail_price * smoothing_factor
+            
+            # 限制单次调整幅度
+            if old_mfg > 0:
+                change_ratio_mfg = (smoothed_mfg - old_mfg) / old_mfg
+                if abs(change_ratio_mfg) > max_change_ratio:
+                    if change_ratio_mfg > 0:
+                        smoothed_mfg = old_mfg * (1 + max_change_ratio)
+                    else:
+                        smoothed_mfg = old_mfg * (1 - max_change_ratio)
+            
+            if old_retail > 0:
+                change_ratio_retail = (smoothed_retail - old_retail) / old_retail
+                if abs(change_ratio_retail) > max_change_ratio:
+                    if change_ratio_retail > 0:
+                        smoothed_retail = old_retail * (1 + max_change_ratio)
+                    else:
+                        smoothed_retail = old_retail * (1 - max_change_ratio)
+            
+            # 更新价格
+            product.unit_cost = avg_unit_cost
+            product.manufacturer_price = max(0.01, smoothed_mfg)
+            product.retail_price = max(0.01, smoothed_retail)
+            updated_count += 1
+        
+        self.logger.info(
+            f"Batch updated {updated_count} products for industry {manufacturer_code}, "
+            f"avg_cost={avg_unit_cost:.2f}"
+        )
+        return updated_count
+
+    # ========== 供需追踪与价格调整 ==========
+    
+    def record_demand(self, manufacturer_code: str, demand_qty: float):
+        """
+        记录某行业的需求量
+        
+        Args:
+            manufacturer_code: 制造商行业代码
+            demand_qty: 需求数量
+        """
+        if manufacturer_code not in self.industry_supply_demand:
+            self.industry_supply_demand[manufacturer_code] = {"demand": 0.0, "supply": 0.0}
+        self.industry_supply_demand[manufacturer_code]["demand"] += demand_qty
+    
+    def record_supply(self, manufacturer_code: str, supply_qty: float):
+        """
+        记录某行业的供给量（生产量）
+        
+        Args:
+            manufacturer_code: 制造商行业代码
+            supply_qty: 供给数量
+        """
+        if manufacturer_code not in self.industry_supply_demand:
+            self.industry_supply_demand[manufacturer_code] = {"demand": 0.0, "supply": 0.0}
+        self.industry_supply_demand[manufacturer_code]["supply"] += supply_qty
+    
+    def get_supply_demand_ratio(self, manufacturer_code: str) -> float:
+        """
+        获取某行业的供需比
+        
+        Returns:
+            供需比（supply/demand），>1表示供过于求，<1表示供不应求
+            如果没有需求记录，返回1.0（均衡状态）
+        """
+        stats = self.industry_supply_demand.get(manufacturer_code, {})
+        demand = stats.get("demand", 0.0)
+        supply = stats.get("supply", 0.0)
+        
+        if demand <= 0:
+            return 1.0  # 无需求时视为均衡
+        return supply / demand
+    
+    def reset_supply_demand_tracking(self):
+        """
+        重置供需追踪数据（每月初调用）
+        """
+        self.industry_supply_demand = {}
+        self.logger.debug("Supply-demand tracking reset")
+    
+    def adjust_prices_by_supply_demand(
+        self,
+        manufacturer_code: str,
+        base_adjustment: float = 0.05,
+        max_adjustment: float = 0.15
+    ) -> int:
+        """
+        根据供需比调整价格
+        
+        价格调整逻辑：
+        - 供需比 > 1（供过于求）：降价
+        - 供需比 < 1（供不应求）：涨价
+        - 调整幅度 = base_adjustment * |ln(供需比)|，最大不超过 max_adjustment
+        
+        Args:
+            manufacturer_code: 制造商行业代码
+            base_adjustment: 基础调整系数
+            max_adjustment: 最大调整幅度
+            
+        Returns:
+            更新的产品数量
+        """
+        ratio = self.get_supply_demand_ratio(manufacturer_code)
+        products = self.products_by_industry.get(manufacturer_code, [])
+        
+        if not products or ratio == 1.0:
+            return 0
+        
+        # 计算调整幅度：使用对数函数使调整更平滑
+        import math
+        # ln(ratio): ratio>1时为正（降价），ratio<1时为负（涨价）
+        log_ratio = math.log(ratio) if ratio > 0 else 0
+        adjustment = base_adjustment * abs(log_ratio)
+        adjustment = min(adjustment, max_adjustment)
+        
+        # 供过于求时降价，供不应求时涨价
+        if ratio > 1:
+            price_multiplier = 1 - adjustment  # 降价
+        else:
+            price_multiplier = 1 + adjustment  # 涨价
+        
+        updated_count = 0
+        for product in products:
+            product.manufacturer_price = max(0.01, product.manufacturer_price * price_multiplier)
+            product.retail_price = max(0.01, product.retail_price * price_multiplier)
+            updated_count += 1
+        
+        self.logger.info(
+            f"Adjusted prices for {manufacturer_code}: ratio={ratio:.2f}, "
+            f"multiplier={price_multiplier:.3f}, products={updated_count}"
+        )
+        return updated_count
+
     def reserve_stock(self, product_id: str, quantity: float) -> bool:
         """
         预留库存
@@ -363,11 +737,24 @@ class ProductMarket:
             seen_ids = set()
             offset = 0
             products_by_id = self.products_by_id
+            
+            # 构建搜索过滤器
+            search_filter = None
+            if self._require_active_filter:
+                search_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="is_active",
+                            match=MatchValue(value=True)
+                        )
+                    ]
+                )
 
             while len(results) < top_k and offset < max_fetch:
                 hits_resp = self.client.query_points(
                     collection_name=collection_name,
                     query=query_embedding,
+                    query_filter=search_filter,
                     limit=search_limit,
                     offset=offset,
                     with_payload=True,
@@ -444,6 +831,92 @@ class ProductMarket:
             "avg_manufacturer_price": sum(p.manufacturer_price for p in self.products) / total_products if total_products > 0 else 0,
             "avg_retail_price": sum(p.retail_price for p in self.products) / total_products if total_products > 0 else 0,
         }
+
+    # ============ Active SKU Management (Qdrant Payload Filter) ============
+    
+    def set_active_filter_mode(self, enabled: bool):
+        """
+        设置是否在搜索时强制过滤活跃SKU
+        
+        Args:
+            enabled: True表示只搜索is_active=true的SKU
+        """
+        self._require_active_filter = enabled
+        self.logger.info(f"Active filter mode set to: {enabled}")
+    
+    def activate_skus(self, sku_ids: List[str]) -> int:
+        """
+        批量激活SKU（在Qdrant中设置is_active=true）
+        
+        Args:
+            sku_ids: 要激活的SKU ID列表
+            
+        Returns:
+            成功激活的SKU数量
+        """
+        if not sku_ids:
+            return 0
+        
+        try:
+            # 更新Qdrant payload
+            self.client.set_payload(
+                collection_name=self._collection_name,
+                payload={"is_active": True},
+                points=sku_ids,  # Qdrant支持直接传string ID列表
+            )
+            
+            # 同步更新本地追踪集合
+            self._active_sku_set.update(sku_ids)
+            
+            self.logger.info(f"Activated {len(sku_ids)} SKUs in Qdrant")
+            return len(sku_ids)
+        except Exception as e:
+            self.logger.error(f"Failed to activate SKUs: {e}")
+            return 0
+    
+    def deactivate_all_skus(self) -> bool:
+        """
+        重置所有SKU为非活跃状态（is_active=false）
+        
+        Returns:
+            是否成功
+        """
+        try:
+            # 使用scroll遍历所有点并更新
+            # 或者使用filter更新所有is_active=true的点
+            self.client.set_payload(
+                collection_name=self._collection_name,
+                payload={"is_active": False},
+                points=Filter(
+                    must=[
+                        FieldCondition(
+                            key="is_active",
+                            match=MatchValue(value=True)
+                        )
+                    ]
+                ),
+            )
+            
+            # 清空本地追踪
+            self._active_sku_set.clear()
+            
+            self.logger.info("Deactivated all SKUs in Qdrant")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to deactivate all SKUs: {e}")
+            return False
+    
+    def get_active_sku_count(self) -> int:
+        """获取当前活跃SKU数量"""
+        return len(self._active_sku_set)
+    
+    def get_active_sku_ids(self) -> Set[str]:
+        """获取当前活跃SKU ID集合的副本"""
+        return self._active_sku_set.copy()
+    
+    def is_sku_active(self, sku_id: str) -> bool:
+        """检查某个SKU是否活跃"""
+        return sku_id in self._active_sku_set
 
 
 if __name__ == "__main__":

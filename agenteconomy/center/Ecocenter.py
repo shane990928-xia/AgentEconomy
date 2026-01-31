@@ -1153,6 +1153,77 @@ class EconomicCenter:
         
         return purchase_tx.id
 
+    def process_wholesale(
+        self,
+        month: int,
+        retailer_id: str,
+        manufacturer_id: str,
+        amount: float,
+        quantity: float = 1.0,
+        product_id: Optional[str] = None,
+        product_name: Optional[str] = None,
+        unit_price: Optional[float] = None,
+    ) -> Optional[str]:
+        """
+        处理零售商从制造商进货的批发交易
+        
+        Args:
+            month: 当前月份
+            retailer_id: 零售商ID
+            manufacturer_id: 制造商ID
+            amount: 交易金额（批发价，即 manufacturer_price * quantity）
+            quantity: 进货数量
+            product_id: 商品ID（可选）
+            product_name: 商品名称（可选）
+            unit_price: 批发单价（可选）
+        
+        Returns:
+            交易ID（成功）或 None（失败）
+        """
+        wholesale_amount = float(amount)
+        
+        # 检查零售商余额
+        if retailer_id not in self.ledger:
+            self.ledger[retailer_id] = Ledger()
+        if self.ledger[retailer_id].amount < wholesale_amount:
+            self.logger.warning(
+                f"进货失败: 零售商 {retailer_id} 余额不足 "
+                f"(需要 {wholesale_amount:.2f}, 余额 {self.ledger[retailer_id].amount:.2f})"
+            )
+            return None
+
+        # 零售商支付批发价
+        self.ledger[retailer_id].amount -= wholesale_amount
+
+        # 创建批发交易记录
+        wholesale_tx = self._record_transaction(
+            sender_id=retailer_id,
+            receiver_id=manufacturer_id,
+            amount=wholesale_amount,
+            tx_type='wholesale',
+            month=month,
+            metadata={
+                "product_id": product_id,
+                "product_name": product_name,
+                "quantity": float(quantity or 0.0),
+                "unit_price": float(unit_price or 0.0) if unit_price else wholesale_amount / max(quantity, 1),
+            },
+        )
+
+        # 制造商收入
+        if manufacturer_id not in self.ledger:
+            self.ledger[manufacturer_id] = Ledger()
+        self.ledger[manufacturer_id].amount += wholesale_amount
+        self.record_firm_income(manufacturer_id, wholesale_amount)
+        self.record_firm_monthly_income(manufacturer_id, month, wholesale_amount)
+        
+        self.logger.debug(
+            f"批发交易完成: {retailer_id} -> {manufacturer_id}, "
+            f"金额={wholesale_amount:.2f}, 数量={quantity}"
+        )
+        
+        return wholesale_tx.id
+
     def process_wage(
         self,
         month: int,
