@@ -478,9 +478,9 @@ class Simulator:
         
         # ========== 劳动力市场 ==========
         with self._time_block("发布岗位", month=month, preheat=True):
-            await self._post_jobs(month, production_stats=production_stats, service_stats=service_consumption_stats)
+            await self._post_jobs(econ_month, production_stats=production_stats, service_stats=service_consumption_stats)
         with self._time_block("招聘匹配", month=month, preheat=True):
-            await self._match_jobs(month, use_llm=False)
+            await self._match_jobs(econ_month, use_llm=False)
         with self._time_block("发放工资", month=month, preheat=True):
             wage_stats = self._pay_wages(econ_month, record_transactions=True)
         
@@ -517,9 +517,9 @@ class Simulator:
         # ========== 劳动力市场 ==========
         logger.info(f"\n{'─'*40}\n📋 [劳动力市场]\n{'─'*40}")
         with self._time_block("发布岗位", month=month, preheat=False):
-            await self._post_jobs(month)
+            await self._post_jobs(econ_month)  # 使用 econ_month 以便正确查询上月数据
         with self._time_block("招聘匹配", month=month, preheat=False):
-            await self._match_jobs(month, use_llm=False)
+            await self._match_jobs(econ_month, use_llm=False)  # 使用 econ_month 保持数据一致性
         with self._time_block("发放工资", month=month, preheat=False):
             wage_stats = self._pay_wages(econ_month, record_transactions=True)
         self._log_wage_stats(wage_stats)
