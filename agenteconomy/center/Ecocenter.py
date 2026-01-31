@@ -2543,3 +2543,416 @@ class EconomicCenter:
                 },
             },
         }
+    # ======================== 改进版 GDP 计算（交易流法 + 行业分解 + 实际GDP） ========================
+
+    def calculate_gdp_comprehensive(
+        self, 
+        month: int, 
+        production_stats: Optional[Dict[str, Any]] = None,
+        base_month: int = 0
+    ) -> Dict[str, Any]:
+        """
+        综合 GDP 计算：基于实际交易流 + 行业分解 + 实际/名义 GDP
+        
+        计算方法：
+        1. 支出法 GDP = C + G + I + (X - M)
+           - C (家庭消费): 家庭购买商品/服务的交易金额
+           - G (政府支出): 政府采购 + 政府工资支出
+           - I (投资): 存货投资 = 产出 - 销售
+           - X - M (净出口): 封闭经济，为 0
+        
+        2. 生产法 GDP = Σ(各行业增加值) + 产品税
+           - 增加值 = 产出 - 中间投入
+        
+        3. 收入法 GDP = 劳动者报酬 + 生产税净额 + 营业盈余
+        
+        4. 实际 GDP = 名义 GDP / 价格指数
+        
+        Args:
+            month: 当前月份
+            production_stats: 生产统计（可选）
+            base_month: 价格指数基期（默认0）
+        
+        Returns:
+            包含多种 GDP 口径及分解的完整统计
+        """
+        transactions = self.tx_by_month.get(month, [])
+        if not transactions:
+            transactions = [tx for tx in self.tx_history if tx.month == month]
+        
+        ps = production_stats
+        if ps is None:
+            ps = self.production_stats_by_month.get(month, {}) if hasattr(self, "production_stats_by_month") else {}
+        ps = ps or {}
+        
+        # =====================================================================
+        # 1️⃣ 从交易流统计各支出组件
+        # =====================================================================
+        
+        # C: 家庭消费（含税）
+        household_consumption = 0.0
+        household_consumption_ex_tax = 0.0
+        
+        # G: 政府支出
+        government_procurement = 0.0  # 政府采购商品
+        government_wages = 0.0         # 政府工资支出
+        
+        # 税收
+        vat_collected = 0.0
+        labor_tax_collected = 0.0
+        fica_tax_collected = 0.0
+        corporate_tax_collected = 0.0
+        
+        # 工资总额
+        total_wages = 0.0
+        private_wages = 0.0
+        
+        # 行业分解
+        industry_sales: Dict[str, float] = defaultdict(float)
+        industry_production: Dict[str, float] = defaultdict(float)
+        industry_intermediate: Dict[str, float] = defaultdict(float)
+        
+        for tx in transactions:
+            tx_type = str(getattr(tx, "type", "") or "")
+            amount = float(getattr(tx, "amount", 0.0) or 0.0)
+            sender_id = str(getattr(tx, "sender_id", "") or "")
+            receiver_id = str(getattr(tx, "receiver_id", "") or "")
+            metadata = getattr(tx, "metadata", {}) or {}
+            
+            # 家庭消费
+            if tx_type == "purchase" and sender_id in self.household_id:
+                household_consumption += amount
+                # 从 metadata 获取不含税金额
+                ex_tax = float(metadata.get("amount_ex_tax", amount / (1 + self.vat_rate)) or 0.0)
+                household_consumption_ex_tax += ex_tax
+                # 按行业分解
+                industry = str(metadata.get("industry", "Unknown") or "Unknown")
+                industry_sales[industry] += ex_tax
+            
+            # 政府采购
+            elif tx_type == "government_procurement":
+                government_procurement += amount
+                industry = str(metadata.get("industry", "Unknown") or "Unknown")
+                industry_sales[industry] += amount
+            
+            # 工资支付
+            elif tx_type == "labor_payment":
+                total_wages += amount
+                # 区分政府工资和私人工资
+                if sender_id in self.government_id or sender_id.startswith("gov"):
+                    government_wages += amount
+                else:
+                    private_wages += amount
+            
+            # 税收
+            elif tx_type == "consume_tax":
+                vat_collected += amount
+            elif tx_type == "labor_tax":
+                labor_tax_collected += amount
+            elif tx_type == "fica_tax":
+                fica_tax_collected += amount
+            elif tx_type == "corporate_tax":
+                corporate_tax_collected += amount
+            
+            # 中间投入（原材料采购）
+            elif tx_type == "resource_purchase":
+                industry = str(metadata.get("industry", "Unknown") or "Unknown")
+                industry_intermediate[industry] += amount
+        
+        # =====================================================================
+        # 2️⃣ 计算支出法 GDP: C + G + I
+        # =====================================================================
+        
+        # 总消费 C（含税，反映实际支付）
+        consumption_total = household_consumption
+        
+        # 政府支出 G = 政府采购 + 政府工资
+        government_expenditure = government_procurement + government_wages
+        
+        # 投资 I（存货投资）= 产出 - 销售
+        total_output = float(ps.get("total_output_value", 0.0) or 0.0)
+        total_sales_ex_tax = household_consumption_ex_tax + government_procurement
+        inventory_investment = total_output - total_sales_ex_tax
+        
+        # 支出法 GDP
+        gdp_expenditure = consumption_total + government_expenditure + inventory_investment
+        
+        # =====================================================================
+        # 3️⃣ 计算生产法 GDP: Σ(增加值) + 产品税
+        # =====================================================================
+        
+        # 从生产统计获取行业产出
+        firm_production_value = ps.get("firm_production_value", {}) or {}
+        firm_production_cost = ps.get("firm_production_cost", {}) or {}
+        
+        # 按行业汇总增加值
+        industry_value_added: Dict[str, float] = defaultdict(float)
+        total_value_added = 0.0
+        total_intermediate = 0.0
+        
+        # 使用生产统计中的数据
+        for firm_id, output_value in firm_production_value.items():
+            output = float(output_value or 0.0)
+            cost = float(firm_production_cost.get(firm_id, 0.0) or 0.0)
+            value_added = output - cost
+            
+            # 获取企业行业（从注册信息）
+            industry = self._get_firm_industry(firm_id)
+            industry_value_added[industry] += value_added
+            industry_production[industry] += output
+            
+            total_value_added += value_added
+            total_intermediate += cost
+        
+        # 如果没有按企业的统计，使用汇总数据
+        if total_value_added <= 0:
+            total_output = float(ps.get("total_output_value", 0.0) or 0.0)
+            total_intermediate = float(ps.get("total_production_cost", 0.0) or 0.0)
+            total_value_added = total_output - total_intermediate
+        
+        # 生产法 GDP = 增加值 + 产品税（VAT）
+        gdp_production = total_value_added + vat_collected
+        
+        # =====================================================================
+        # 4️⃣ 计算收入法 GDP: 劳动者报酬 + 生产税 + 营业盈余
+        # =====================================================================
+        
+        # 劳动者报酬（税前）= 实发工资 + 劳动税 + FICA
+        compensation_of_employees = total_wages + labor_tax_collected + fica_tax_collected
+        
+        # 生产税净额 = VAT + 企业所得税（简化，不考虑补贴）
+        taxes_on_production = vat_collected + corporate_tax_collected
+        
+        # 营业盈余 = 增加值 - 劳动者报酬
+        operating_surplus = total_value_added - compensation_of_employees
+        
+        # 收入法 GDP
+        gdp_income = compensation_of_employees + taxes_on_production + operating_surplus
+        
+        # =====================================================================
+        # 5️⃣ 计算价格指数与实际 GDP
+        # =====================================================================
+        
+        # 获取当前价格水平
+        current_price_index = self._calculate_price_index(month)
+        base_price_index = self._calculate_price_index(base_month) if base_month != month else 1.0
+        
+        # 价格指数（基期=100）
+        if base_price_index > 0:
+            price_index = (current_price_index / base_price_index) * 100
+        else:
+            price_index = 100.0
+        
+        # 实际 GDP（去除价格因素）
+        deflator = price_index / 100.0 if price_index > 0 else 1.0
+        real_gdp = gdp_expenditure / deflator if deflator > 0 else gdp_expenditure
+        
+        # =====================================================================
+        # 6️⃣ 计算增长率（与上月比较）
+        # =====================================================================
+        
+        prev_gdp = self._get_previous_month_gdp(month - 1)
+        gdp_growth_rate = None
+        real_gdp_growth_rate = None
+        if prev_gdp and prev_gdp.get("nominal_gdp", 0) > 0:
+            gdp_growth_rate = (gdp_expenditure / prev_gdp["nominal_gdp"]) - 1.0
+        if prev_gdp and prev_gdp.get("real_gdp", 0) > 0:
+            real_gdp_growth_rate = (real_gdp / prev_gdp["real_gdp"]) - 1.0
+        
+        # =====================================================================
+        # 7️⃣ 计算关键比率
+        # =====================================================================
+        
+        # 消费率
+        consumption_rate = consumption_total / gdp_expenditure if gdp_expenditure > 0 else 0.0
+        
+        # 投资率
+        investment_rate = inventory_investment / gdp_expenditure if gdp_expenditure > 0 else 0.0
+        
+        # 政府支出占比
+        government_rate = government_expenditure / gdp_expenditure if gdp_expenditure > 0 else 0.0
+        
+        # 劳动报酬占比（收入分配）
+        labor_share = compensation_of_employees / gdp_income if gdp_income > 0 else 0.0
+        
+        # 资本回报率（营业盈余/资本存量）
+        total_capital = sum(self.firm_capital_stock.values()) if hasattr(self, "firm_capital_stock") else 0.0
+        capital_return_rate = operating_surplus / total_capital if total_capital > 0 else 0.0
+        
+        # =====================================================================
+        # 8️⃣ 构建返回结果
+        # =====================================================================
+        
+        return {
+            "month": month,
+            
+            # 核心 GDP 指标
+            "nominal_gdp": gdp_expenditure,  # 名义 GDP（支出法，主指标）
+            "real_gdp": real_gdp,            # 实际 GDP（去除价格因素）
+            "price_index": price_index,       # 价格指数（基期=100）
+            "deflator": deflator,             # GDP 平减指数
+            
+            # 三种核算方法
+            "gdp_by_method": {
+                "expenditure": gdp_expenditure,   # 支出法
+                "production": gdp_production,     # 生产法
+                "income": gdp_income,             # 收入法
+                "discrepancy": {
+                    "exp_vs_prod": gdp_expenditure - gdp_production,
+                    "exp_vs_income": gdp_expenditure - gdp_income,
+                    "prod_vs_income": gdp_production - gdp_income,
+                },
+            },
+            
+            # 支出法分解: GDP = C + G + I
+            "expenditure_components": {
+                "consumption": {
+                    "total": consumption_total,
+                    "household_consumption_with_tax": household_consumption,
+                    "household_consumption_ex_tax": household_consumption_ex_tax,
+                    "vat_paid_by_household": household_consumption - household_consumption_ex_tax,
+                },
+                "government": {
+                    "total": government_expenditure,
+                    "procurement": government_procurement,
+                    "wages": government_wages,
+                },
+                "investment": {
+                    "inventory_investment": inventory_investment,
+                    "total_output": total_output,
+                    "total_sales_ex_tax": total_sales_ex_tax,
+                },
+                "net_exports": 0.0,  # 封闭经济
+            },
+            
+            # 生产法分解: GDP = Σ(VA) + 税
+            "production_components": {
+                "total_output": total_output,
+                "intermediate_consumption": total_intermediate,
+                "gross_value_added": total_value_added,
+                "taxes_on_products": vat_collected,
+                "by_industry": {
+                    industry: {
+                        "output": industry_production.get(industry, 0.0),
+                        "intermediate": industry_intermediate.get(industry, 0.0),
+                        "value_added": va,
+                        "share": va / total_value_added if total_value_added > 0 else 0.0,
+                    }
+                    for industry, va in industry_value_added.items()
+                },
+            },
+            
+            # 收入法分解: GDP = W + T + π
+            "income_components": {
+                "compensation_of_employees": {
+                    "total": compensation_of_employees,
+                    "wages_net": total_wages,
+                    "labor_tax": labor_tax_collected,
+                    "fica_tax": fica_tax_collected,
+                    "private_wages": private_wages,
+                    "government_wages": government_wages,
+                },
+                "taxes_on_production": {
+                    "total": taxes_on_production,
+                    "vat": vat_collected,
+                    "corporate_tax": corporate_tax_collected,
+                },
+                "operating_surplus": operating_surplus,
+            },
+            
+            # 税收统计
+            "tax_revenue": {
+                "total": vat_collected + labor_tax_collected + fica_tax_collected + corporate_tax_collected,
+                "vat": vat_collected,
+                "labor_tax": labor_tax_collected,
+                "fica_tax": fica_tax_collected,
+                "corporate_tax": corporate_tax_collected,
+            },
+            
+            # 增长率
+            "growth_rates": {
+                "nominal_gdp_growth": gdp_growth_rate,
+                "real_gdp_growth": real_gdp_growth_rate,
+            },
+            
+            # 关键比率
+            "ratios": {
+                "consumption_rate": consumption_rate,
+                "investment_rate": investment_rate,
+                "government_rate": government_rate,
+                "labor_share": labor_share,
+                "capital_return_rate": capital_return_rate,
+            },
+            
+            # 行业销售分布
+            "industry_sales": dict(industry_sales),
+        }
+    
+    def _get_firm_industry(self, firm_id: str) -> str:
+        """获取企业所属行业"""
+        # 尝试从企业实例获取
+        if hasattr(self, "firm") and self.firm:
+            for firm in self.firm:
+                fid = getattr(firm, "firm_id", None) or getattr(firm, "id", None)
+                if str(fid) == str(firm_id):
+                    return str(getattr(firm, "industry", "Unknown") or "Unknown")
+        # 从 firm_monthly_data 的元数据获取（如果有存储）
+        return "Unknown"
+    
+    def _calculate_price_index(self, month: int) -> float:
+        """
+        计算价格指数（拉氏指数简化版）
+        
+        使用商品市场价格注册表计算加权平均价格
+        """
+        if not hasattr(self, "market_price_registry") or not self.market_price_registry:
+            return 1.0
+        
+        # 尝试从交易历史计算平均价格
+        transactions = self.tx_by_month.get(month, [])
+        if not transactions:
+            transactions = [tx for tx in self.tx_history if tx.month == month]
+        
+        total_value = 0.0
+        total_quantity = 0.0
+        
+        for tx in transactions:
+            if str(getattr(tx, "type", "") or "") in ("purchase", "government_procurement"):
+                metadata = getattr(tx, "metadata", {}) or {}
+                quantity = float(metadata.get("quantity", 0.0) or 0.0)
+                amount = float(getattr(tx, "amount", 0.0) or 0.0)
+                if quantity > 0:
+                    total_value += amount
+                    total_quantity += quantity
+        
+        if total_quantity > 0:
+            return total_value / total_quantity
+        return 1.0
+    
+    def _get_previous_month_gdp(self, month: int) -> Optional[Dict[str, float]]:
+        """获取上月 GDP 数据（用于计算增长率）"""
+        if month < 0:
+            return None
+        
+        # 尝试从缓存获取
+        if hasattr(self, "_gdp_cache") and month in self._gdp_cache:
+            return self._gdp_cache[month]
+        
+        # 简单计算上月数据
+        try:
+            prev_stats = self.calculate_gdp_comprehensive(month)
+            return {
+                "nominal_gdp": prev_stats.get("nominal_gdp", 0.0),
+                "real_gdp": prev_stats.get("real_gdp", 0.0),
+            }
+        except Exception:
+            return None
+    
+    def cache_gdp_result(self, month: int, result: Dict[str, Any]) -> None:
+        """缓存 GDP 计算结果（用于增长率计算）"""
+        if not hasattr(self, "_gdp_cache"):
+            self._gdp_cache: Dict[int, Dict[str, float]] = {}
+        self._gdp_cache[month] = {
+            "nominal_gdp": result.get("nominal_gdp", 0.0),
+            "real_gdp": result.get("real_gdp", 0.0),
+        }
