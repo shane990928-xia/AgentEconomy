@@ -231,17 +231,22 @@ class Government:
         
         逻辑：服务费收入 → 雇佣公务员 → 提供政府服务
         
+        如果没有服务费收入（如预热第一个月），使用初始预算。
+        
         Returns:
             本期可用于雇佣的预算
         """
+        # 初始预算：保证政府在第一个月也能招聘公务员
+        INITIAL_GOVERNMENT_LABOR_BUDGET = 50000.0  # 政府初始劳动预算
+        
         # 获取政府服务费收入
         service_fee_summary = self.get_service_fee_summary(period=period)
         service_fee_income = service_fee_summary.get("total", 0.0)
         by_type = service_fee_summary.get("by_type", {})
         
         if service_fee_income <= 0:
-            self.logger.debug("政府服务费收入为0，不招聘")
-            return 0.0
+            self.logger.info(f"政府服务费收入为0，使用初始预算: {INITIAL_GOVERNMENT_LABOR_BUDGET:.2f}")
+            return INITIAL_GOVERNMENT_LABOR_BUDGET
         
         # 获取各政府部门的 compensation 比率
         ratios = self._get_government_compensation_ratios()

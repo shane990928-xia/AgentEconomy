@@ -478,7 +478,7 @@ class Simulator:
         
         # ========== 劳动力市场 ==========
         with self._time_block("发布岗位", month=month, preheat=True):
-            await self._post_jobs(month)
+            await self._post_jobs(month, production_stats=production_stats, service_stats=service_consumption_stats)
         with self._time_block("招聘匹配", month=month, preheat=True):
             await self._match_jobs(month, use_llm=False)
         with self._time_block("发放工资", month=month, preheat=True):
@@ -1492,9 +1492,35 @@ class Simulator:
             "price_index": price_index_stats,
         }
 
-    async def _post_jobs(self, month: int) -> None:
-        # 企业发布岗位
-        tasks = [firm.post_jobs(period=month) for firm in (self.firms or [])]
+    async def _post_jobs(
+        self,
+        month: int,
+        production_stats: Optional[Dict[str, Any]] = None,
+        service_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        企业发布岗位
+        
+        Args:
+            month: 当前月份
+            production_stats: 本月生产统计 {by_firm: {firm_id: {qty, value}}}
+            service_stats: 本月服务消费统计 {by_industry: {industry_code: amount}}
+        """
+        # 从 production_stats 提取各企业的生产价值作为劳动预算基础
+        production_by_firm = (production_stats or {}).get("by_firm", {}) if production_stats else {}
+        service_by_industry = (service_stats or {}).get("by_industry", {}) if service_stats else {}
+        
+        # 企业发布岗位，传入本月生产价值
+        tasks = []
+        for firm in (self.firms or []):
+            # 获取该企业本月的生产价值
+            firm_production = production_by_firm.get(firm.firm_id, {})
+            production_value = float(firm_production.get("value", 0.0) or 0.0)
+            # 服务企业使用服务消费数据
+            service_income = float(service_by_industry.get(firm.industry, 0.0) or 0.0)
+            # 传给企业作为本月需求基础
+            tasks.append(firm.post_jobs(period=month, current_demand_value=production_value + service_income))
+        
         postings_by_firm: Dict[str, List[Job]] = {}
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -413,29 +413,66 @@ class Firm:
             return ray.get(method.remote(*args, **kwargs))
         return method(*args, **kwargs)
 
-    def _compute_labor_budget(self, period: Optional[int] = None) -> float:
+    def _compute_labor_budget(self, period: Optional[int] = None, current_demand_value: Optional[float] = None) -> float:
+        """
+        计算本期劳动预算
+        
+        优先级：
+        1. 当前需求价值（如果传入）× compensation_ratio
+        2. 上月收入的 compensation_ratio 比例
+        3. 生产历史中最近一次的生产价值
+        4. 当前现金
+        5. 初始预算（用于第一个月没有任何数据的情况）
+        
+        Args:
+            period: 当前期间
+            current_demand_value: 本月的需求/生产价值（从 simulator 传入）
+        """
+        # 初始预算：保证企业在第一个月也能招聘
+        INITIAL_LABOR_BUDGET = 10000.0
+        
         base_value = 0.0
-        current_period = int(period if period is not None else self.current_period or 0)
-        if current_period > 0:
-            stats = self._call_economic_center(
-                "query_firm_monthly_financials",
-                firm_id=self.firm_id,
-                month=current_period - 1,
-            )
-            if isinstance(stats, dict):
-                base_value = float(stats.get("monthly_income", 0.0) or 0.0)
+        
+        # 优先使用当前需求价值
+        if current_demand_value is not None and current_demand_value > 0:
+            base_value = float(current_demand_value)
+        
+        # 其次查询上月收入
+        if base_value <= 0:
+            current_period = int(period if period is not None else self.current_period or 0)
+            if current_period > 0:
+                stats = self._call_economic_center(
+                    "query_firm_monthly_financials",
+                    firm_id=self.firm_id,
+                    month=current_period - 1,
+                )
+                if isinstance(stats, dict):
+                    base_value = float(stats.get("monthly_income", 0.0) or 0.0)
+        
+        # 再次查看生产历史
         if base_value <= 0 and self.production_history:
             try:
                 base_value = float(self.production_history[-1].get("production_value", 0.0) or 0.0)
             except Exception:
                 base_value = 0.0
+        
+        # 使用现金
         if base_value <= 0:
             base_value = float(self.cash or 0.0)
+        
+        # 如果还是没有基础值，使用初始预算
+        if base_value <= 0:
+            return INITIAL_LABOR_BUDGET
 
         budget = base_value * float(getattr(self, "compensation_ratio", 0.2) or 0.2)
         return max(0.0, budget)
 
-    def _decide_job_postings_from_data(self, period: Optional[int] = None, max_job_types: int = 10) -> List[Job]:
+    def _decide_job_postings_from_data(
+        self,
+        period: Optional[int] = None,
+        max_job_types: int = 10,
+        current_demand_value: Optional[float] = None
+    ) -> List[Job]:
         if not self.industry:
             return []
 
@@ -474,7 +511,7 @@ class Firm:
         if total_weight <= 0:
             total_weight = float(len(candidate_socs))
 
-        labor_budget = self._compute_labor_budget(period)
+        labor_budget = self._compute_labor_budget(period, current_demand_value=current_demand_value)
         if labor_budget <= 0:
             return []
 
@@ -575,9 +612,15 @@ class Firm:
         return self.employee_count, self.employee_list
 
     # Labor market operations
-    async def post_jobs(self, period: Optional[int] = None):
-        """Post jobs to the labor market"""
-        jobs = self._decide_job_postings_from_data(period=period)
+    async def post_jobs(self, period: Optional[int] = None, current_demand_value: Optional[float] = None):
+        """
+        Post jobs to the labor market
+        
+        Args:
+            period: 当前期间
+            current_demand_value: 本月的需求/生产价值（用于计算劳动预算）
+        """
+        jobs = self._decide_job_postings_from_data(period=period, current_demand_value=current_demand_value)
         if jobs:
             snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
             if not isinstance(snapshot, dict):
