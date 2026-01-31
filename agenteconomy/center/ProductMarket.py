@@ -9,7 +9,6 @@ from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.embedding import embedding
 from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
-from agenteconomy.data.category_to_retailer import get_retailer_code
 import os
 
 @ray.remote(num_cpus=8, max_concurrency=100)
@@ -73,12 +72,17 @@ class ProductMarket:
         
         # 统计零售商分布
         retailer_counts = {}
+        manufacturer_counts = {}
         
         for _, row in products_df.iterrows():
             try:
-                # 根据产品分类动态确定零售商
-                category = row.get('Category', '') or ''
-                retailer_code = get_retailer_code(category)
+                # 直接使用CSV中的Retailer_Code和Manufacturer_Code
+                retailer_code = str(row['Retailer_Code']) if pd.notna(row['Retailer_Code']) else '452'
+                manufacturer_code = str(row['Manufacturer_Code']) if pd.notna(row['Manufacturer_Code']) else None
+                
+                if not manufacturer_code:
+                    self.logger.warning(f"Skipping product {row['Uniq Id']}: no Manufacturer_Code")
+                    continue
                 
                 product = Product.create(
                     name=row['Product Name'],
@@ -90,20 +94,21 @@ class ProductMarket:
                     retail_price=float(row['List Price']),
                     base_retail_price=float(row['List Price']),
                     has_wholesale_layer=bool(row['Has_Wholesale_Layer']),
-                    manufacturer_code=row['Manufacturer_Code'],
-                    retailer_code=retailer_code,  # 使用动态映射的零售商代码
-                    owner_id=row['Manufacturer_Code'],  # 初始拥有者为制造商
+                    manufacturer_code=manufacturer_code,
+                    retailer_code=retailer_code,
+                    owner_id=manufacturer_code,  # 初始拥有者为制造商
                     amount=1000,
-                    classification=row.get('Industry', None),
-                    description=row.get('Description', None),
-                    brand=row.get('Brand', None),
+                    classification=str(row['Industry_fixed']) if pd.notna(row.get('Industry_fixed')) else None,
+                    description=str(row['Description']) if pd.notna(row.get('Description')) else None,
+                    brand=str(row['Brand']) if pd.notna(row.get('Brand')) else None,
                     available_stock=100,  # 初始库存
-                    category=category,  # 保存原始分类用于调试
+                    category=str(row['Category']) if pd.notna(row.get('Category')) else None,
                 )
                 self.add_product(product)
                 
                 # 统计
                 retailer_counts[retailer_code] = retailer_counts.get(retailer_code, 0) + 1
+                manufacturer_counts[manufacturer_code] = manufacturer_counts.get(manufacturer_code, 0) + 1
             except Exception as e:
                 self.logger.error(f"Failed to create product from row: {e}")
                 continue
@@ -112,7 +117,7 @@ class ProductMarket:
         self._calculate_industry_avg_prices()
         
         self.logger.info(f"Loaded {len(self.products)} products")
-        self.logger.info(f"Covered {len(self.products_by_industry)} manufacturer industries")
+        self.logger.info(f"Covered {len(self.products_by_industry)} manufacturer industries: {list(self.products_by_industry.keys())}")
         self.logger.info(f"Retailer distribution: {retailer_counts}")
 
     def add_product(self, product: Product):

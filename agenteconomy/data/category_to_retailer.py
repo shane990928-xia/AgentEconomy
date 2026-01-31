@@ -71,7 +71,7 @@ def get_retailer_code(category: str) -> str:
     Returns:
         零售商代码
     """
-    if not category:
+    if not category or not isinstance(category, str):
         return DEFAULT_RETAILER
     
     # 提取顶级分类
