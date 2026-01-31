@@ -684,16 +684,24 @@ class Simulator:
             available_budget = None
             if available_balance is not None:
                 available_budget = float(available_balance) + float(max(0.0, expected_income))
-            tasks.append(
+            
+            # 为每个家庭消费任务添加超时（120秒）
+            task = asyncio.wait_for(
                 hh.consume_v2(
                     top_k=top_k,
                     product_market=self.product_market,
                     available_balance=available_balance,
                     expected_income=expected_income,
                     available_budget=available_budget,
-                )
+                ),
+                timeout=120.0  # 2分钟超时
             )
+            tasks.append(task)
         outputs = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 统计超时数量并使用降级方案
+        timeout_count = 0
+        fallback_count = 0
         
         # 禁用进度追踪并打印最终状态
         status = consumption_progress.get_status()
@@ -707,12 +715,37 @@ class Simulator:
         )
         
         for hh, out in zip(self.households, outputs):
-            if isinstance(out, Exception):
+            if isinstance(out, asyncio.TimeoutError):
+                timeout_count += 1
+                # 使用降级消费计划
+                available_budget = balance_by_household.get(hh.household_id, 0.0)
+                expected_income = expected_income_by_household.get(hh.household_id, 0.0)
+                total_budget = float(available_budget) + float(max(0.0, expected_income))
+                out = hh.generate_fallback_consumption_plan(
+                    available_budget=total_budget,
+                    product_market=self.product_market,
+                )
+                fallback_count += 1
+                logger.warning(f"[消费超时] {hh.household_id} 使用降级消费计划")
+                results.append((hh, out))
+            elif isinstance(out, Exception):
                 logger.error(f"Household {hh.household_id} consumption failed: {out}")
-                continue
-            if not isinstance(out, dict):
-                continue
-            results.append((hh, out))
+                # 其他异常也使用降级方案
+                available_budget = balance_by_household.get(hh.household_id, 0.0)
+                expected_income = expected_income_by_household.get(hh.household_id, 0.0)
+                total_budget = float(available_budget) + float(max(0.0, expected_income))
+                out = hh.generate_fallback_consumption_plan(
+                    available_budget=total_budget,
+                    product_market=self.product_market,
+                )
+                fallback_count += 1
+                results.append((hh, out))
+            elif isinstance(out, dict):
+                results.append((hh, out))
+        
+        if timeout_count > 0 or fallback_count > 0:
+            logger.warning(f"[消费进度] 超时:{timeout_count} 降级:{fallback_count}")
+            
         if self._debug_enabled():
             self._log_consumption_plans(results)
             self._log_consumption_budget_status(results, balance_by_household, expected_income_by_household)

@@ -1,8 +1,10 @@
 from dotenv import load_dotenv
 load_dotenv()
 from typing import List, Optional, Dict, Any, Set
+import warnings
 import ray
 import pandas as pd
+import numpy as np
 from qdrant_client.models import Filter, FieldCondition, MatchValue, PointIdsList
 from agenteconomy.center.Model import *
 from agenteconomy.utils.logger import get_logger
@@ -10,6 +12,10 @@ from agenteconomy.utils.embedding import embedding
 from agenteconomy.utils.product_attribute_loader import get_product_attributes
 from agenteconomy.utils.load_qdrant_client import load_client
 import os
+
+# 抑制 Qdrant 本地模式的数值计算警告（不影响功能）
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="qdrant_client.local")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
 # 制造业名称 -> 零售商代码 映射
 # 基于 Industry_fixed 列的行业名称（不是IO代码）

@@ -1345,10 +1345,18 @@ class Household:
     # LLM helper (minimal)
     # -------------------------------------------------------------------------
 
-    async def _llm_chat(self, *, system: str, user: str, temperature: float = 0.2) -> str:
+    async def _llm_chat(self, *, system: str, user: str, temperature: float = 0.2, timeout: float = 60.0) -> str:
         # temperature is currently ignored by agenteconomy.llm.llm.call_llm; kept for extensibility.
-        content = await call_llm(prompt=user, system_prompt=system, model_type=self.llm_model_type)
-        return (content or "").strip()
+        # 添加超时保护，防止 LLM 调用卡住
+        try:
+            content = await asyncio.wait_for(
+                call_llm(prompt=user, system_prompt=system, model_type=self.llm_model_type),
+                timeout=timeout
+            )
+            return (content or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(f"[LLM超时] {self.household_id} LLM调用超时 ({timeout}秒)")
+            return "{}"  # 返回空 JSON，让调用方处理
 
     @staticmethod
     def _json_loads_loose(text: str) -> Any:
@@ -1712,6 +1720,128 @@ class Household:
         Step4 (placeholder): validate purchase reasonableness. Not implemented yet.
         """
         return True
+
+    def generate_fallback_consumption_plan(
+        self,
+        available_budget: Optional[float] = None,
+        product_market=None,
+    ) -> Dict[str, Any]:
+        """
+        降级消费计划：当 LLM/向量搜索超时时，生成基于规则的简单消费计划。
+        
+        策略：
+        1. 按历史消费比例分配预算（如果有）
+        2. 从各品类中随机选择有库存的商品
+        3. 尽量保证基本消费需求（食品、日用品）
+        """
+        avail_budget = float(available_budget or 0.0)
+        if avail_budget <= 0:
+            return self._empty_consumption_result(avail_budget)
+        
+        # 默认预算分配比例（基于典型家庭消费结构）
+        default_budget_ratios = {
+            "Retail merchandise": 0.35,  # 零售商品
+            "housing": 0.30,             # 住房
+            "transportation": 0.15,      # 交通
+            "healthcare": 0.10,          # 医疗
+            "utilities": 0.05,           # 公用事业
+            "insurance": 0.05,           # 保险
+        }
+        
+        budgets = {k: avail_budget * v for k, v in default_budget_ratios.items()}
+        retail_budget = budgets.get("Retail merchandise", 0.0)
+        
+        # 生成简单的品类分配
+        category_ratios = {
+            "Food & Groceries": 0.40,
+            "Household Essentials": 0.25,
+            "Personal Care": 0.15,
+            "Clothing & Apparel": 0.10,
+            "Electronics": 0.10,
+        }
+        
+        category_plans = []
+        for cat, ratio in category_ratios.items():
+            cat_budget = retail_budget * ratio
+            category_plans.append({
+                "category": cat,
+                "budget_amount": cat_budget,
+                "need_descriptions": [f"Basic {cat.lower()} needs"],
+            })
+        
+        # 尝试从 ProductMarket 获取一些基本商品
+        purchases = []
+        market = product_market or self.product_market
+        if market is not None:
+            try:
+                # 获取一些食品类商品（最基本的需求）
+                search_method = getattr(market, "search_by_vector", None)
+                if search_method is not None:
+                    is_actor = hasattr(search_method, "remote")
+                    queries = ["food groceries", "household essentials", "personal care"]
+                    
+                    for i, query in enumerate(queries):
+                        cat = list(category_ratios.keys())[i]
+                        cat_budget = retail_budget * list(category_ratios.values())[i]
+                        
+                        try:
+                            if is_actor:
+                                products = ray.get(search_method.remote(query, top_k=3))
+                            else:
+                                products = search_method(query, top_k=3)
+                            
+                            if products:
+                                # 选择第一个有库存的商品
+                                for p in products:
+                                    stock = float(getattr(p, "available_stock", 0) or 0)
+                                    if stock > 0:
+                                        purchases.append({
+                                            "category": cat,
+                                            "product_id": str(getattr(p, "product_id", "")),
+                                            "allocated_budget": cat_budget * 0.5,  # 保守分配
+                                            "reason": "fallback_purchase",
+                                        })
+                                        break
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"[降级消费] {self.household_id} 获取商品失败: {e}")
+        
+        return {
+            "step0": {
+                "total_budget": avail_budget,
+                "budgets": budgets,
+                "note": "fallback_plan",
+                "available_balance": avail_budget,
+                "expected_income": 0.0,
+                "available_budget": avail_budget,
+            },
+            "step1": {
+                "total_budget": retail_budget,
+                "category_plans": category_plans,
+                "note": "fallback_plan",
+            },
+            "step2": {"category_bundles": {}},
+            "step3": {"purchases": purchases, "note": "fallback_plan"},
+            "is_fallback": True,
+        }
+    
+    def _empty_consumption_result(self, avail_budget: float = 0.0) -> Dict[str, Any]:
+        """返回空的消费结果"""
+        return {
+            "step0": {
+                "total_budget": 0.0,
+                "budgets": {},
+                "note": "no_budget",
+                "available_balance": avail_budget,
+                "expected_income": 0.0,
+                "available_budget": avail_budget,
+            },
+            "step1": {"total_budget": 0.0, "category_plans": [], "note": "no_budget"},
+            "step2": {"category_bundles": {}},
+            "step3": {"purchases": [], "note": "no_budget"},
+            "is_fallback": True,
+        }
 
     async def consume_v2(
         self,
