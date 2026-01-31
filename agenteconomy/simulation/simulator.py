@@ -17,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
@@ -72,6 +73,12 @@ class Simulator:
         self._last_balance_by_household: Dict[str, float] = {}
         self._last_expected_income_by_household: Dict[str, float] = {}
         self._last_sales_by_product: Dict[str, float] = {}
+        
+        # 配置更大的线程池以支持更高的并发度
+        # 默认线程池大小是 min(32, cpu_count+4)，对于大量household并发消费不够用
+        # 这里设置为 household 数量的 2 倍 或最小 64
+        self._thread_pool_size = max(64, self.config.num_households * 2)
+        self._thread_pool: Optional[ThreadPoolExecutor] = None
 
         # Metrics
         
@@ -354,13 +361,30 @@ class Simulator:
     async def run_simulation(self):
         """Run simulation"""
         logger.info("Running simulation...")
-        if self.config.preheat_months > 0:
-            logger.info(f"Running preheat for {self.config.preheat_months} months...")
-            await self._run_preheat(self.config.preheat_months)
-            if self.economic_center is not None:
-                self._call_actor(self.economic_center, "reset_transactions")
-        for month in range(1, self.config.num_months + 1):
-            await self._run_month(month)
+        
+        # 配置更大的线程池以支持更高的并发度
+        # asyncio.to_thread() 默认使用的线程池太小，无法支持大量household并发
+        loop = asyncio.get_running_loop()
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=self._thread_pool_size,
+            thread_name_prefix="household_consumption"
+        )
+        loop.set_default_executor(self._thread_pool)
+        logger.info(f"Configured thread pool with {self._thread_pool_size} workers for parallel consumption")
+        
+        try:
+            if self.config.preheat_months > 0:
+                logger.info(f"Running preheat for {self.config.preheat_months} months...")
+                await self._run_preheat(self.config.preheat_months)
+                if self.economic_center is not None:
+                    self._call_actor(self.economic_center, "reset_transactions")
+            for month in range(1, self.config.num_months + 1):
+                await self._run_month(month)
+        finally:
+            # 清理线程池
+            if self._thread_pool is not None:
+                self._thread_pool.shutdown(wait=False)
+                self._thread_pool = None
             
     async def _run_preheat(self, months: int):
         """
