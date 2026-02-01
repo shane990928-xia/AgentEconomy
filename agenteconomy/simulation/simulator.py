@@ -8,10 +8,11 @@ from agenteconomy.center.Ecocenter import EconomicCenter
 from agenteconomy.center.LaborMarket import LaborMarket
 from agenteconomy.center.ProductMarket import ProductMarket
 from agenteconomy.agent.firm import Firm, ManufactureFirm, RetailFirm
-from agenteconomy.agent.household import Household, consumption_progress, set_llm_max_concurrency
+from agenteconomy.agent.household import Household, consumption_progress
 from agenteconomy.agent.government import Government
 from agenteconomy.agent.bank import Bank
 from agenteconomy.simulation.agent_loader import create_firms, create_households
+from agenteconomy.simulation.checkpoint import CheckpointManager
 from agenteconomy.market.AbstractResourceMarket import AbstractResourceMarket
 from datetime import datetime
 from collections import defaultdict
@@ -80,9 +81,21 @@ class Simulator:
         self._thread_pool_size = max(64, self.config.num_households * 2)
         self._thread_pool: Optional[ThreadPoolExecutor] = None
 
+        # Checkpoint 管理器
+        checkpoint_dir = os.path.join(
+            getattr(self.config, "checkpoint_output_dir", "output/checkpoints"),
+            self._record_run_id
+        )
+        self._checkpoint_manager = CheckpointManager(
+            checkpoint_dir=checkpoint_dir,
+            compress=getattr(self.config, "checkpoint_compress", True)
+        )
+        self._save_checkpoint_interval: int = getattr(self.config, "checkpoint_interval", 1)
+        
         # Metrics
         
         logger.info(f"Simulator initialized with {self.config.num_months} months and {self.config.num_households} households")
+        logger.info(f"Checkpoint enabled: interval={self._save_checkpoint_interval}, dir={checkpoint_dir}")
 
     async def setup_simulation_environment(self):
         """Setup simulation environment"""
@@ -211,6 +224,84 @@ class Simulator:
             elif isinstance(firm, RetailFirm):
                 self.retailers_by_industry[firm.industry] = firm
     
+    async def resume_from_checkpoint(self, checkpoint_path: Optional[str] = None) -> bool:
+        """
+        从 Checkpoint 恢复模拟状态并继续执行
+        
+        Args:
+            checkpoint_path: Checkpoint 文件路径。如果为 None，则使用最新的 checkpoint
+            
+        Returns:
+            是否成功恢复
+        """
+        # 找到 checkpoint 文件
+        if checkpoint_path is None:
+            checkpoint_path = self._checkpoint_manager.get_latest_checkpoint()
+        
+        if checkpoint_path is None:
+            logger.error("没有找到可用的 Checkpoint 文件")
+            return False
+        
+        logger.info(f"从 Checkpoint 恢复: {checkpoint_path}")
+        
+        try:
+            # 加载 checkpoint 数据
+            checkpoint_data = self._checkpoint_manager.load_checkpoint(checkpoint_path)
+            
+            # 验证配置兼容性
+            saved_config = checkpoint_data.get("config", {})
+            if saved_config.get("num_households") != self.config.num_households:
+                logger.warning(
+                    f"Checkpoint 家庭数量 ({saved_config.get('num_households')}) "
+                    f"与当前配置 ({self.config.num_households}) 不匹配，可能导致恢复不完整"
+                )
+            
+            # 恢复状态
+            self._checkpoint_manager.restore_simulator(self, checkpoint_data)
+            
+            # 更新 current_month 以从下一月开始
+            resume_month = int(checkpoint_data.get("month", 1))
+            self.current_month = resume_month + 1
+            
+            logger.info(f"✅ 状态恢复成功，将从月份 {self.current_month} 继续执行")
+            return True
+            
+        except Exception as e:
+            logger.error(f"从 Checkpoint 恢复失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    async def run_simulation_from_checkpoint(self, checkpoint_path: Optional[str] = None):
+        """
+        从 Checkpoint 恢复并继续运行模拟
+        
+        Args:
+            checkpoint_path: Checkpoint 文件路径。如果为 None，则使用最新的 checkpoint
+        """
+        # 先恢复状态
+        if not await self.resume_from_checkpoint(checkpoint_path):
+            logger.error("无法从 Checkpoint 恢复，退出")
+            return
+        
+        # 配置线程池
+        loop = asyncio.get_running_loop()
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=self._thread_pool_size,
+            thread_name_prefix="household_consumption"
+        )
+        loop.set_default_executor(self._thread_pool)
+        logger.info(f"Configured thread pool with {self._thread_pool_size} workers")
+        
+        try:
+            # 从恢复的月份继续执行
+            for month in range(self.current_month, self.config.num_months + 1):
+                await self._run_month(month)
+        finally:
+            if self._thread_pool is not None:
+                self._thread_pool.shutdown(wait=False)
+                self._thread_pool = None
+
     def _register_manufacturers_for_intermediate_goods(self):
         """
         预注册所有制造商到中间品市场价格注册表
@@ -527,6 +618,21 @@ class Simulator:
                 wage_stats=wage_stats,
                 procurement_stats=procurement_stats,
             )
+        
+        # ========== 保存 Checkpoint (预热阶段) ==========
+        # 预热阶段最后一个月保存 checkpoint
+        preheat_months = int(getattr(self.config, "preheat_months", 0) or 0)
+        if month == preheat_months and self._save_checkpoint_interval > 0:
+            with self._time_block("保存检查点", month=month, preheat=True):
+                try:
+                    checkpoint_path = self._checkpoint_manager.save_checkpoint(
+                        simulator=self,
+                        month=month,
+                        preheat=True
+                    )
+                    logger.info(f"💾 预热 Checkpoint 已保存: {checkpoint_path}")
+                except Exception as e:
+                    logger.warning(f"保存预热 Checkpoint 失败: {e}")
 
     async def _run_month(self, month: int):
         """Run a single month"""
@@ -635,6 +741,19 @@ class Simulator:
         
         # 月末余额汇总
         self._log_month_end_summary(econ_month)
+        
+        # ========== 保存 Checkpoint ==========
+        if self._save_checkpoint_interval > 0 and month % self._save_checkpoint_interval == 0:
+            with self._time_block("保存检查点", month=month, preheat=False):
+                try:
+                    checkpoint_path = self._checkpoint_manager.save_checkpoint(
+                        simulator=self,
+                        month=month,
+                        preheat=False
+                    )
+                    logger.info(f"💾 Checkpoint 已保存: {checkpoint_path}")
+                except Exception as e:
+                    logger.warning(f"保存 Checkpoint 失败: {e}")
 
     async def _collect_consumption_plans(self, top_k: int = 10) -> List[Tuple[Household, Dict[str, Any]]]:
         results: List[Tuple[Household, Dict[str, Any]]] = []

@@ -895,3 +895,82 @@ class LaborMarket:
             Processing summary dict
         """
         return self.process_monthly_wages(month)
+
+    # =========================================================================
+    # Checkpoint Support (用于断点续跑)
+    # =========================================================================
+    def get_matched_jobs(self) -> List[Dict[str, Any]]:
+        """
+        获取所有已匹配的工作（用于 checkpoint）
+        
+        Returns:
+            匹配工作数据列表
+        """
+        matched_data = []
+        for mj in self.matched_jobs:
+            matched_data.append({
+                "match_id": mj.match_id,
+                "job_id": mj.job_id,
+                "firm_id": mj.firm_id,
+                "household_id": mj.household_id,
+                "lh_type": mj.lh_type,
+                "matched_wage_rate": mj.matched_wage_rate,
+                "accepted": mj.accepted,
+                "month_matched": mj.month_matched,
+                "job_SOC": getattr(mj, "job_SOC", None),
+                "job_title": getattr(mj, "job_title", None),
+            })
+        return matched_data
+    
+    def restore_matched_jobs(self, matched_jobs_data: List[Dict[str, Any]]) -> int:
+        """
+        从 checkpoint 恢复已匹配的工作关系
+        
+        注意：这个方法假设模拟器已经重新初始化了 labor_hours，
+        只需要恢复 matched_jobs 列表和相关索引。
+        
+        Args:
+            matched_jobs_data: 匹配工作数据列表
+            
+        Returns:
+            恢复的工作数量
+        """
+        restored = 0
+        
+        for data in matched_jobs_data:
+            try:
+                mj = MatchedJob(
+                    match_id=data.get("match_id", str(uuid4())),
+                    job_id=data.get("job_id", ""),
+                    firm_id=data.get("firm_id", ""),
+                    household_id=data.get("household_id", ""),
+                    lh_type=data.get("lh_type", ""),
+                    matched_wage_rate=float(data.get("matched_wage_rate") or 0.0),
+                    accepted=bool(data.get("accepted", True)),
+                    month_matched=int(data.get("month_matched") or 0),
+                )
+                if hasattr(mj, "job_SOC"):
+                    mj.job_SOC = data.get("job_SOC")
+                if hasattr(mj, "job_title"):
+                    mj.job_title = data.get("job_title")
+                
+                self.matched_jobs.append(mj)
+                
+                # 更新 matched_workers 集合
+                worker_key = self._worker_key(mj.household_id, mj.lh_type)
+                self.matched_workers.add(worker_key)
+                
+                # 更新对应的 labor_hour 状态
+                if worker_key in self.labor_index:
+                    lh = self.labor_index[worker_key]
+                    lh.is_valid = False  # 已被雇佣
+                    lh.firm_id = mj.firm_id
+                    lh.job_SOC = mj.job_SOC if hasattr(mj, "job_SOC") else None
+                    lh.job_title = mj.job_title if hasattr(mj, "job_title") else None
+                
+                restored += 1
+            except Exception as e:
+                self.logger.warning(f"Failed to restore matched job: {e}")
+        
+        self.logger.info(f"Restored {restored} matched jobs from checkpoint")
+        return restored

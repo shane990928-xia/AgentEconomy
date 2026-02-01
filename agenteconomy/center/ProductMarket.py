@@ -975,6 +975,54 @@ class ProductMarket:
         """检查某个SKU是否活跃"""
         return sku_id in self._active_sku_set
 
+    # =========================================================================
+    # Checkpoint Support (用于断点续跑)
+    # =========================================================================
+    def get_all_products_snapshot(self) -> List[Dict[str, Any]]:
+        """
+        获取所有产品的快照数据（用于 checkpoint）
+        
+        Returns:
+            产品数据列表
+        """
+        products_snapshot = []
+        for product in self.products:
+            products_snapshot.append({
+                "product_id": product.product_id,
+                "sku_id": product.sku_id,
+                "name": product.name,
+                "price": float(product.price or 0.0),
+                "stock": float(product.stock or 0.0),
+                "manufacturer_code": product.manufacturer_code,
+                "retailer_code": product.retailer_code,
+                "is_active": product.is_active,
+            })
+        return products_snapshot
+    
+    def restore_products_snapshot(self, products_data: List[Dict[str, Any]]) -> int:
+        """
+        从 checkpoint 恢复产品库存和价格
+        
+        Args:
+            products_data: 产品数据列表
+            
+        Returns:
+            恢复的产品数量
+        """
+        restored = 0
+        product_data_by_id = {d["product_id"]: d for d in products_data}
+        
+        for product in self.products:
+            if product.product_id in product_data_by_id:
+                data = product_data_by_id[product.product_id]
+                product.price = float(data.get("price") or product.price or 0.0)
+                product.stock = float(data.get("stock") or product.stock or 0.0)
+                product.is_active = bool(data.get("is_active", product.is_active))
+                restored += 1
+        
+        self.logger.info(f"Restored {restored} product states from checkpoint")
+        return restored
+
 
 if __name__ == "__main__":
     pro_m = ProductMarket.remote()

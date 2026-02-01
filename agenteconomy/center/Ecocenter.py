@@ -2956,3 +2956,37 @@ class EconomicCenter:
             "nominal_gdp": result.get("nominal_gdp", 0.0),
             "real_gdp": result.get("real_gdp", 0.0),
         }
+
+    # =========================================================================
+    # Checkpoint Support (用于断点续跑)
+    # =========================================================================
+    def get_all_balances(self) -> Dict[str, float]:
+        """
+        获取所有代理的账户余额（用于 checkpoint）
+        
+        Returns:
+            Dict[agent_id, balance]
+        """
+        return {
+            agent_id: float(ledger.amount)
+            for agent_id, ledger in self.ledger.items()
+        }
+    
+    def restore_balances(self, ledger_data: Dict[str, float]) -> int:
+        """
+        从 checkpoint 恢复所有代理的账户余额
+        
+        Args:
+            ledger_data: Dict[agent_id, balance]
+            
+        Returns:
+            恢复的账户数量
+        """
+        restored = 0
+        for agent_id, balance in ledger_data.items():
+            if agent_id not in self.ledger:
+                self.ledger[agent_id] = Ledger()
+            self.ledger[agent_id].amount = float(balance)
+            restored += 1
+        self.logger.info(f"Restored {restored} account balances from checkpoint")
+        return restored
