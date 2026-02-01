@@ -9,6 +9,7 @@ import warnings
 
 # 简单粗暴屏蔽所有 Pydantic 序列化警告
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
+
 # 配置模型列表
 model_list = [
     {
@@ -62,18 +63,18 @@ async def call_llm_strong(prompt: str, system_prompt: str = "You are a helpful a
 
 
 async def call_llm(
-    prompt: str, 
+    prompt: str,
     system_prompt: str = "You are a helpful assistant.",
     model_type: Literal["simple", "strong"] = "simple"
 ) -> str:
     """
     统一的 LLM 调用接口，供所有实体和市场使用
-    
+
     Args:
         prompt: 用户提示词
         system_prompt: 系统提示词
         model_type: 模型类型，"simple" 为简单推理，"strong" 为强推理
-    
+
     Returns:
         模型的回答内容
     """

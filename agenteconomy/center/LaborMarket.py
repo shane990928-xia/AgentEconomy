@@ -925,18 +925,29 @@ class LaborMarket:
     def restore_matched_jobs(self, matched_jobs_data: List[Dict[str, Any]]) -> int:
         """
         从 checkpoint 恢复已匹配的工作关系
-        
+
         注意：这个方法假设模拟器已经重新初始化了 labor_hours，
         只需要恢复 matched_jobs 列表和相关索引。
-        
+
         Args:
             matched_jobs_data: 匹配工作数据列表
-            
+
         Returns:
             恢复的工作数量
         """
+        # 清空现有数据，避免重复
+        self.matched_jobs.clear()
+        self.matched_workers.clear()
+
+        # 重置所有 labor_hour 的状态
+        for lh in self.labor_hours:
+            lh.is_valid = True
+            lh.firm_id = None
+            lh.job_SOC = None
+            lh.job_title = None
+
         restored = 0
-        
+
         for data in matched_jobs_data:
             try:
                 mj = MatchedJob(

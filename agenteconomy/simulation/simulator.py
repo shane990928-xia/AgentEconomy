@@ -78,7 +78,7 @@ class Simulator:
         # 配置更大的线程池以支持更高的并发度
         # 默认线程池大小是 min(32, cpu_count+4)，对于大量household并发消费不够用
         # 这里设置为 household 数量的 2 倍 或最小 64
-        self._thread_pool_size = max(64, self.config.num_households * 2)
+        self._thread_pool_size = min(256, max(64, self.config.num_households * 2))
         self._thread_pool: Optional[ThreadPoolExecutor] = None
 
         # Checkpoint 管理器
@@ -539,29 +539,38 @@ class Simulator:
         for firm_id, stats in demand_by_mfg.items():
             expected_revenue = float(stats.get("value", 0.0))
             initial_cash = expected_revenue * capital_multiplier
-            
+
             firm = self._firm_by_id.get(firm_id)
             if firm is not None and initial_cash > 0:
                 firm.cash = initial_cash
+                # 同步到 EconomicCenter 的 ledger
+                if self.economic_center is not None:
+                    self._call_actor(self.economic_center, "set_agent_balance", firm_id, initial_cash)
                 total_initialized += 1
                 logger.debug(f"Initialized {firm_id} cash: {initial_cash:.2f} (from demand {expected_revenue:.2f})")
-        
+
         # 为零售商分配初始资金
         for firm_id, stats in demand_by_retail.items():
             expected_revenue = float(stats.get("value", 0.0))
             initial_cash = expected_revenue * capital_multiplier
-            
+
             firm = self._firm_by_id.get(firm_id)
             if firm is not None and initial_cash > 0:
                 firm.cash = initial_cash
+                # 同步到 EconomicCenter 的 ledger
+                if self.economic_center is not None:
+                    self._call_actor(self.economic_center, "set_agent_balance", firm_id, initial_cash)
                 total_initialized += 1
                 logger.debug(f"Initialized {firm_id} cash: {initial_cash:.2f} (from demand {expected_revenue:.2f})")
-        
+
         # 为没有需求的企业设置最低资金（用于基本运营）
         min_cash = float(getattr(self.config, "firm_min_initial_cash", 1000.0) or 1000.0)
         for firm in (self.firms or []):
             if firm.cash <= 0:
                 firm.cash = min_cash
+                # 同步到 EconomicCenter 的 ledger
+                if self.economic_center is not None:
+                    self._call_actor(self.economic_center, "set_agent_balance", firm.firm_id, min_cash)
                 total_initialized += 1
         
         logger.info(f"Phase 0: Initialized capital for {total_initialized} firms")
@@ -660,14 +669,6 @@ class Simulator:
             wage_stats = self._pay_wages(econ_month, record_transactions=True)
         self._log_wage_stats(wage_stats)
 
-        # ========== 企业所得税（工资发放后、生产前） ==========
-        logger.info(f"\n┌{'─' * 38}┐")
-        logger.info(f"│ 💰 税收结算                          │")
-        logger.info(f"└{'─' * 38}┘")
-        with self._time_block("企业所得税", month=month, preheat=False):
-            corporate_tax_stats = self._settle_corporate_tax(econ_month)
-        self._log_corporate_tax_stats(corporate_tax_stats)
-
         # ========== 商品市场 ==========
         logger.info(f"\n┌{'─' * 38}┐")
         logger.info(f"│ 🛒 商品市场                          │")
@@ -718,6 +719,12 @@ class Simulator:
         logger.info(f"\n┌{'─' * 38}┐")
         logger.info(f"│ 📊 月末结算                          │")
         logger.info(f"└{'─' * 38}┘")
+
+        # 企业所得税（销售完成后结算，此时当月收入已记录）
+        with self._time_block("企业所得税", month=month, preheat=False):
+            corporate_tax_stats = self._settle_corporate_tax(econ_month)
+        self._log_corporate_tax_stats(corporate_tax_stats)
+
         with self._time_block("银行利息", month=month, preheat=False):
             interest_stats = await self._pay_bank_interest(econ_month)
         
@@ -1255,6 +1262,12 @@ class Simulator:
                 )
             else:
                 self._manual_produce(firm, plan, sku_base_prices, month)
+
+            # 生产完成后，清空已生产产品的缓存，以便后续步骤获取最新库存
+            for sku_id in plan.keys():
+                if sku_id in snapshot_cache:
+                    del snapshot_cache[sku_id]
+
         return production_stats
 
     def _manual_produce(
@@ -1655,6 +1668,10 @@ class Simulator:
                     )
                     if tx_id:
                         self._call_actor(self.product_market, "update_stock", product_id, -qty)
+                        # 更新 snapshot_cache 中的库存，防止后续家庭超卖
+                        if product_id in snapshot_cache and snapshot_cache[product_id]:
+                            old_stock = int(snapshot_cache[product_id].get("available_stock") or 0)
+                            snapshot_cache[product_id]["available_stock"] = max(0, old_stock - qty)
                         stats = consumption_by_household[hh.household_id]
                         stats["qty"] += float(qty)
                         stats["value"] += amount
@@ -1673,6 +1690,10 @@ class Simulator:
                             )
                 else:
                     self._call_actor(self.product_market, "update_stock", product_id, -qty)
+                    # 更新 snapshot_cache 中的库存，防止后续家庭超卖
+                    if product_id in snapshot_cache and snapshot_cache[product_id]:
+                        old_stock = int(snapshot_cache[product_id].get("available_stock") or 0)
+                        snapshot_cache[product_id]["available_stock"] = max(0, old_stock - qty)
                     seller.cash += amount
                     stats = consumption_by_household[hh.household_id]
                     stats["qty"] += float(qty)

@@ -222,6 +222,20 @@ class CheckpointManager:
         except Exception as e:
             logger.warning(f"Failed to get ledger snapshot: {e}")
             return {}
+
+    def _get_firm_monthly_data_snapshot(self, economic_center) -> Dict[str, Any]:
+        """获取企业月度数据快照"""
+        if economic_center is None:
+            return {}
+        try:
+            if hasattr(economic_center, "remote"):
+                data = ray.get(economic_center.get_firm_monthly_data_snapshot.remote())
+            else:
+                data = economic_center.get_firm_monthly_data_snapshot()
+            return data or {}
+        except Exception as e:
+            logger.warning(f"Failed to get firm monthly data snapshot: {e}")
+            return {}
     
     def _get_product_market_snapshot(self, product_market) -> Dict[str, Any]:
         """获取 ProductMarket 快照"""
@@ -314,7 +328,10 @@ class CheckpointManager:
             
             # EconomicCenter ledger (账户余额)
             "ledger": self._get_ledger_snapshot(simulator.economic_center),
-            
+
+            # EconomicCenter 企业月度数据（用于企业所得税计算）
+            "firm_monthly_data": self._get_firm_monthly_data_snapshot(simulator.economic_center),
+
             # ProductMarket (产品库存和价格)
             "product_market": self._get_product_market_snapshot(simulator.product_market),
             
@@ -414,7 +431,19 @@ class CheckpointManager:
                 logger.info(f"Restored {len(ledger_data)} account balances")
             except Exception as e:
                 logger.warning(f"Failed to restore ledger: {e}")
-        
+
+        # 恢复 EconomicCenter 企业月度数据
+        firm_monthly_data = checkpoint_data.get("firm_monthly_data", {})
+        if firm_monthly_data and simulator.economic_center:
+            try:
+                if hasattr(simulator.economic_center, "remote"):
+                    ray.get(simulator.economic_center.restore_firm_monthly_data.remote(firm_monthly_data))
+                else:
+                    simulator.economic_center.restore_firm_monthly_data(firm_monthly_data)
+                logger.info(f"Restored firm monthly data for {len(firm_monthly_data)} firms")
+            except Exception as e:
+                logger.warning(f"Failed to restore firm monthly data: {e}")
+
         # 恢复 ProductMarket
         product_market_data = checkpoint_data.get("product_market", {})
         if product_market_data.get("products") and simulator.product_market:

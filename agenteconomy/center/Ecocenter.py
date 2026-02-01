@@ -775,24 +775,26 @@ class EconomicCenter:
     def set_agent_balance(self, agent_id: str, amount: float) -> float:
         """
         设置代理余额为指定值（覆盖式）。
-        用于“企业初始资金 = 初始库存总价值”等初始化场景。
+        用于"企业初始资金 = 初始库存总价值"等初始化场景。
         """
         if agent_id not in self.ledger:
-            self.ledger[agent_id] = Ledger()
-        self.ledger[agent_id].amount = float(amount)
+            self.ledger[agent_id] = Ledger.create(agent_id, float(amount))
+        else:
+            self.ledger[agent_id].amount = float(amount)
         return self.ledger[agent_id].amount
-    
+
     def update_balance(self, agent_id: str, amount: float):
         """
         更新代理的余额（可以是正数或负数）
-        
+
         Args:
             agent_id: 代理ID
             amount: 变动金额（正数增加，负数减少）
         """
         if agent_id not in self.ledger:
-            self.ledger[agent_id] = Ledger()
-        self.ledger[agent_id].amount += amount
+            self.ledger[agent_id] = Ledger.create(agent_id, float(amount))
+        else:
+            self.ledger[agent_id].amount += amount
     
     # register_middleware
     def register_middleware(self, tx_type: str, middleware_fn: Callable[[Transaction, Dict[str, float]], None], tag: Optional[str] = None):
@@ -1102,7 +1104,7 @@ class EconomicCenter:
         
         # 检查买家余额
         if buyer_id not in self.ledger:
-            self.ledger[buyer_id] = Ledger()
+            self.ledger[buyer_id] = Ledger.create(buyer_id, 0.0)
         if self.ledger[buyer_id].amount < total_cost_with_tax:
             self.logger.warning(f"购买失败: 买家 {buyer_id} 余额不足 (需要 {total_cost_with_tax:.2f})")
             return None
@@ -1126,7 +1128,7 @@ class EconomicCenter:
         
         # 政府收取消费税
         if "gov_main_simulation" not in self.ledger:
-            self.ledger["gov_main_simulation"] = Ledger()
+            self.ledger["gov_main_simulation"] = Ledger.create("gov_main_simulation", 0.0)
         self.ledger["gov_main_simulation"].amount += tax_amount
 
         # 创建购买交易记录
@@ -1146,7 +1148,7 @@ class EconomicCenter:
 
         # 企业收入
         if seller_id not in self.ledger:
-            self.ledger[seller_id] = Ledger()
+            self.ledger[seller_id] = Ledger.create(seller_id, 0.0)
         self.ledger[seller_id].amount += base_price
         self.record_firm_income(seller_id, base_price)
         self.record_firm_monthly_income(seller_id, month, base_price)
@@ -1184,7 +1186,7 @@ class EconomicCenter:
         
         # 检查零售商余额
         if retailer_id not in self.ledger:
-            self.ledger[retailer_id] = Ledger()
+            self.ledger[retailer_id] = Ledger.create(retailer_id, 0.0)
         if self.ledger[retailer_id].amount < wholesale_amount:
             self.logger.warning(
                 f"进货失败: 零售商 {retailer_id} 余额不足 "
@@ -1212,7 +1214,7 @@ class EconomicCenter:
 
         # 制造商收入
         if manufacturer_id not in self.ledger:
-            self.ledger[manufacturer_id] = Ledger()
+            self.ledger[manufacturer_id] = Ledger.create(manufacturer_id, 0.0)
         self.ledger[manufacturer_id].amount += wholesale_amount
         self.record_firm_income(manufacturer_id, wholesale_amount)
         self.record_firm_monthly_income(manufacturer_id, month, wholesale_amount)
@@ -2975,18 +2977,54 @@ class EconomicCenter:
     def restore_balances(self, ledger_data: Dict[str, float]) -> int:
         """
         从 checkpoint 恢复所有代理的账户余额
-        
+
         Args:
             ledger_data: Dict[agent_id, balance]
-            
+
         Returns:
             恢复的账户数量
         """
         restored = 0
         for agent_id, balance in ledger_data.items():
             if agent_id not in self.ledger:
-                self.ledger[agent_id] = Ledger()
-            self.ledger[agent_id].amount = float(balance)
+                self.ledger[agent_id] = Ledger.create(agent_id, float(balance))
+            else:
+                self.ledger[agent_id].amount = float(balance)
             restored += 1
         self.logger.info(f"Restored {restored} account balances from checkpoint")
+        return restored
+
+    def get_firm_monthly_data_snapshot(self) -> Dict[str, Dict[int, Dict[str, float]]]:
+        """
+        获取企业月度数据快照（用于 checkpoint）
+
+        Returns:
+            Dict[firm_id, Dict[month, Dict[field, value]]]
+        """
+        snapshot = {}
+        for firm_id, months_data in self.firm_monthly_data.items():
+            snapshot[firm_id] = {}
+            for month, data in months_data.items():
+                snapshot[firm_id][month] = dict(data)
+        return snapshot
+
+    def restore_firm_monthly_data(self, data: Dict[str, Dict[str, Dict[str, float]]]) -> int:
+        """
+        从 checkpoint 恢复企业月度数据
+
+        Args:
+            data: Dict[firm_id, Dict[month_str, Dict[field, value]]]
+                  注意：JSON 序列化后 month 会变成字符串
+
+        Returns:
+            恢复的企业数量
+        """
+        restored = 0
+        for firm_id, months_data in data.items():
+            for month_str, month_data in months_data.items():
+                month = int(month_str)
+                for field, value in month_data.items():
+                    self.firm_monthly_data[firm_id][month][field] = float(value or 0.0)
+            restored += 1
+        self.logger.info(f"Restored firm monthly data for {restored} firms from checkpoint")
         return restored
