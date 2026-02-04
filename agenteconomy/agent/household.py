@@ -135,6 +135,7 @@ from agenteconomy.llm.prompt_template import (
     CONSUMPTION_MAJOR_BUDGET_PROMPT,
     CONSUMPTION_NEEDS_BY_CATEGORY_PROMPT,
     PURCHASE_BY_CATEGORY_PROMPT,
+    PURCHASE_ALL_CATEGORIES_PROMPT,
     JOB_APPLICATION_DECISION_PROMPT,
     JOB_OFFER_DECISION_PROMPT,
     PERSONA_UPDATE_PROMPT,
@@ -420,6 +421,9 @@ class Household:
 
         # LLM config: use agenteconomy.llm.llm Router ("simple" / "strong")
         self.llm_model_type: Literal["simple", "strong"] = "simple"
+        
+        # 上月实际消费（用于消费惯性计算）
+        self._last_month_consumption: float = 0.0
 
     @classmethod
     def _normalize_census_code_4(cls, code: Any) -> Optional[str]:
@@ -932,6 +936,157 @@ class Household:
         except Exception:
             return 0.0
 
+    def _calculate_reasonable_monthly_budget(
+        self,
+        available_balance: Optional[float] = None,
+        expected_income: Optional[float] = None,
+    ) -> float:
+        """
+        计算合理的月度消费预算上限。
+        
+        核心原则：
+        1. 消费 = 收入部分 + 储蓄提取部分
+        2. 消费惯性：不允许消费剧烈波动，平滑过渡
+        3. 历史支出作为参考基准
+        
+        消费预算 = max(
+            收入 * 消费倾向 + 储蓄提取,
+            上月消费 * (1 - 最大下降比例),
+            最低生活费
+        )
+        
+        Returns:
+            本月合理的消费预算上限
+        """
+        # 获取收入信息
+        income = 0.0
+        if expected_income is not None and expected_income > 0:
+            income = float(expected_income)
+        else:
+            try:
+                income = float(self.csv_values.get("ER85629") or 0.0)
+            except (ValueError, TypeError):
+                pass
+        
+        # 获取历史支出作为参考（来自原始数据）
+        historical_expenditure = 0.0
+        try:
+            historical_expenditure = float(self.csv_values.get("ER85768") or 0.0)
+        except (ValueError, TypeError):
+            pass
+        
+        # 上月实际消费（模拟中的动态消费）
+        last_consumption = float(self._last_month_consumption or 0.0)
+        
+        # 获取储蓄
+        savings = float(available_balance or 0.0)
+        
+        # ========== 参数设置 ==========
+        MINIMUM_LIVING_EXPENSE = 1500.0   # 最低生活费
+        ABSOLUTE_MAX = 15000.0            # 绝对上限
+        INCOME_CONSUMPTION_RATE = 0.85    # 收入的消费倾向（85%用于消费）
+        MAX_CONSUMPTION_DROP = 0.08       # 消费下降的最大幅度（8%/月）
+        MAX_CONSUMPTION_RISE = 0.15       # 消费上升的最大幅度（15%/月）
+        
+        # 储蓄提取率：根据收入情况动态调整
+        # - 有稳定收入时：少动用储蓄（1.5%）
+        # - 无收入/低收入时：更多动用储蓄（5%），以维持消费
+        if income > MINIMUM_LIVING_EXPENSE:
+            SAVINGS_MONTHLY_DRAW_RATE = 0.015  # 有收入时，储蓄提取1.5%/月
+        else:
+            SAVINGS_MONTHLY_DRAW_RATE = 0.05   # 无/低收入时，储蓄提取5%/月（约20个月耗尽）
+        
+        # ========== 计算本期预算 ==========
+        
+        # 1. 基于收入的消费
+        income_consumption = income * INCOME_CONSUMPTION_RATE
+        
+        # 2. 储蓄提取（允许动用储蓄的一部分，用于平滑消费）
+        savings_draw = 0.0
+        if savings > 0:
+            # 基础储蓄提取：储蓄的 1.5%/月
+            savings_draw = savings * SAVINGS_MONTHLY_DRAW_RATE
+        
+        # 3. 历史支出参考（首月特别重要）
+        # 如果有历史支出数据，使用它作为参考
+        # 如果没有，使用储蓄的合理比例作为初始消费基准
+        if historical_expenditure > 0:
+            reference_budget = historical_expenditure
+        elif savings > 0:
+            # 假设储蓄是24个月的生活费，则月消费 ≈ 储蓄/24
+            reference_budget = max(savings / 24.0, MINIMUM_LIVING_EXPENSE)
+        else:
+            reference_budget = MINIMUM_LIVING_EXPENSE
+        
+        # 4. 计算基础预算
+        # 核心公式：预算 = 收入消费 + 储蓄提取
+        # 但要确保预算合理（不能太高也不能太低）
+        base_budget = income_consumption + savings_draw
+        
+        # 如果储蓄很高但收入很低（失业或低收入），允许更多储蓄消费
+        # 关键改进：储蓄充足时，应该维持一定的消费水平
+        if savings > reference_budget * 12:  # 储蓄够1年以上的消费
+            # 储蓄充足，预算至少是历史支出的 60%
+            min_from_historical = reference_budget * 0.6
+            if base_budget < min_from_historical:
+                base_budget = min_from_historical
+        elif savings > reference_budget * 6:  # 储蓄够半年消费
+            # 储蓄中等，预算至少是历史支出的 40%
+            min_from_historical = reference_budget * 0.4
+            if base_budget < min_from_historical:
+                base_budget = min_from_historical
+        
+        # ========== 消费惯性调整 ==========
+        if last_consumption > 0:
+            # 有上月消费记录
+            # 限制消费变化幅度，实现平滑过渡
+            min_budget = last_consumption * (1 - MAX_CONSUMPTION_DROP)
+            max_budget = last_consumption * (1 + MAX_CONSUMPTION_RISE)
+            
+            # 如果基础预算低于惯性下限
+            if base_budget < min_budget:
+                # 检查是否有足够的储蓄支撑惯性消费
+                if savings >= min_budget * 12:  # 储蓄至少能支撑 12 个月的惯性消费
+                    budget = min_budget  # 维持惯性消费
+                elif savings >= min_budget * 6:
+                    # 储蓄中等，允许小幅下降
+                    budget = (min_budget + base_budget) / 2
+                else:
+                    # 储蓄不足，逐步降低消费
+                    budget = max(base_budget, MINIMUM_LIVING_EXPENSE)
+            # 如果基础预算高于惯性上限
+            elif base_budget > max_budget:
+                budget = max_budget
+            else:
+                budget = base_budget
+        else:
+            # 无上月消费记录（首月）
+            # 使用 reference_budget 作为起点
+            # reference_budget 已经考虑了历史支出和储蓄情况
+            budget = max(reference_budget, base_budget)
+        
+        # ========== 最终约束 ==========
+        # 确保至少有最低生活费
+        budget = max(budget, MINIMUM_LIVING_EXPENSE)
+        
+        # 应用绝对上限
+        budget = min(budget, ABSOLUTE_MAX)
+        
+        # 确保不超过可用余额
+        if savings > 0:
+            budget = min(budget, savings * 0.95)  # 保留 5% 余额
+        
+        return max(budget, 0.0)
+    
+    def update_last_month_consumption(self, actual_consumption: float) -> None:
+        """
+        更新上月实际消费，用于下个月的消费惯性计算。
+        
+        Args:
+            actual_consumption: 本月实际消费总额（商品 + 服务）
+        """
+        self._last_month_consumption = max(0.0, float(actual_consumption or 0.0))
+
     @staticmethod
     @lru_cache(maxsize=1)
     def _load_job_skill_data() -> Dict[str, Dict[str, Any]]:
@@ -1038,23 +1193,31 @@ class Household:
         """
         Public getter: RP (head) SOC occupation code.
         Note: stored in csv_values["ER82181"] after census2010->SOC mapping.
+        Returns None if code is missing, empty, or 0 (indicating no occupation).
         """
         v = self.csv_values.get("ER82181")
         if v is None:
             return None
         s = str(v).strip()
-        return s if s else None
+        # Filter out empty strings and "0" (no occupation code)
+        if not s or s == "0" or s == "0.0":
+            return None
+        return s
 
     def get_sp_soc_occupation_code(self) -> Optional[str]:
         """
         Public getter: SP (spouse) SOC occupation code.
         Note: stored in csv_values["ER82500"] after census2010->SOC mapping.
+        Returns None if code is missing, empty, or 0 (indicating no occupation).
         """
         v = self.csv_values.get("ER82500")
         if v is None:
             return None
         s = str(v).strip()
-        return s if s else None
+        # Filter out empty strings and "0" (no occupation code)
+        if not s or s == "0" or s == "0.0":
+            return None
+        return s
 
     def update_total_assets(self, delta: float) -> float:
         """
@@ -1345,12 +1508,14 @@ class Household:
     # LLM helper (minimal)
     # -------------------------------------------------------------------------
 
-    async def _llm_chat(self, *, system: str, user: str, temperature: float = 0.2, timeout: float = 60.0) -> str:
+    async def _llm_chat(self, *, system: str, user: str, temperature: float = 0.2, timeout: float = 180.0) -> str:
         # temperature is currently ignored by agenteconomy.llm.llm.call_llm; kept for extensibility.
-        # 添加超时保护，防止 LLM 调用卡住
+        # 超时在 call_llm 内部处理（只计算实际API调用时间，不包括等待信号量的时间）
         try:
-            content = await asyncio.wait_for(
-                call_llm(prompt=user, system_prompt=system, model_type=self.llm_model_type),
+            content = await call_llm(
+                prompt=user,
+                system_prompt=system,
+                model_type=self.llm_model_type,
                 timeout=timeout
             )
             return (content or "").strip()
@@ -1368,9 +1533,11 @@ class Household:
         Also handles common LLM JSON errors like trailing commas.
         """
         import re
-        
+
         s = (text or "").strip()
-        if s.startswith("```"):
+        # 处理 markdown 代码块（可能有前导空格）
+        if s.startswith("```") or s.lstrip().startswith("```"):
+            s = s.lstrip()
             # strip leading fence line
             lines = s.splitlines()
             if lines:
@@ -1382,12 +1549,18 @@ class Household:
             # if first token is "json", drop it
             if s.lower().startswith("json"):
                 s = s[4:].strip()
-        
+
         def try_parse(json_str: str) -> Any:
             """Try to parse JSON, fixing common errors."""
             try:
                 return json.loads(json_str)
             except json.JSONDecodeError:
+                # Fix invalid escape sequences (e.g., \n in product names)
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_str)
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    pass
                 # Fix trailing commas before } or ]
                 fixed = re.sub(r',\s*([}\]])', r'\1', json_str)
                 try:
@@ -1395,21 +1568,95 @@ class Household:
                 except json.JSONDecodeError:
                     # Fix missing commas between values (e.g., "key": value\n"key2")
                     fixed2 = re.sub(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*"', r'\1,\n"', fixed)
-                    return json.loads(fixed2)
-        
+                    try:
+                        return json.loads(fixed2)
+                    except json.JSONDecodeError:
+                        # Fix missing commas between } and {
+                        fixed3 = re.sub(r'\}\s*\{', r'},{', fixed2)
+                        # Fix missing commas between ] and {
+                        fixed3 = re.sub(r'\]\s*\{', r'],{', fixed3)
+                        # Fix missing commas between } and "
+                        fixed3 = re.sub(r'\}\s*"', r'},"', fixed3)
+                        # Also fix invalid escapes in the final attempt
+                        fixed3 = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', fixed3)
+                        return json.loads(fixed3)
+
+        def try_fix_truncated_json(json_str: str) -> Any:
+            """
+            尝试修复被截断的 JSON。
+            策略：
+            1. 补全未闭合的字符串（添加缺失的引号）
+            2. 补全未闭合的括号（添加缺失的 }, ]）
+            """
+            s = json_str.strip()
+            if not s:
+                return {}
+
+            # 统计未闭合的括号
+            open_braces = 0
+            open_brackets = 0
+            in_string = False
+            escape_next = False
+
+            for char in s:
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == '\\' and in_string:
+                    escape_next = True
+                    continue
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        open_braces += 1
+                    elif char == '}':
+                        open_braces -= 1
+                    elif char == '[':
+                        open_brackets += 1
+                    elif char == ']':
+                        open_brackets -= 1
+
+            # 如果在字符串中被截断，先闭合字符串
+            if in_string:
+                s += '"'
+
+            # 移除可能的尾部逗号
+            s = re.sub(r',\s*$', '', s)
+
+            # 补全未闭合的括号
+            # 先闭合 ]，再闭合 }（因为通常数组在对象内部）
+            s += ']' * max(0, open_brackets)
+            s += '}' * max(0, open_braces)
+
+            return try_parse(s)
+
         try:
             return try_parse(s)
         except Exception:
-            # fallback: extract first JSON object/array substring
+            # fallback 1: 尝试修复截断的 JSON
+            try:
+                return try_fix_truncated_json(s)
+            except Exception:
+                pass
+
+            # fallback 2: extract first JSON object/array substring
             start_obj = s.find("{")
             start_arr = s.find("[")
             if start_obj == -1 and start_arr == -1:
-                raise
+                return {}  # 返回空字典而不是抛出异常
             start = start_obj if (start_obj != -1 and (start_arr == -1 or start_obj < start_arr)) else start_arr
             end = s.rfind("}") if start == start_obj else s.rfind("]")
             if end == -1:
-                raise
-            return try_parse(s[start : end + 1])
+                # 没有找到结束括号，尝试修复截断的 JSON
+                try:
+                    return try_fix_truncated_json(s[start:])
+                except Exception:
+                    return {}
+            try:
+                return try_parse(s[start : end + 1])
+            except Exception:
+                return {}  # 解析失败返回空字典
 
     # -------------------------------------------------------------------------
     # Consumption decision (NEW workflow): step1-4
@@ -1493,17 +1740,46 @@ class Household:
         available_balance: Optional[float] = None,
         expected_income: Optional[float] = None,
         available_budget: Optional[float] = None,
+        macro_indicators: Optional[Dict[str, Any]] = None,
     ) -> MajorBudgetOutput:
         """
         Step0 (default LLM):
         Allocate major budget buckets. Retail merchandise budget will be used as step1 total_budget.
+
+        Args:
+            available_balance: Current account balance
+            expected_income: Expected income this period
+            available_budget: Total available budget for consumption
+            macro_indicators: Macroeconomic indicators dict with keys:
+                - inflation_rate: Monthly inflation rate (e.g., 0.02 = 2%)
+                - unemployment_rate: Current unemployment rate
+                - interest_rate: Monthly interest rate on savings
+                - tax_rate: Effective tax rate
+                - price_index: Current price index (base=100)
         """
+        # 默认宏观指标
+        macro = macro_indicators or {}
+        macro_text = f"""- inflation_rate: {macro.get("inflation_rate", 0.0):.2%}
+- unemployment_rate: {macro.get("unemployment_rate", 0.0):.2%}
+- interest_rate: {macro.get("interest_rate", 0.0):.2%} (monthly)
+- price_index: {macro.get("price_index", 100.0):.1f} (base=100)"""
+
+        # 获取上月消费和历史支出
+        last_consumption = float(self._last_month_consumption or 0.0)
+        historical_exp = 0.0
+        try:
+            historical_exp = float(self.csv_values.get("ER85768") or 0.0)
+        except (ValueError, TypeError):
+            pass
+
         prompt = CONSUMPTION_MAJOR_BUDGET_PROMPT.format(
             persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
             past_household_status=self.past_household_status_text,
-            available_balance=json.dumps(available_balance, ensure_ascii=False),
-            expected_income=json.dumps(expected_income, ensure_ascii=False),
-            available_budget=json.dumps(available_budget, ensure_ascii=False),
+            available_balance=f"${available_balance:,.2f}" if available_balance else "unknown",
+            expected_income=f"${expected_income:,.2f}" if expected_income else "$0.00 (unemployed)",
+            last_month_consumption=f"${last_consumption:,.2f}" if last_consumption > 0 else "N/A (first month)",
+            historical_expenditure=f"${historical_exp:,.2f}" if historical_exp > 0 else "N/A",
+            macro_indicators=macro_text,
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         parsed = self._json_loads_loose(raw)
@@ -1662,45 +1938,122 @@ class Household:
     ) -> BudgetedPurchasePlan:
         """
         Step3:
-        Call LLM once per category IN PARALLEL. Each call chooses product_ids from that category's candidate list
-        and allocates per-product budgets. Then we merge all categories into one purchase plan.
+        Call LLM ONCE with all categories' candidates, then parse results.
+        This reduces LLM calls from N (one per category) to 1.
         """
         purchases: List[BudgetedPurchase] = []
         notes: List[str] = []
-        raw_map: Dict[str, str] = {}
 
-        # 并发调用所有品类的 LLM（而不是串行）
-        async def process_category(cat: str) -> Tuple[str, str, Any]:
+        def rule_based_selection(cat: str, cat_budget: float, candidates: List[Dict]) -> List[BudgetedPurchase]:
+            """规则选择：当LLM失败时，从candidates中选择商品"""
+            if not candidates or cat_budget <= 0:
+                return []
+
+            # 策略：选择价格最低的前3个商品，平均分配预算
+            sorted_candidates = sorted(
+                [c for c in candidates if c.get("product_id") and (c.get("price") or 0) > 0],
+                key=lambda x: float(x.get("price") or 999999)
+            )[:3]
+
+            if not sorted_candidates:
+                # 如果没有有效价格，随机选前3个
+                sorted_candidates = [c for c in candidates if c.get("product_id")][:3]
+
+            if not sorted_candidates:
+                return []
+
+            budget_per_item = cat_budget / len(sorted_candidates)
+            result = []
+            for c in sorted_candidates:
+                result.append(BudgetedPurchase(
+                    category=cat,
+                    product_id=str(c.get("product_id", "")),
+                    allocated_budget=budget_per_item,
+                    reason="rule-based fallback selection",
+                ))
+            return result
+
+        # 构建所有品类的数据（限制候选商品数量和信息量以避免超出 token 限制）
+        MAX_CANDIDATES_PER_CATEGORY = 10  # 每个品类最多 10 个候选
+        MAX_NAME_LENGTH = 80  # 商品名称最大长度
+
+        categories_data = []
+        for cat in sorted(category_bundles.keys()):
             bundle = category_bundles.get(cat) or {}
-            cat_budget = float(bundle.get("budget_amount") or 0.0)
-            need_descs = list(bundle.get("need_descriptions") or [])
-            candidates = list(bundle.get("candidates") or [])
+            raw_candidates = list(bundle.get("candidates") or [])
 
-            prompt = PURCHASE_BY_CATEGORY_PROMPT.format(
-                persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
-                past_household_status=self.past_household_status_text,
-                category=json.dumps(cat, ensure_ascii=False),
-                category_budget=json.dumps(cat_budget, ensure_ascii=False),
-                need_descriptions=json.dumps(need_descs, ensure_ascii=False),
-                candidates=json.dumps(candidates, ensure_ascii=False),
-            )
+            # 限制候选数量并简化信息
+            simplified_candidates = []
+            for c in raw_candidates[:MAX_CANDIDATES_PER_CATEGORY]:
+                name = str(c.get("name") or "")[:MAX_NAME_LENGTH]
+                simplified_candidates.append({
+                    "product_id": c.get("product_id"),
+                    "name": name,
+                    "price": c.get("price"),
+                })
+
+            categories_data.append({
+                "category": cat,
+                "budget": float(bundle.get("budget_amount") or 0.0),
+                "need_descriptions": list(bundle.get("need_descriptions") or [])[:3],  # 最多 3 个需求描述
+                "candidates": simplified_candidates,
+            })
+
+        # 单次LLM调用处理所有品类
+        prompt = PURCHASE_ALL_CATEGORIES_PROMPT.format(
+            persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
+            past_household_status=self.past_household_status_text,
+            categories_data=json.dumps(categories_data, ensure_ascii=False),
+        )
+
+        try:
             raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
             parsed = self._json_loads_loose(raw)
-            return (cat, raw, parsed, cat_budget)
-        
-        # 并发执行所有品类
-        sorted_cats = sorted(category_bundles.keys())
-        results = await asyncio.gather(*[process_category(cat) for cat in sorted_cats], return_exceptions=True)
-        
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning(f"[Step3] {self.household_id} 品类处理异常: {result}")
+        except Exception as e:
+            logger.warning(f"[Step3] {self.household_id} LLM调用失败，全部使用规则选择: {e}")
+            # 全部使用规则选择
+            for cat_data in categories_data:
+                cat = cat_data["category"]
+                cat_budget = cat_data["budget"]
+                candidates = cat_data["candidates"]
+                fallback_purchases = rule_based_selection(cat, cat_budget, candidates)
+                purchases.extend(fallback_purchases)
+                notes.append(f"{cat}: rule-based fallback (LLM error)")
+            return BudgetedPurchasePlan(purchases=purchases, note=" | ".join(notes), raw_llm_output="{}")
+
+        # 解析LLM返回的结果
+        llm_categories = list(parsed.get("categories") or [])
+        if not llm_categories:
+            # LLM 返回的 JSON 可能格式不对，尝试其他字段名
+            llm_categories = list(parsed.get("category_purchases") or parsed.get("results") or [])
+
+        llm_cat_map = {c.get("category"): c for c in llm_categories if c.get("category")}
+        # 创建小写映射用于大小写不敏感匹配
+        llm_cat_map_lower = {k.lower(): v for k, v in llm_cat_map.items()}
+
+        for cat_data in categories_data:
+            cat = cat_data["category"]
+            cat_budget = cat_data["budget"]
+            candidates = cat_data["candidates"]
+
+            # 先尝试精确匹配，再尝试大小写不敏感匹配
+            llm_result = llm_cat_map.get(cat) or llm_cat_map_lower.get(cat.lower())
+            if not llm_result:
+                # LLM没有返回该品类，使用规则选择
+                fallback_purchases = rule_based_selection(cat, cat_budget, candidates)
+                purchases.extend(fallback_purchases)
+                notes.append(f"{cat}: rule-based fallback (missing from LLM)")
                 continue
-            
-            cat, raw, parsed, cat_budget = result
-            raw_map[cat] = raw
-            notes.append(f"{cat}: {str(parsed.get('note') or '').strip()}")
-            recs = list(parsed.get("purchases") or [])
+
+            recs = list(llm_result.get("purchases") or [])
+            if not recs:
+                # LLM返回空结果，使用规则选择
+                fallback_purchases = rule_based_selection(cat, cat_budget, candidates)
+                purchases.extend(fallback_purchases)
+                notes.append(f"{cat}: rule-based fallback (empty LLM response)")
+                continue
+
+            notes.append(f"{cat}: {str(llm_result.get('note') or '').strip()}")
             shares: List[float] = []
             for rec in recs:
                 share = float(rec.get("budget_share") or 0.0)
@@ -1710,7 +2063,7 @@ class Household:
                     share = 1.0
                 shares.append(share)
 
-            # If shares sum to > 1, scale down so total spend does not exceed category budget.
+            # If shares sum to > 1, scale down
             s = sum(shares)
             if s > 1e-9 and s > 1.0:
                 shares = [x / s for x in shares]
@@ -1725,7 +2078,7 @@ class Household:
                     )
                 )
 
-        return BudgetedPurchasePlan(purchases=purchases, note=" | ".join([n for n in notes if n]), raw_llm_output=json.dumps(raw_map))
+        return BudgetedPurchasePlan(purchases=purchases, note=" | ".join([n for n in notes if n]), raw_llm_output=raw)
 
     def consumption_step4_validate(self, *args, **kwargs) -> bool:
         """
@@ -1863,10 +2216,24 @@ class Household:
         available_balance: Optional[float] = None,
         expected_income: Optional[float] = None,
         available_budget: Optional[float] = None,
+        macro_indicators: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        New end-to-end consumption flow (step1-4).
+        New end-to-end consumption flow (step0-4).
         Step4 is stubbed.
+
+        Args:
+            top_k: Number of candidate products to retrieve per need
+            product_market: ProductMarket instance for product search
+            available_balance: Current account balance
+            expected_income: Expected income this period
+            available_budget: Total available budget for consumption
+            macro_indicators: Macroeconomic indicators dict with keys:
+                - inflation_rate: Monthly inflation rate (e.g., 0.02 = 2%)
+                - unemployment_rate: Current unemployment rate
+                - interest_rate: Monthly interest rate on savings
+                - tax_rate: Effective tax rate
+                - price_index: Current price index (base=100)
         """
 
         avail_balance = None if available_balance is None else float(available_balance)
@@ -1885,15 +2252,33 @@ class Household:
             available_balance=avail_balance,
             expected_income=exp_income,
             available_budget=avail_budget,
+            macro_indicators=macro_indicators,
         )
-        if avail_budget is not None:
-            if step0.total_budget > avail_budget and step0.total_budget > 0:
-                scale = avail_budget / float(step0.total_budget)
-                step0.budgets = {k: float(v) * scale for k, v in (step0.budgets or {}).items()}
-                step0.total_budget = float(avail_budget)
-            elif avail_budget <= 0.0:
-                step0.budgets = {k: 0.0 for k in (step0.budgets or {}).keys()}
-                step0.total_budget = 0.0
+        
+        # 基本安全检查：确保不超过可用余额
+        # LLM 已经被提示考虑合理预算，这里只做最基本的约束
+        max_spendable = float(avail_balance or 0.0)
+        if max_spendable > 0 and step0.total_budget > max_spendable:
+            # 超过可用余额，按比例缩减
+            scale = max_spendable / float(step0.total_budget)
+            step0.budgets = {k: float(v) * scale for k, v in (step0.budgets or {}).items()}
+            step0.total_budget = float(max_spendable)
+            step0.note = f"{step0.note or ''} (capped to available balance)"
+        
+        # 最低保障：确保至少有基本生活费（如果储蓄允许）
+        MINIMUM_BUDGET = 1500.0
+        if step0.total_budget < MINIMUM_BUDGET and max_spendable >= MINIMUM_BUDGET:
+            # LLM 给的预算太低，提升到最低标准
+            step0.total_budget = MINIMUM_BUDGET
+            # 按原比例分配，如果没有比例则均分
+            if sum(step0.budgets.values()) > 0:
+                scale = MINIMUM_BUDGET / sum(step0.budgets.values())
+                step0.budgets = {k: float(v) * scale for k, v in step0.budgets.items()}
+            else:
+                per = MINIMUM_BUDGET / 6.0
+                step0.budgets = {k: per for k in step0.budgets.keys()}
+            step0.note = f"{step0.note or ''} (raised to minimum)"
+        
         consumption_progress.step0_complete()
         
         retail_budget = float((step0.budgets or {}).get("Retail merchandise") or 0.0)

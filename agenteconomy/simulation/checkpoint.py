@@ -69,6 +69,8 @@ class CheckpointManager:
             "ER82500": getattr(hh, "ER82500", None),
             "RP_income": getattr(hh, "RP_income", 0.0),
             "SP_income": getattr(hh, "SP_income", 0.0),
+            # 消费惯性相关
+            "_last_month_consumption": getattr(hh, "_last_month_consumption", 0.0),
         }
     
     def _deserialize_household(self, hh: 'Household', data: Dict[str, Any]) -> None:
@@ -96,6 +98,9 @@ class CheckpointManager:
             hh.csv_values["ER82500"] = data["ER82500"]
         hh.RP_income = float(data.get("RP_income") or 0.0)
         hh.SP_income = float(data.get("SP_income") or 0.0)
+        
+        # 消费惯性
+        hh._last_month_consumption = float(data.get("_last_month_consumption") or 0.0)
     
     def _serialize_firm(self, firm: 'Firm') -> Dict[str, Any]:
         """序列化 Firm 状态"""
@@ -208,12 +213,16 @@ class CheckpointManager:
         if hasattr(bank, "loan_rate"):
             bank.loan_rate = float(data.get("loan_rate") or 0.0)
     
+    def _is_ray_actor(self, obj) -> bool:
+        """检查对象是否为 Ray Actor"""
+        return obj is not None and "ActorHandle" in str(type(obj))
+    
     def _get_ledger_snapshot(self, economic_center) -> Dict[str, float]:
         """获取 EconomicCenter 账本快照"""
         if economic_center is None:
             return {}
         try:
-            if hasattr(economic_center, "remote"):
+            if self._is_ray_actor(economic_center):
                 # Ray Actor
                 ledger = ray.get(economic_center.get_all_balances.remote())
             else:
@@ -228,7 +237,7 @@ class CheckpointManager:
         if economic_center is None:
             return {}
         try:
-            if hasattr(economic_center, "remote"):
+            if self._is_ray_actor(economic_center):
                 data = ray.get(economic_center.get_firm_monthly_data_snapshot.remote())
             else:
                 data = economic_center.get_firm_monthly_data_snapshot()
@@ -242,20 +251,23 @@ class CheckpointManager:
         if product_market is None:
             return {}
         try:
-            if hasattr(product_market, "remote"):
-                # Ray Actor
-                stats = ray.get(product_market.get_market_stats.remote())
-                # 获取所有产品的库存和价格
-                products_snapshot = []
-                products = ray.get(product_market.get_all_products_snapshot.remote())
-                if products:
-                    products_snapshot = products
+            if self._is_ray_actor(product_market):
+                # Ray Actor - 并行获取所有数据
+                stats_future = product_market.get_market_stats.remote()
+                products_future = product_market.get_all_products_snapshot.remote()
+                market_state_future = product_market.get_market_state_snapshot.remote()
+                # 一次性等待所有结果
+                stats, products_snapshot, market_state = ray.get([
+                    stats_future, products_future, market_state_future
+                ])
             else:
                 stats = product_market.get_market_stats()
                 products_snapshot = product_market.get_all_products_snapshot()
+                market_state = product_market.get_market_state_snapshot()
             return {
                 "stats": stats or {},
                 "products": products_snapshot or [],
+                "market_state": market_state or {},
             }
         except Exception as e:
             logger.warning(f"Failed to get product market snapshot: {e}")
@@ -266,18 +278,31 @@ class CheckpointManager:
         if labor_market is None:
             return {}
         try:
-            if hasattr(labor_market, "remote"):
-                summary = ray.get(labor_market.summary.remote())
-                matched_jobs = ray.get(labor_market.get_matched_jobs.remote())
+            if self._is_ray_actor(labor_market):
+                # 并行获取
+                summary_future = labor_market.summary.remote()
+                matched_jobs_future = labor_market.get_matched_jobs_snapshot.remote()
+                summary, matched_jobs = ray.get([summary_future, matched_jobs_future])
             else:
                 summary = labor_market.summary()
-                matched_jobs = labor_market.get_matched_jobs()
+                matched_jobs = labor_market.get_matched_jobs_snapshot()
             return {
                 "summary": summary or {},
                 "matched_jobs": matched_jobs or [],
             }
         except Exception as e:
             logger.warning(f"Failed to get labor market snapshot: {e}")
+            return {}
+    
+    def _get_abstract_resource_market_snapshot(self, abstract_resource_market) -> Dict[str, Any]:
+        """获取 AbstractResourceMarket 快照"""
+        if abstract_resource_market is None:
+            return {}
+        try:
+            # AbstractResourceMarket 不是 Ray Actor，直接调用
+            return abstract_resource_market.get_state_snapshot()
+        except Exception as e:
+            logger.warning(f"Failed to get abstract resource market snapshot: {e}")
             return {}
     
     def save_checkpoint(
@@ -338,13 +363,18 @@ class CheckpointManager:
             # LaborMarket (雇佣关系)
             "labor_market": self._get_labor_market_snapshot(simulator.labor_market),
             
+            # AbstractResourceMarket (服务/资源价格)
+            "abstract_resource_market": self._get_abstract_resource_market_snapshot(simulator.abstract_resource_market),
+            
             # Simulator 内部状态
             "simulator_state": {
                 "current_month": simulator.current_month,
                 "_last_price_index": simulator._last_price_index,
+                "_last_inflation_rate": getattr(simulator, "_last_inflation_rate", None),
                 "_last_balance_by_household": dict(simulator._last_balance_by_household or {}),
                 "_last_expected_income_by_household": dict(simulator._last_expected_income_by_household or {}),
                 "_last_sales_by_product": dict(simulator._last_sales_by_product or {}),
+                "_fixed_consumption_basket": dict(getattr(simulator, "_fixed_consumption_basket", None) or {}),
             },
         }
         
@@ -420,65 +450,96 @@ class CheckpointManager:
             self._deserialize_bank(simulator.bank, checkpoint_data["bank"])
             logger.info("Restored bank")
         
-        # 恢复 EconomicCenter ledger
+        # 并行恢复各个组件状态（使用批量 ray.get）
         ledger_data = checkpoint_data.get("ledger", {})
-        if ledger_data and simulator.economic_center:
-            try:
-                if hasattr(simulator.economic_center, "remote"):
-                    ray.get(simulator.economic_center.restore_balances.remote(ledger_data))
-                else:
-                    simulator.economic_center.restore_balances(ledger_data)
-                logger.info(f"Restored {len(ledger_data)} account balances")
-            except Exception as e:
-                logger.warning(f"Failed to restore ledger: {e}")
-
-        # 恢复 EconomicCenter 企业月度数据
         firm_monthly_data = checkpoint_data.get("firm_monthly_data", {})
-        if firm_monthly_data and simulator.economic_center:
-            try:
-                if hasattr(simulator.economic_center, "remote"):
-                    ray.get(simulator.economic_center.restore_firm_monthly_data.remote(firm_monthly_data))
-                else:
-                    simulator.economic_center.restore_firm_monthly_data(firm_monthly_data)
-                logger.info(f"Restored firm monthly data for {len(firm_monthly_data)} firms")
-            except Exception as e:
-                logger.warning(f"Failed to restore firm monthly data: {e}")
-
-        # 恢复 ProductMarket
         product_market_data = checkpoint_data.get("product_market", {})
-        if product_market_data.get("products") and simulator.product_market:
-            try:
-                if hasattr(simulator.product_market, "remote"):
-                    ray.get(simulator.product_market.restore_products_snapshot.remote(
-                        product_market_data["products"]
-                    ))
-                else:
-                    simulator.product_market.restore_products_snapshot(product_market_data["products"])
-                logger.info(f"Restored product market state")
-            except Exception as e:
-                logger.warning(f"Failed to restore product market: {e}")
-        
-        # 恢复 LaborMarket
         labor_market_data = checkpoint_data.get("labor_market", {})
-        if labor_market_data.get("matched_jobs") and simulator.labor_market:
+        
+        # 收集所有需要执行的恢复操作（Ray Actor 远程调用）
+        restore_futures = []
+        restore_names = []
+        
+        # EconomicCenter 恢复
+        if simulator.economic_center and self._is_ray_actor(simulator.economic_center):
+            if ledger_data:
+                restore_futures.append(simulator.economic_center.restore_balances.remote(ledger_data))
+                restore_names.append(f"ledger ({len(ledger_data)} accounts)")
+            if firm_monthly_data:
+                restore_futures.append(simulator.economic_center.restore_firm_monthly_data.remote(firm_monthly_data))
+                restore_names.append(f"firm monthly data ({len(firm_monthly_data)} firms)")
+        
+        # ProductMarket 恢复
+        if simulator.product_market and self._is_ray_actor(simulator.product_market):
+            if product_market_data.get("products"):
+                restore_futures.append(simulator.product_market.restore_products_snapshot.remote(
+                    product_market_data["products"]
+                ))
+                restore_names.append("product market products")
+            if product_market_data.get("market_state"):
+                restore_futures.append(simulator.product_market.restore_market_state.remote(
+                    product_market_data["market_state"]
+                ))
+                restore_names.append("product market state")
+        
+        # LaborMarket 恢复
+        if simulator.labor_market and self._is_ray_actor(simulator.labor_market):
+            if labor_market_data.get("matched_jobs"):
+                restore_futures.append(simulator.labor_market.restore_matched_jobs.remote(
+                    labor_market_data["matched_jobs"]
+                ))
+                restore_names.append("labor market")
+        
+        # 批量等待所有恢复操作完成
+        if restore_futures:
             try:
-                if hasattr(simulator.labor_market, "remote"):
-                    ray.get(simulator.labor_market.restore_matched_jobs.remote(
-                        labor_market_data["matched_jobs"]
-                    ))
-                else:
-                    simulator.labor_market.restore_matched_jobs(labor_market_data["matched_jobs"])
-                logger.info(f"Restored labor market state")
+                ray.get(restore_futures)
+                for name in restore_names:
+                    logger.info(f"Restored {name}")
             except Exception as e:
-                logger.warning(f"Failed to restore labor market: {e}")
+                logger.warning(f"Some restore operations failed: {e}")
+        
+        # 非 Ray Actor 的恢复（顺序执行）
+        if simulator.economic_center and not self._is_ray_actor(simulator.economic_center):
+            if ledger_data:
+                simulator.economic_center.restore_balances(ledger_data)
+            if firm_monthly_data:
+                simulator.economic_center.restore_firm_monthly_data(firm_monthly_data)
+        
+        if simulator.product_market and not self._is_ray_actor(simulator.product_market):
+            if product_market_data.get("products"):
+                simulator.product_market.restore_products_snapshot(product_market_data["products"])
+            if product_market_data.get("market_state"):
+                simulator.product_market.restore_market_state(product_market_data["market_state"])
+        
+        if simulator.labor_market and not self._is_ray_actor(simulator.labor_market):
+            if labor_market_data.get("matched_jobs"):
+                simulator.labor_market.restore_matched_jobs(labor_market_data["matched_jobs"])
+        
+        # 恢复 AbstractResourceMarket (服务/资源价格)
+        abstract_resource_market_data = checkpoint_data.get("abstract_resource_market", {})
+        if abstract_resource_market_data and simulator.abstract_resource_market:
+            try:
+                # AbstractResourceMarket 不是 Ray Actor，直接调用
+                simulator.abstract_resource_market.restore_state(abstract_resource_market_data)
+                logger.info(f"Restored abstract resource market state")
+            except Exception as e:
+                logger.warning(f"Failed to restore abstract resource market: {e}")
         
         # 恢复 Simulator 内部状态
         sim_state = checkpoint_data.get("simulator_state", {})
         simulator.current_month = int(sim_state.get("current_month") or checkpoint_data.get("month", 1))
         simulator._last_price_index = sim_state.get("_last_price_index")
+        simulator._last_inflation_rate = sim_state.get("_last_inflation_rate")
         simulator._last_balance_by_household = dict(sim_state.get("_last_balance_by_household") or {})
         simulator._last_expected_income_by_household = dict(sim_state.get("_last_expected_income_by_household") or {})
         simulator._last_sales_by_product = dict(sim_state.get("_last_sales_by_product") or {})
+        # 恢复固定消费篮子
+        basket = sim_state.get("_fixed_consumption_basket")
+        if basket:
+            simulator._fixed_consumption_basket = dict(basket)
+        else:
+            simulator._fixed_consumption_basket = None
         
         logger.info(f"Simulator state restored. Ready to resume from month {simulator.current_month}")
     

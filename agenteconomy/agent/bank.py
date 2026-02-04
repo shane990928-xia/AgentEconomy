@@ -187,31 +187,69 @@ class Bank:
             logger.error(f"Failed to process withdrawal for household {household_id}: {e}")
             return False
     
-    async def calculate_and_pay_monthly_interest(self, month: int) -> float:
+    async def calculate_and_pay_monthly_interest(
+        self, 
+        month: int,
+        household_ids: Optional[List[str]] = None
+    ) -> float:
         """
-        Calculate and distribute monthly interest
+        Calculate and distribute monthly interest based on household ledger balances.
+        
+        简化版利息计算：直接根据家庭在经济中心的余额发放利息，
+        不需要显式的存款/取款操作。银行作为一个壳子，自动发放利息。
+        
         Annual interest rate 0.5%, calculated monthly: monthly rate = 0.5% / 12 ≈ 0.0417%
         
         Args:
             month: Current month
+            household_ids: List of household IDs to pay interest to
             
         Returns:
             float: Total interest payment amount
         """
+        if self.economic_center is None:
+            logger.warning("[银行利息] 经济中心未初始化")
+            return 0.0
+        
         monthly_interest_rate = 0.005 / 12  # Convert annual rate 0.5% to monthly rate
         total_interest_paid = 0.0
+        households_paid = 0
         
-        for household_id, account in self.savings_accounts.items():
-            if account.balance <= 0:
+        # 如果没有传入 household_ids，尝试从经济中心获取所有家庭ID
+        if not household_ids:
+            try:
+                all_ids = await self.economic_center.get_all_household_ids.remote()
+                household_ids = all_ids if isinstance(all_ids, list) else []
+            except Exception as e:
+                logger.warning(f"[银行利息] 无法获取家庭ID列表: {e}")
+                return 0.0
+        
+        if not household_ids:
+            return 0.0
+        
+        # 批量查询所有家庭余额
+        try:
+            balances = await self.economic_center.get_all_balances.remote()
+            if not isinstance(balances, dict):
+                balances = {}
+        except Exception as e:
+            logger.warning(f"[银行利息] 无法获取余额: {e}")
+            balances = {}
+        
+        # 为每个家庭计算并发放利息
+        for household_id in household_ids:
+            balance = float(balances.get(household_id, 0.0) or 0.0)
+            
+            if balance <= 0:
                 continue
             
             # Calculate interest
-            interest_amount = account.balance * monthly_interest_rate
+            interest_amount = balance * monthly_interest_rate
             
-            if interest_amount > 0:
+            if interest_amount > 0.01:  # 忽略小于 1 分的利息
                 try:
                     # Bank pays interest to household
-                    tx_id = await self.economic_center.add_interest_tx.remote(
+                    await self.economic_center.add_interest_tx.remote(
                         month=month,
                         sender_id=self.bank_id,
                         receiver_id=household_id,
@@ -219,24 +257,24 @@ class Bank:
                     )
   
                     total_interest_paid += interest_amount
+                    households_paid += 1
                     
                     # Record interest history
                     self.interest_history.append({
                         "month": month,
                         "household_id": household_id,
-                        "principal": account.balance - interest_amount,
+                        "principal": balance,
                         "interest": interest_amount,
-                        "new_balance": account.balance
+                        "rate": monthly_interest_rate
                     })
                     
-                    logger.debug(f"Paid ${interest_amount:.4f} interest to household {household_id}")
-                    
                 except Exception as e:
-                    logger.error(f"Failed to pay interest to household {household_id}: {e}")
+                    logger.error(f"[银行利息] 发放失败 {household_id}: {e}")
         
         self.total_interest_paid += total_interest_paid
+        
         if total_interest_paid > 0:
-            print(f"Month {month}: Paid total interest ${total_interest_paid:.2f} to {len([a for a in self.savings_accounts.values() if a.balance > 0])} accounts")
+            logger.info(f"[银行利息] 月份={month}, 总利息=${total_interest_paid:.2f}, 受益家庭={households_paid}")
         
         return total_interest_paid
     

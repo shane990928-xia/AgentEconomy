@@ -2,12 +2,27 @@ from typing import Optional, Dict, List, Any, Tuple
 from functools import lru_cache
 from collections import defaultdict
 import os
+import json
 import pandas as pd
 from agenteconomy.center.Model import *
 from agenteconomy.center.Ecocenter import EconomicCenter
 from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.load_io_table import get_cost_structure
 import ray
+
+
+# IO代码到行业名称的映射（用于政府采购）
+@lru_cache(maxsize=1)
+def _load_io_code_to_industry_name() -> Dict[str, str]:
+    """加载 IO 代码到行业名称的映射"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(os.path.dirname(current_dir), "data")
+    mapping_path = os.path.join(data_dir, "industry_map.json")
+    
+    if os.path.exists(mapping_path):
+        with open(mapping_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 
 # 政府服务行业代码（IO表中的政府部门）
@@ -32,6 +47,31 @@ GOVERNMENT_NON_PROCUREMENT_ROWS = frozenset({"V001", "V002", "V003", "Other"})
 GOVERNMENT_PROCUREMENT_MIN_COEFFICIENT = 0.005
 # 政府采购占总支出的比例（基于IO表分析，实际采购约35%，其余为补偿、折旧等）
 GOVERNMENT_PROCUREMENT_RATIO = 0.35
+
+# ========== 政府作为"无限资金"需求注入器的参数 ==========
+# 政府支出占家庭消费总预算的比例（凯恩斯主义需求刺激）
+# 设为0.50意味着政府额外注入相当于家庭消费50%的需求，帮助维持企业生存
+GOVERNMENT_DEMAND_INJECTION_RATIO = 0.50
+# 政府最低采购预算（保证政府始终能采购，维持企业最低运营）
+GOVERNMENT_MIN_PROCUREMENT_BUDGET = 300000.0
+# 政府最高采购预算上限（防止无限膨胀）
+GOVERNMENT_MAX_PROCUREMENT_BUDGET = 1000000.0
+
+# ========== 政府公共就业计划（兜底就业）参数 ==========
+# 目标失业率（当失业率高于此值时，政府启动公共就业计划）
+PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT = 0.30  # 目标：失业率不超过30%
+# 公共就业岗位的最低工资（使用较低工资，鼓励市场就业）
+PUBLIC_EMPLOYMENT_MIN_WAGE = 15.0  # $15/小时
+# 公共就业预算上限（政府每月用于公共就业的最大支出）
+PUBLIC_EMPLOYMENT_MAX_BUDGET = 500000.0
+# 公共就业岗位类型（低技能要求的通用岗位）
+PUBLIC_EMPLOYMENT_SOC_CODES = [
+    "43-9061",  # Office Clerks, General
+    "37-2011",  # Janitors and Cleaners
+    "53-7062",  # Laborers and Material Movers
+    "39-9011",  # Childcare Workers
+    "31-1120",  # Home Health and Personal Care Aides
+]
 
 
 class Government:
@@ -232,12 +272,15 @@ class Government:
         逻辑：服务费收入 → 雇佣公务员 → 提供政府服务
         
         如果没有服务费收入（如预热第一个月），使用初始预算。
+        确保最低预算，保证政府能维持基本运作。
         
         Returns:
             本期可用于雇佣的预算
         """
         # 初始预算：保证政府在第一个月也能招聘公务员
         INITIAL_GOVERNMENT_LABOR_BUDGET = 50000.0  # 政府初始劳动预算
+        # 最低劳动预算：确保政府能维持基本运作（初始预算的20%）
+        MIN_GOVERNMENT_LABOR_BUDGET = 10000.0
         
         # 获取政府服务费收入
         service_fee_summary = self.get_service_fee_summary(period=period)
@@ -263,11 +306,14 @@ class Government:
             avg_ratio = sum(ratios.values()) / len(ratios) if ratios else 0.4
             labor_budget = service_fee_income * avg_ratio
         
+        # 确保最低预算
+        final_budget = max(labor_budget, MIN_GOVERNMENT_LABOR_BUDGET)
+        
         self.logger.info(
-            f"政府劳动预算: {labor_budget:.2f} "
-            f"(服务费收入={service_fee_income:.2f}, 部门数={len(by_type)})"
+            f"政府劳动预算: {final_budget:.2f} "
+            f"(计算值={labor_budget:.2f}, 服务费收入={service_fee_income:.2f}, 部门数={len(by_type)})"
         )
-        return max(0.0, labor_budget)
+        return final_budget
     
     def _load_government_naics_to_soc(self) -> Dict[str, List[str]]:
         """
@@ -414,9 +460,115 @@ class Government:
         
         return jobs
     
+    def _create_public_employment_jobs(self, period: Optional[int] = None) -> List[Job]:
+        """
+        创建公共就业计划岗位（政府兜底就业）
+        
+        当失业率超过目标值时，政府发布低技能公益岗位吸收失业人员。
+        这些岗位没有技能要求，任何劳动力都可以匹配。
+        
+        Args:
+            period: 当前期数
+            
+        Returns:
+            公共就业 Job 列表
+        """
+        from agenteconomy.agent.firm import _load_job_skill_data
+        
+        # 获取劳动力市场统计
+        labor_stats = self._call_labor_market("summary")
+        if not isinstance(labor_stats, dict):
+            self.logger.info("无法获取劳动力市场数据，跳过公共就业计划")
+            return []
+        
+        total_labor = int(labor_stats.get("total_labor_hours", 0) or 0)
+        total_matched = int(labor_stats.get("total_matched_jobs", 0) or 0)
+        
+        if total_labor <= 0:
+            return []
+        
+        unemployment_rate = (total_labor - total_matched) / total_labor
+        
+        # 检查是否需要启动公共就业计划
+        if unemployment_rate <= PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:
+            self.logger.info(
+                f"公共就业计划: 失业率 {unemployment_rate:.1%} <= 目标 {PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:.1%}，无需启动"
+            )
+            return []
+        
+        # 计算需要创造的岗位数量
+        unemployed = total_labor - total_matched
+        target_employed = int(total_labor * (1.0 - PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT))
+        jobs_needed = max(0, target_employed - total_matched)
+        
+        # 限制预算
+        hours_per_period = 160.0  # 月工时
+        monthly_wage = PUBLIC_EMPLOYMENT_MIN_WAGE * hours_per_period
+        max_affordable = int(PUBLIC_EMPLOYMENT_MAX_BUDGET / monthly_wage)
+        jobs_to_create = min(jobs_needed, max_affordable)
+        
+        if jobs_to_create <= 0:
+            return []
+        
+        self.logger.info(
+            f"公共就业计划: 失业率 {unemployment_rate:.1%} > 目标 {PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:.1%}, "
+            f"失业人数 {unemployed}, 计划创造 {jobs_to_create} 个公益岗位"
+        )
+        
+        # 加载职业数据
+        job_data = _load_job_skill_data()
+        
+        # 创建公益岗位（均分到各SOC类型）
+        jobs: List[Job] = []
+        soc_codes = PUBLIC_EMPLOYMENT_SOC_CODES.copy()
+        positions_per_soc = max(1, jobs_to_create // len(soc_codes))
+        remaining = jobs_to_create
+        
+        for soc in soc_codes:
+            if remaining <= 0:
+                break
+            
+            positions = min(positions_per_soc, remaining)
+            remaining -= positions
+            
+            info = job_data.get(soc, {})
+            title = str(info.get("title", f"Public Service Worker ({soc})"))
+            
+            # 公益岗位：无技能要求，任何人都可以匹配
+            job = Job(
+                job_id=f"pub_{self.government_id}_{period}_{soc}",
+                SOC=soc,
+                title=title,  # Job模型使用title，不是job_title
+                firm_id=self.government_id,
+                wage_per_hour=PUBLIC_EMPLOYMENT_MIN_WAGE,
+                hours_per_period=hours_per_period,
+                positions_available=positions,
+                required_skills={},  # 无技能要求
+                required_abilities={},  # 无能力要求
+                is_valid=True,
+            )
+            jobs.append(job)
+        
+        # 剩余岗位分配给第一个SOC
+        if remaining > 0 and jobs:
+            jobs[0].positions_available += remaining
+        
+        total_positions = sum(j.positions_available for j in jobs)
+        total_cost = total_positions * monthly_wage
+        self.logger.info(
+            f"公共就业计划: 创建 {total_positions} 个公益岗位, "
+            f"预计月支出 ${total_cost:,.2f}"
+        )
+        
+        return jobs
+    
     async def post_jobs(self, period: Optional[int] = None) -> List[Job]:
         """
         发布政府招聘岗位到劳动力市场
+        
+        包括两部分：
+        1. 常规政府岗位（基于服务费收入）
+        2. 公共就业计划岗位（兜底失业人员）
         
         Args:
             period: 当前期数
@@ -424,7 +576,14 @@ class Government:
         Returns:
             发布的 Job 列表
         """
-        jobs = self._decide_job_postings(period=period)
+        # 常规政府岗位
+        regular_jobs = self._decide_job_postings(period=period)
+        
+        # 公共就业计划岗位
+        public_jobs = self._create_public_employment_jobs(period=period)
+        
+        # 合并所有岗位
+        jobs = regular_jobs + public_jobs
         
         if jobs:
             # 查询现有岗位快照
@@ -570,25 +729,48 @@ class Government:
             self.logger.error(f"加载政府采购权重失败: {e}")
             return {}
     
-    def _compute_procurement_budget(self, period: Optional[int] = None) -> float:
+    def _compute_procurement_budget(
+        self, 
+        period: Optional[int] = None,
+        household_consumption_budget: Optional[float] = None
+    ) -> float:
         """
         计算政府采购预算
         
-        基于上个月税收收入的一部分作为采购预算
-        （因为本月税收在月末才征收，采购在中间执行）
+        采用"无限资金"模式：政府作为需求注入器，不依赖税收
+        预算 = 家庭消费总预算 × 需求注入比例
+        
+        这实现了凯恩斯主义的政府支出乘数效应：
+        - 政府支出增加 → 企业收入增加 → 招聘增加 → 工资增加 → 消费增加 → ...
         
         Args:
             period: 当前期数
+            household_consumption_budget: 家庭消费总预算（由 simulator 传入）
             
         Returns:
             可用于采购的预算
         """
+        # 方法1：基于家庭消费预算（优先）
+        if household_consumption_budget is not None and household_consumption_budget > 0:
+            # 政府支出 = 家庭消费 × 注入比例
+            demand_injection = household_consumption_budget * GOVERNMENT_DEMAND_INJECTION_RATIO
+            
+            # 应用上下限约束
+            procurement_budget = max(demand_injection, GOVERNMENT_MIN_PROCUREMENT_BUDGET)
+            procurement_budget = min(procurement_budget, GOVERNMENT_MAX_PROCUREMENT_BUDGET)
+            
+            self.logger.info(
+                f"政府采购预算: ${procurement_budget:,.2f} "
+                f"(家庭消费=${household_consumption_budget:,.2f} × {GOVERNMENT_DEMAND_INJECTION_RATIO:.0%} "
+                f"= ${demand_injection:,.2f}, 约束后=${procurement_budget:,.2f})"
+            )
+            return procurement_budget
+        
+        # 方法2：基于上月税收（兜底）
         if self.economic_center is None:
-            return 0.0
+            return GOVERNMENT_MIN_PROCUREMENT_BUDGET
         
         current_period = period or 0
-        
-        # 获取上个月的税收收入（本月税收在月末才有）
         prev_period = current_period - 1
         total_tax = 0.0
         
@@ -602,27 +784,27 @@ class Government:
             except Exception as e:
                 self.logger.warning(f"获取上月税收汇总失败: {e}")
         
-        if total_tax <= 0:
-            # 第一个月或没有税收，使用政府初始预算
-            INITIAL_PROCUREMENT_BUDGET = 10000.0  # 初始采购预算
-            procurement_budget = INITIAL_PROCUREMENT_BUDGET
+        if total_tax > 0:
+            tax_based_budget = total_tax * GOVERNMENT_PROCUREMENT_RATIO
+            procurement_budget = max(tax_based_budget, GOVERNMENT_MIN_PROCUREMENT_BUDGET)
             self.logger.info(
-                f"政府采购预算: {procurement_budget:.2f} (使用初始预算，上月税收=0)"
+                f"政府采购预算: ${procurement_budget:,.2f} "
+                f"(税收=${total_tax:,.2f} × {GOVERNMENT_PROCUREMENT_RATIO:.0%}, 最低=${GOVERNMENT_MIN_PROCUREMENT_BUDGET:,.2f})"
             )
         else:
-            # 上月税收 × 采购比例 = 采购预算
-            procurement_budget = total_tax * GOVERNMENT_PROCUREMENT_RATIO
+            # 使用最低预算保障
+            procurement_budget = GOVERNMENT_MIN_PROCUREMENT_BUDGET
             self.logger.info(
-                f"政府采购预算: {procurement_budget:.2f} "
-                f"(上月税收={total_tax:.2f}, 比例={GOVERNMENT_PROCUREMENT_RATIO})"
+                f"政府采购预算: ${procurement_budget:,.2f} (使用最低保障预算)"
             )
         
-        return max(0.0, procurement_budget)
+        return procurement_budget
     
     def procure_goods_and_services(
         self, 
         period: int,
-        budget_override: Optional[float] = None
+        budget_override: Optional[float] = None,
+        household_consumption_budget: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         执行政府采购
@@ -631,9 +813,15 @@ class Government:
         使用IO表系数决定各行业的采购比例
         不收取VAT（避免政府自我征税）
         
+        政府作为"无限资金"的需求注入器：
+        - 预算基于家庭消费总预算的一定比例
+        - 即使税收为0，也会有最低采购预算
+        - 这样可以启动经济循环
+        
         Args:
             period: 当前期数
             budget_override: 可选的预算覆盖（用于测试）
+            household_consumption_budget: 家庭消费总预算（用于计算需求注入）
             
         Returns:
             {
@@ -655,8 +843,14 @@ class Government:
                 "error": "product_market not set"
             }
         
-        # 计算采购预算
-        budget = budget_override if budget_override is not None else self._compute_procurement_budget(period)
+        # 计算采购预算（优先使用家庭消费预算计算）
+        if budget_override is not None:
+            budget = budget_override
+        else:
+            budget = self._compute_procurement_budget(
+                period=period,
+                household_consumption_budget=household_consumption_budget
+            )
         self.logger.info(f"[政府采购] 计算采购预算=${budget:,.2f}")
         
         if budget <= 0:
@@ -739,25 +933,37 @@ class Government:
         从指定行业采购
         
         Args:
-            industry_code: 行业代码
+            industry_code: 行业代码 (IO表代码，如 "325")
             budget: 分配给该行业的预算
             period: 当前期数
             
         Returns:
             (实际支出, 采购项数量)
         """
-        # 获取可用产品
+        # 将 IO 代码转换为行业名称（产品市场使用名称索引）
+        io_to_name = _load_io_code_to_industry_name()
+        industry_name = io_to_name.get(industry_code, industry_code)
+        
+        # 获取可用产品（使用行业名称查询）
         available_skus = self._call_product_market(
             'get_available_skus',
-            industry=industry_code,
+            industry=industry_name,
             period=period
         )
+        
+        if not available_skus:
+            # 尝试用原始代码查询（兼容旧逻辑）
+            available_skus = self._call_product_market(
+                'get_available_skus',
+                industry=industry_code,
+                period=period
+            )
         
         if not available_skus:
             # 尝试服务类行业
             available_skus = self._call_product_market(
                 'get_available_services',
-                industry=industry_code,
+                industry=industry_name,
                 period=period
             )
         

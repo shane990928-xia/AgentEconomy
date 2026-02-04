@@ -263,22 +263,50 @@ class LaborMarket:
         Returns:
             List of top 3 best matching Job objects, sorted by matching loss (best first)
         """
-        ranked = self.rank_jobs_for_labor(labor_hour, loss_threshold=3000.0)
+        ranked = self.rank_jobs_for_labor(labor_hour, loss_threshold=8000.0)
         return [job for job, loss in ranked[:3]]
 
     def rank_jobs_for_labor(
         self,
         labor_hour: LaborHour,
-        loss_threshold: float = 3000.0
+        loss_threshold: float = 15000.0  # 增加阈值，允许更多匹配
     ) -> List[Tuple[Job, float]]:
+        """
+        为劳动力匹配岗位，返回按匹配度排序的岗位列表
+        
+        技能匹配是系统特色：
+        - 根据技能/能力的差距计算损失
+        - 损失越低越匹配
+        - 超过阈值的岗位不返回
+        
+        Args:
+            labor_hour: 劳动力资源
+            loss_threshold: 匹配损失阈值（默认15000，允许一定程度的技能差距）
+        
+        Returns:
+            List[(Job, loss)] 按损失排序的岗位列表
+        """
+        # 如果没有技能数据，返回所有有效岗位（降级匹配）
         if labor_hour.skill_profile is None or labor_hour.ability_profile is None:
-            return []
+            fallback_jobs = []
+            for job in self.job_openings:
+                if job.is_valid and job.positions_available > 0:
+                    # 没有技能数据时给一个中等损失值，让有技能的劳动力优先匹配
+                    fallback_jobs.append((job, 5000.0))
+            return fallback_jobs
 
         job_losses: List[Tuple[Job, float]] = []
         for job in self.job_openings:
             if not job.is_valid or job.positions_available <= 0:
                 continue
-            if not isinstance(job.required_skills, dict) or not isinstance(job.required_abilities, dict):
+            
+            # 如果岗位没有技能要求或技能要求为空，允许匹配（给较低损失）
+            # 这是为了支持政府公共就业计划等低门槛岗位
+            skills_empty = not isinstance(job.required_skills, dict) or len(job.required_skills) == 0
+            abilities_empty = not isinstance(job.required_abilities, dict) or len(job.required_abilities) == 0
+            
+            if skills_empty and abilities_empty:
+                job_losses.append((job, 500.0))  # 非常低的损失，优先匹配无要求岗位
                 continue
 
             required_profile = [job.required_skills, job.required_abilities]
@@ -293,6 +321,12 @@ class LaborMarket:
     def _compute_matching_loss(self, worker_profile: list, required_profile: list) -> float:
         """
         Compute matching loss between worker profile and job requirements.
+        
+        这是系统的技能匹配特色功能：
+        - 根据技能/能力的差距计算损失
+        - 过度胜任（worker > requirement）惩罚很小（系数0.1）
+        - 轻度不足（-1 < z-score < 0）惩罚适中（系数0.3）
+        - 严重不足（z-score < -1）惩罚较大（系数0.5）
         
         Args:
             worker_profile: List of [skill_profile, ability_profile] dictionaries
@@ -326,12 +360,18 @@ class LaborMarket:
 
                 worker_value = worker_profile[i].get(skill, 0.0)
 
-                distance = (worker_value - mean) / std
+                # z-score: 正值=过度胜任，负值=不足
+                z_score = (worker_value - mean) / std
                 
-                if distance > 0:  
-                    loss = importance * (distance ** 2) * 0.2
-                else: 
-                    loss = importance * (distance ** 2)
+                if z_score > 0:  
+                    # 过度胜任：很小的惩罚（公司一般欢迎超出要求的员工）
+                    loss = importance * (z_score ** 2) * 0.1
+                elif z_score > -1:
+                    # 轻度不足（在1个标准差内）：适度惩罚（可通过培训弥补）
+                    loss = importance * (z_score ** 2) * 0.3
+                else:
+                    # 严重不足（超过1个标准差）：较大惩罚
+                    loss = importance * (z_score ** 2) * 0.5
 
                 total_loss += loss
         return total_loss
@@ -356,7 +396,7 @@ class LaborMarket:
         labor_hour: LaborHour,
         month: int,
         max_apply: int = 3,
-        loss_threshold: float = 3000.0
+        loss_threshold: float = 15000.0  # 与 rank_jobs_for_labor 保持一致
     ) -> List[JobApplication]:
         if max_apply <= 0:
             return []
@@ -841,32 +881,50 @@ class LaborMarket:
         total_paid = 0.0
         errors = []
         
+        # 第一步：记录工资历史（本地操作，无阻塞）
         for wage_info in wage_details:
             try:
-                # Record wage history in LaborMarket
                 wage_record = Wage.create(
                     agent_id=wage_info['household_id'],
                     amount=wage_info['monthly_gross_wage'],
                     month=month
                 )
                 self.wage_history.append(wage_record)
-                
-                # Delegate actual transfer to EconomicCenter
-                if self.economic_center is not None:
-                    # Call EconomicCenter to process wage (handles taxes and ledger updates)
-                    ray.get(self.economic_center.process_wage.remote(
-                        month=month,
-                        wage_hour=wage_info['wage_per_hour'],
-                        household_id=wage_info['household_id'],
-                        firm_id=wage_info['firm_id'],
-                        hours_per_period=wage_info['hours_per_period'],
-                        periods_per_month=self.default_weeks_per_month
-                    ))
-                
                 total_paid += wage_info['monthly_gross_wage']
-                
             except Exception as e:
-                error_msg = f"Failed to process wage for {wage_info['household_id']}: {e}"
+                error_msg = f"Failed to record wage for {wage_info['household_id']}: {e}"
+                self.logger.error(error_msg)
+                errors.append(error_msg)
+        
+        # 第二步：批量发送工资处理请求到 EconomicCenter（并行执行）
+        if self.economic_center is not None and wage_details:
+            # 收集所有远程调用的 futures
+            futures = []
+            wage_info_list = []
+            
+            for wage_info in wage_details:
+                future = self.economic_center.process_wage.remote(
+                    month=month,
+                    wage_hour=wage_info['wage_per_hour'],
+                    household_id=wage_info['household_id'],
+                    firm_id=wage_info['firm_id'],
+                    hours_per_period=wage_info['hours_per_period'],
+                    periods_per_month=self.default_weeks_per_month
+                )
+                futures.append(future)
+                wage_info_list.append(wage_info)
+            
+            # 批量等待所有结果（一次 ray.get 而不是 N 次）
+            try:
+                results = ray.get(futures)
+                # 处理可能的单个失败
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        error_msg = f"Failed to process wage for {wage_info_list[i]['household_id']}: {result}"
+                        self.logger.error(error_msg)
+                        errors.append(error_msg)
+            except Exception as e:
+                error_msg = f"Batch wage processing failed: {e}"
                 self.logger.error(error_msg)
                 errors.append(error_msg)
         
@@ -897,28 +955,232 @@ class LaborMarket:
         return self.process_monthly_wages(month)
 
     # =========================================================================
+    # Layoff Support (裁员机制)
+    # =========================================================================
+    def get_firm_wage_bill(self, firm_id: str) -> Dict[str, Any]:
+        """
+        获取企业当前工资支出
+
+        Args:
+            firm_id: 企业ID
+
+        Returns:
+            {
+                "total_wage": float,  # 月工资总额
+                "employee_count": int,
+                "employees": [{household_id, lh_type, wage_per_hour, monthly_wage, job_id, job_SOC}, ...]
+            }
+        """
+        employees = []
+        total_wage = 0.0
+
+        for mj in self.matched_jobs:
+            if mj.firm_id != firm_id:
+                continue
+
+            hours_per_period = getattr(mj.job, "hours_per_period", None) if hasattr(mj, "job") else None
+            if hours_per_period is None:
+                hours_per_period = 160.0  # 默认 40小时/周 × 4周
+            monthly_wage = mj.average_wage * float(hours_per_period)
+
+            employees.append({
+                "household_id": mj.household_id,
+                "lh_type": mj.lh_type,
+                "wage_per_hour": mj.average_wage,
+                "monthly_wage": monthly_wage,
+                "job_id": getattr(mj.job, "job_id", None) if mj.job else None,
+                "job_SOC": getattr(mj.job, "SOC", None) if mj.job else None,
+            })
+            total_wage += monthly_wage
+
+        return {
+            "total_wage": total_wage,
+            "employee_count": len(employees),
+            "employees": employees,
+        }
+
+    def terminate_employment(
+        self,
+        firm_id: str,
+        household_id: str,
+        lh_type: str,
+        reason: str,
+        month: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        终止雇佣关系
+
+        Args:
+            firm_id: 企业ID
+            household_id: 家庭ID
+            lh_type: 劳动力类型 ('head' or 'spouse')
+            reason: 辞退原因
+            month: 当前月份
+
+        Returns:
+            辞退记录 或 None（如果未找到匹配）
+        """
+        worker_key = self._worker_key(household_id, lh_type)
+        match_to_remove = None
+
+        for mj in self.matched_jobs:
+            if mj.firm_id == firm_id and mj.household_id == household_id and mj.lh_type == lh_type:
+                match_to_remove = mj
+                break
+
+        if match_to_remove is None:
+            self.logger.warning(f"[裁员] 未找到匹配: firm={firm_id}, household={household_id}, lh_type={lh_type}")
+            return None
+
+        # 从 matched_jobs 移除
+        self.matched_jobs.remove(match_to_remove)
+
+        # 从 matched_workers 移除
+        self.matched_workers.discard(worker_key)
+
+        # 恢复 labor_hour 状态（重新可用于求职）
+        if worker_key in self.labor_index:
+            lh = self.labor_index[worker_key]
+            lh.is_valid = True
+            lh.firm_id = None
+            lh.job_SOC = None
+            lh.job_title = None
+
+        self.logger.info(f"[裁员] {firm_id} 解雇 {household_id}({lh_type}), 原因: {reason}")
+
+        return {
+            "firm_id": firm_id,
+            "household_id": household_id,
+            "lh_type": lh_type,
+            "reason": reason,
+            "month": month,
+            "previous_wage": match_to_remove.average_wage,
+            "job_id": getattr(match_to_remove.job, "job_id", None) if match_to_remove.job else None,
+        }
+
+    def layoff_to_budget(
+        self,
+        firm_id: str,
+        target_wage_cap: float,
+        reason: str,
+        month: int,
+        strategy: str = "highest_wage",
+    ) -> Dict[str, Any]:
+        """
+        裁员至工资帽附近（但不低于工资帽，保证产能）
+
+        工资帽是产能下限，裁员后工资支出不能低于工资帽。
+
+        Args:
+            firm_id: 企业ID
+            target_wage_cap: 目标工资帽（产能下限）
+            reason: 裁员原因
+            month: 当前月份
+            strategy: 裁员策略
+                - 'highest_wage': 先裁高薪员工（节省最多）
+                - 'lowest_wage': 先裁低薪员工
+                - 'lifo': 后进先出（先裁最近入职的）
+                - 'fifo': 先进先出（先裁最早入职的）
+
+        Returns:
+            {
+                "layoffs": [...],
+                "saved_wage": float,
+                "new_wage_bill": float,
+                "target_wage_cap": float,
+                "reason": str,
+            }
+        """
+        wage_info = self.get_firm_wage_bill(firm_id)
+        current_wage = wage_info["total_wage"]
+
+        # 没有超支空间，不裁员
+        if current_wage <= target_wage_cap:
+            return {
+                "layoffs": [],
+                "saved_wage": 0.0,
+                "new_wage_bill": current_wage,
+                "target_wage_cap": target_wage_cap,
+                "reason": "no_excess",
+            }
+
+        # 可裁员空间 = 超出工资帽的部分
+        layoff_budget = current_wage - target_wage_cap
+        employees = list(wage_info["employees"])
+
+        # 按策略排序
+        if strategy == "highest_wage":
+            employees.sort(key=lambda x: x["monthly_wage"], reverse=True)
+        elif strategy == "lowest_wage":
+            employees.sort(key=lambda x: x["monthly_wage"])
+        elif strategy == "lifo":
+            employees.sort(key=lambda x: x.get("month_matched", 0), reverse=True)
+        elif strategy == "fifo":
+            employees.sort(key=lambda x: x.get("month_matched", 0))
+
+        layoffs = []
+        saved = 0.0
+
+        for emp in employees:
+            emp_wage = emp["monthly_wage"]
+
+            # 关键约束：如果裁掉这个人会导致工资支出 < 工资帽，则跳过
+            if saved + emp_wage > layoff_budget:
+                continue  # 跳过这个人，尝试下一个（可能工资更低）
+
+            result = self.terminate_employment(
+                firm_id=firm_id,
+                household_id=emp["household_id"],
+                lh_type=emp["lh_type"],
+                reason=reason,
+                month=month,
+            )
+
+            if result:
+                layoffs.append(result)
+                saved += emp_wage
+
+        new_wage_bill = current_wage - saved
+
+        if layoffs:
+            self.logger.info(
+                f"[裁员汇总] {firm_id}: 裁员{len(layoffs)}人, "
+                f"节省${saved:.2f}, 新工资支出=${new_wage_bill:.2f}, 工资帽=${target_wage_cap:.2f}"
+            )
+
+        return {
+            "layoffs": layoffs,
+            "saved_wage": saved,
+            "new_wage_bill": new_wage_bill,
+            "target_wage_cap": target_wage_cap,
+            "reason": "budget_reduction" if layoffs else "no_suitable_candidates",
+        }
+
+    # =========================================================================
     # Checkpoint Support (用于断点续跑)
     # =========================================================================
-    def get_matched_jobs(self) -> List[Dict[str, Any]]:
+    def get_matched_jobs_snapshot(self) -> List[Dict[str, Any]]:
         """
-        获取所有已匹配的工作（用于 checkpoint）
-        
+        获取所有已匹配的工作快照（用于 checkpoint）
+
         Returns:
             匹配工作数据列表
         """
         matched_data = []
         for mj in self.matched_jobs:
+            # MatchedJob 模型包含: job, average_wage, household_id, lh_type, firm_id, skill_match_score
+            job = mj.job
             matched_data.append({
-                "match_id": mj.match_id,
-                "job_id": mj.job_id,
+                "job_id": getattr(job, "job_id", None),
                 "firm_id": mj.firm_id,
                 "household_id": mj.household_id,
                 "lh_type": mj.lh_type,
-                "matched_wage_rate": mj.matched_wage_rate,
-                "accepted": mj.accepted,
-                "month_matched": mj.month_matched,
-                "job_SOC": getattr(mj, "job_SOC", None),
-                "job_title": getattr(mj, "job_title", None),
+                "average_wage": float(mj.average_wage or 0.0),
+                "skill_match_score": mj.skill_match_score,
+                "job_SOC": getattr(job, "SOC", None),
+                "job_title": getattr(job, "title", None),
+                "wage_per_hour": float(getattr(job, "wage_per_hour", 0.0) or 0.0),
+                "hours_per_period": float(getattr(job, "hours_per_period", 0.0) or 0.0),
             })
         return matched_data
     
@@ -950,20 +1212,25 @@ class LaborMarket:
 
         for data in matched_jobs_data:
             try:
-                mj = MatchedJob(
-                    match_id=data.get("match_id", str(uuid4())),
-                    job_id=data.get("job_id", ""),
+                # 重建 Job 对象
+                job = Job(
+                    job_id=data.get("job_id") or str(uuid4()),
                     firm_id=data.get("firm_id", ""),
-                    household_id=data.get("household_id", ""),
-                    lh_type=data.get("lh_type", ""),
-                    matched_wage_rate=float(data.get("matched_wage_rate") or 0.0),
-                    accepted=bool(data.get("accepted", True)),
-                    month_matched=int(data.get("month_matched") or 0),
+                    SOC=data.get("job_SOC") or "",
+                    title=data.get("job_title") or "",
+                    wage_per_hour=float(data.get("wage_per_hour") or data.get("average_wage") or 0.0),
+                    hours_per_period=float(data.get("hours_per_period") or 160.0),
                 )
-                if hasattr(mj, "job_SOC"):
-                    mj.job_SOC = data.get("job_SOC")
-                if hasattr(mj, "job_title"):
-                    mj.job_title = data.get("job_title")
+                
+                # 创建 MatchedJob
+                mj = MatchedJob(
+                    job=job,
+                    average_wage=float(data.get("average_wage") or 0.0),
+                    household_id=data.get("household_id", ""),
+                    lh_type=data.get("lh_type", "head"),
+                    firm_id=data.get("firm_id", ""),
+                    skill_match_score=data.get("skill_match_score"),
+                )
                 
                 self.matched_jobs.append(mj)
                 
@@ -976,8 +1243,8 @@ class LaborMarket:
                     lh = self.labor_index[worker_key]
                     lh.is_valid = False  # 已被雇佣
                     lh.firm_id = mj.firm_id
-                    lh.job_SOC = mj.job_SOC if hasattr(mj, "job_SOC") else None
-                    lh.job_title = mj.job_title if hasattr(mj, "job_title") else None
+                    lh.job_SOC = job.SOC
+                    lh.job_title = job.title
                 
                 restored += 1
             except Exception as e:

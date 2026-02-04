@@ -91,6 +91,10 @@ class ProductMarket:
         # Qdrant collection name
         self._collection_name = os.getenv("QDRANT_COLLECTION_NAME", "products")
         
+        # Qdrant 模式：cloud/docker 使用原生 filter，local 使用本地 filter
+        self._qdrant_mode = os.getenv("QDRANT_MODE", "local")
+        self._use_qdrant_filter = self._qdrant_mode in ("cloud", "docker")
+        
         # 活跃SKU追踪
         self._active_sku_set: Set[str] = set()
         self._require_active_filter: bool = False  # 是否在搜索时强制过滤is_active
@@ -101,8 +105,13 @@ class ProductMarket:
         # 供需追踪（按行业）：用于价格调整
         # {manufacturer_code: {"demand": float, "supply": float}}
         self.industry_supply_demand: Dict[str, Dict[str, float]] = {}
-        
-        self.logger.info(f"ProductMarket initialized")
+
+        # 原材料需求追踪（按行业，以价值为单位）
+        # {industry_code: {"current": float, "previous": float}}
+        self.raw_material_demand: Dict[str, Dict[str, float]] = {}
+
+        filter_strategy = "Qdrant native filter" if self._use_qdrant_filter else "local Python filter"
+        self.logger.info(f"ProductMarket initialized (mode={self._qdrant_mode}, filter_strategy={filter_strategy})")
 
     def initialize_products(self, csv_path: Optional[str] = None):
         """
@@ -625,13 +634,159 @@ class ProductMarket:
             return 1.0  # 无需求时视为均衡
         return supply / demand
     
+    def get_all_supply_demand_stats(self) -> Dict[str, Dict[str, float]]:
+        """
+        获取所有行业的供需统计数据
+        
+        Returns:
+            {industry_code: {demand: float, supply: float, ratio: float}}
+        """
+        result = {}
+        for code, stats in self.industry_supply_demand.items():
+            demand = stats.get("demand", 0.0)
+            supply = stats.get("supply", 0.0)
+            ratio = supply / demand if demand > 0 else 1.0
+            result[code] = {
+                "demand": demand,
+                "supply": supply,
+                "ratio": ratio
+            }
+        return result
+    
     def reset_supply_demand_tracking(self):
         """
         重置供需追踪数据（每月初调用）
         """
         self.industry_supply_demand = {}
         self.logger.debug("Supply-demand tracking reset")
-    
+
+    # ========== 原材料价格调整（基于需求变化） ==========
+
+    def record_raw_material_demand(self, industry_code: str, demand_value: float):
+        """
+        记录原材料行业的需求（以价值为单位）
+
+        原材料行业（作为中间品供应商）的需求来自下游制造商的采购
+        这里记录的是采购金额，不是数量
+
+        Args:
+            industry_code: 原材料行业代码
+            demand_value: 需求价值（美元）
+        """
+        if industry_code not in self.raw_material_demand:
+            self.raw_material_demand[industry_code] = {"current": 0.0, "previous": 0.0}
+        self.raw_material_demand[industry_code]["current"] += demand_value
+
+    def get_raw_material_demand_change_ratio(self, industry_code: str) -> float:
+        """
+        获取原材料行业的需求变化率
+
+        Returns:
+            需求变化率（current/previous）
+            - > 1: 需求增加
+            - < 1: 需求减少
+            - = 1: 需求不变或无历史数据
+        """
+        stats = self.raw_material_demand.get(industry_code, {})
+        current = stats.get("current", 0.0)
+        previous = stats.get("previous", 0.0)
+
+        if previous <= 0:
+            return 1.0  # 无历史数据时视为均衡
+        return current / previous
+
+    def adjust_raw_material_prices(
+        self,
+        industry_code: str,
+        base_adjustment: float = 0.03,
+        max_adjustment: float = 0.10
+    ) -> int:
+        """
+        根据需求变化调整原材料行业的价格
+
+        价格调整逻辑：
+        - 需求增加（change_ratio > 1）：涨价
+        - 需求减少（change_ratio < 1）：降价
+        - 调整幅度 = base_adjustment * |ln(change_ratio)|，最大不超过 max_adjustment
+
+        Args:
+            industry_code: 原材料行业代码
+            base_adjustment: 基础调整系数（默认3%，比消费品更保守）
+            max_adjustment: 最大调整幅度（默认10%）
+
+        Returns:
+            更新的产品数量
+        """
+        change_ratio = self.get_raw_material_demand_change_ratio(industry_code)
+        products = self.products_by_industry.get(industry_code, [])
+
+        if not products:
+            return 0
+
+        # 如果没有历史数据或变化很小，不调整
+        if change_ratio == 1.0 or abs(change_ratio - 1.0) < 0.02:
+            self.logger.debug(
+                f"Raw material {industry_code}: no price adjustment (change_ratio={change_ratio:.3f})"
+            )
+            return 0
+
+        # 计算调整幅度：使用对数函数使调整更平滑
+        import math
+        log_ratio = math.log(change_ratio) if change_ratio > 0 else 0
+        adjustment = base_adjustment * abs(log_ratio)
+        adjustment = min(adjustment, max_adjustment)
+
+        # 需求增加时涨价，需求减少时降价
+        if change_ratio > 1:
+            price_multiplier = 1 + adjustment  # 涨价
+        else:
+            price_multiplier = 1 - adjustment  # 降价
+
+        updated_count = 0
+        for product in products:
+            old_price = product.manufacturer_price
+            product.manufacturer_price = max(0.01, product.manufacturer_price * price_multiplier)
+            product.retail_price = max(0.01, product.retail_price * price_multiplier)
+            updated_count += 1
+
+        self.logger.info(
+            f"Raw material {industry_code} price adjusted: "
+            f"change_ratio={change_ratio:.3f}, multiplier={price_multiplier:.3f}, "
+            f"products={updated_count}"
+        )
+        return updated_count
+
+    def finalize_raw_material_demand(self):
+        """
+        结束当期原材料需求记录，将当期需求转为历史需求
+
+        在每月结束时调用，为下一期的需求变化计算做准备
+        """
+        for industry_code in self.raw_material_demand:
+            current = self.raw_material_demand[industry_code].get("current", 0.0)
+            self.raw_material_demand[industry_code]["previous"] = current
+            self.raw_material_demand[industry_code]["current"] = 0.0
+        self.logger.debug(f"Raw material demand finalized for {len(self.raw_material_demand)} industries")
+
+    def get_raw_material_stats(self) -> Dict[str, Dict[str, float]]:
+        """
+        获取所有原材料行业的需求统计
+
+        Returns:
+            {industry_code: {"current": float, "previous": float, "change_ratio": float}}
+        """
+        result = {}
+        for industry_code, stats in self.raw_material_demand.items():
+            current = stats.get("current", 0.0)
+            previous = stats.get("previous", 0.0)
+            change_ratio = current / previous if previous > 0 else 1.0
+            result[industry_code] = {
+                "current": current,
+                "previous": previous,
+                "change_ratio": change_ratio
+            }
+        return result
+
     def adjust_prices_by_supply_demand(
         self,
         manufacturer_code: str,
@@ -748,6 +903,9 @@ class ProductMarket:
         def _fallback_from_published() -> List[Product]:
             """Fallback逻辑：使用简单的文本匹配"""
             candidates = [p for p in (self.products or []) if float(getattr(p, "available_stock", 0.0) or 0.0) > 0]
+            # 如果启用了活跃过滤，只返回活跃的SKU
+            if self._require_active_filter and self._active_sku_set:
+                candidates = [p for p in candidates if p.product_id in self._active_sku_set]
             if must_contain:
                 mc = must_contain.lower()
                 candidates = [p for p in candidates if mc in (getattr(p, "classification", "") or "").lower()]
@@ -784,9 +942,24 @@ class ProductMarket:
             return _fallback_from_published()
 
         must_contain_lc = must_contain.lower() if must_contain else None
-        collection_name = os.getenv("QDRANT_COLLECTION_NAME", "products")
-        search_limit = max(top_k * 3, 50)
-        max_fetch = max(top_k * 10, search_limit)
+        collection_name = self._collection_name
+        
+        # 根据 Qdrant 模式选择过滤策略：
+        # - Cloud/Docker 模式：使用 Qdrant 原生 filter（有索引优化，性能好）
+        # - Local 模式：使用本地 Python filter（本地模式 filter 性能极差）
+        use_qdrant_filter = self._use_qdrant_filter and self._require_active_filter
+        use_local_filter = (not self._use_qdrant_filter) and self._require_active_filter and self._active_sku_set
+        
+        # 设置搜索参数
+        if use_local_filter:
+            # 本地过滤模式：需要搜索更多候选
+            search_limit = max(top_k * 20, 200)
+            max_fetch = max(top_k * 50, 500)
+        else:
+            # Qdrant 过滤或无过滤：正常搜索量
+            search_limit = max(top_k * 3, 50)
+            max_fetch = max(top_k * 10, search_limit)
+        
         try:
             query_embedding = embedding(query)
 
@@ -794,10 +967,11 @@ class ProductMarket:
             seen_ids = set()
             offset = 0
             products_by_id = self.products_by_id
+            active_sku_set = self._active_sku_set if use_local_filter else None
             
-            # 构建搜索过滤器
+            # 构建 Qdrant filter（仅 Cloud/Docker 模式）
             search_filter = None
-            if self._require_active_filter:
+            if use_qdrant_filter:
                 search_filter = Filter(
                     must=[
                         FieldCondition(
@@ -806,17 +980,42 @@ class ProductMarket:
                         )
                     ]
                 )
+            
+            # 重试配置（针对云端网络问题）
+            max_retries = 3 if self._qdrant_mode == "cloud" else 1
+            retry_delay = 1.0  # 秒
 
             while len(results) < top_k and offset < max_fetch:
-                hits_resp = self.client.query_points(
-                    collection_name=collection_name,
-                    query=query_embedding,
-                    query_filter=search_filter,
-                    limit=search_limit,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False,
-                )
+                # 带重试的 Qdrant 查询
+                hits_resp = None
+                last_error = None
+                
+                for attempt in range(max_retries):
+                    try:
+                        hits_resp = self.client.query_points(
+                            collection_name=collection_name,
+                            query=query_embedding,
+                            query_filter=search_filter,  # Cloud/Docker 用 Qdrant filter，Local 用 None
+                            limit=search_limit,
+                            offset=offset,
+                            with_payload=True,
+                            with_vectors=False,
+                        )
+                        break  # 成功，退出重试循环
+                    except Exception as e:
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            import time
+                            self.logger.warning(
+                                f"Qdrant query attempt {attempt + 1}/{max_retries} failed: {e}, retrying..."
+                            )
+                            time.sleep(retry_delay * (attempt + 1))  # 指数退避
+                        else:
+                            self.logger.error(f"Qdrant query failed after {max_retries} attempts: {e}")
+                            raise last_error
+                
+                if hits_resp is None:
+                    break
 
                 if hasattr(hits_resp, "points"):
                     hits_list = list(getattr(hits_resp, "points") or [])
@@ -837,6 +1036,10 @@ class ProductMarket:
                             product_id = str(hit_id)
 
                     if not product_id or product_id in seen_ids:
+                        continue
+                    
+                    # 本地活跃过滤（仅 Local 模式使用）
+                    if active_sku_set and product_id not in active_sku_set:
                         continue
 
                     product = products_by_id.get(product_id)
@@ -989,15 +1192,65 @@ class ProductMarket:
         for product in self.products:
             products_snapshot.append({
                 "product_id": product.product_id,
-                "sku_id": product.sku_id,
                 "name": product.name,
-                "price": float(product.price or 0.0),
-                "stock": float(product.stock or 0.0),
+                "manufacturer_price": float(product.manufacturer_price or 0.0),
+                "retail_price": float(product.retail_price or 0.0),
+                "available_stock": int(product.available_stock or 0),
                 "manufacturer_code": product.manufacturer_code,
-                "retailer_code": product.retailer_code,
-                "is_active": product.is_active,
+                "retailer_code": getattr(product, "retailer_code", None),
+                "is_active": getattr(product, "is_active", True),
             })
         return products_snapshot
+    
+    def get_market_state_snapshot(self) -> Dict[str, Any]:
+        """
+        获取市场状态快照（用于 checkpoint）
+        
+        Returns:
+            市场状态字典，包含:
+            - require_active_filter: 是否启用活跃SKU过滤
+            - active_sku_count: 活跃SKU数量
+            - raw_material_demand: 原材料需求历史（用于价格调整）
+            - industry_supply_demand: 行业供需数据
+        """
+        return {
+            "require_active_filter": self._require_active_filter,
+            "active_sku_count": len(self._active_sku_set),
+            # 原材料需求历史（关键：用于跨月的价格调整计算）
+            "raw_material_demand": dict(self.raw_material_demand),
+            # 行业供需数据（通常在月初被重置，但checkpoint可能在月中保存）
+            "industry_supply_demand": dict(self.industry_supply_demand),
+        }
+    
+    def restore_market_state(self, state_data: Dict[str, Any]) -> None:
+        """
+        从 checkpoint 恢复市场状态设置
+        
+        Args:
+            state_data: 市场状态数据
+        """
+        if state_data:
+            self._require_active_filter = bool(state_data.get("require_active_filter", False))
+            
+            # 恢复原材料需求历史（关键：用于跨月的价格调整计算）
+            raw_material_demand = state_data.get("raw_material_demand", {})
+            if raw_material_demand:
+                self.raw_material_demand = {
+                    k: {"current": v.get("current", 0.0), "previous": v.get("previous", 0.0)}
+                    for k, v in raw_material_demand.items()
+                }
+                self.logger.info(f"Restored raw_material_demand for {len(self.raw_material_demand)} industries")
+            
+            # 恢复行业供需数据
+            industry_supply_demand = state_data.get("industry_supply_demand", {})
+            if industry_supply_demand:
+                self.industry_supply_demand = {
+                    k: {"demand": v.get("demand", 0.0), "supply": v.get("supply", 0.0)}
+                    for k, v in industry_supply_demand.items()
+                }
+                self.logger.info(f"Restored industry_supply_demand for {len(self.industry_supply_demand)} industries")
+            
+            self.logger.info(f"Restored market state: require_active_filter={self._require_active_filter}")
     
     def restore_products_snapshot(self, products_data: List[Dict[str, Any]]) -> int:
         """
@@ -1012,15 +1265,23 @@ class ProductMarket:
         restored = 0
         product_data_by_id = {d["product_id"]: d for d in products_data}
         
+        # 重建 _active_sku_set
+        self._active_sku_set.clear()
+        
         for product in self.products:
             if product.product_id in product_data_by_id:
                 data = product_data_by_id[product.product_id]
-                product.price = float(data.get("price") or product.price or 0.0)
+                # 注意：product.price 是只读 property，需要设置 retail_price
+                product.retail_price = float(data.get("price") or product.retail_price or 0.0)
                 product.stock = float(data.get("stock") or product.stock or 0.0)
                 product.is_active = bool(data.get("is_active", product.is_active))
                 restored += 1
+                
+                # 重建活跃SKU集合
+                if product.is_active:
+                    self._active_sku_set.add(product.product_id)
         
-        self.logger.info(f"Restored {restored} product states from checkpoint")
+        self.logger.info(f"Restored {restored} product states from checkpoint, {len(self._active_sku_set)} active SKUs")
         return restored
 
 

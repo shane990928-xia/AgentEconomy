@@ -418,7 +418,7 @@ class Firm:
         计算本期劳动预算
         
         优先级：
-        1. 当前需求价值（如果传入）× compensation_ratio
+        1. 当前需求价值（如果传入且 > 0）× compensation_ratio
         2. 上月收入的 compensation_ratio 比例
         3. 生产历史中最近一次的生产价值
         4. 当前现金
@@ -426,16 +426,23 @@ class Firm:
         
         Args:
             period: 当前期间
-            current_demand_value: 本月的需求/生产价值（从 simulator 传入）
+            current_demand_value: 本月的需求/生产价值（从 simulator 传入），可以是 0 或 None
         """
-        # 初始预算：保证企业在第一个月也能招聘
-        INITIAL_LABOR_BUDGET = 10000.0
+        import logging
+        _logger = logging.getLogger(__name__)
+        
+        # 常量定义
+        INITIAL_LABOR_BUDGET = 15000.0  # 初始劳动预算（无数据时），可雇3-4人
+        MIN_COMPENSATION_RATIO = 0.20   # 最低 compensation 比率（20%，保证资本密集型行业也能招人）
+        MIN_LABOR_BUDGET = 8000.0       # 最低劳动预算（保证每个企业至少能雇2人）
         
         base_value = 0.0
+        source = "none"
         
-        # 优先使用当前需求价值
+        # 优先使用当前需求价值（仅当 > 0 时）
         if current_demand_value is not None and current_demand_value > 0:
             base_value = float(current_demand_value)
+            source = "current_demand"
         
         # 其次查询上月收入
         if base_value <= 0:
@@ -447,25 +454,50 @@ class Firm:
                     month=current_period - 1,
                 )
                 if isinstance(stats, dict):
-                    base_value = float(stats.get("monthly_income", 0.0) or 0.0)
+                    income = float(stats.get("monthly_income", 0.0) or 0.0)
+                    if income > 0:
+                        base_value = income
+                        source = "last_month_income"
         
         # 再次查看生产历史
         if base_value <= 0 and self.production_history:
             try:
-                base_value = float(self.production_history[-1].get("production_value", 0.0) or 0.0)
+                prod_val = float(self.production_history[-1].get("production_value", 0.0) or 0.0)
+                if prod_val > 0:
+                    base_value = prod_val
+                    source = "production_history"
             except Exception:
-                base_value = 0.0
+                pass
         
-        # 使用现金
+        # 使用当前现金
         if base_value <= 0:
-            base_value = float(self.cash or 0.0)
+            cash_val = float(self.cash or 0.0)
+            if cash_val > 0:
+                base_value = cash_val
+                source = "current_cash"
         
         # 如果还是没有基础值，使用初始预算
         if base_value <= 0:
+            _logger.debug(
+                f"[劳动预算] {self.firm_id}: 所有来源均为0，使用初始预算 "
+                f"(demand={current_demand_value}, cash={self.cash}, history={len(self.production_history or [])})"
+            )
             return INITIAL_LABOR_BUDGET
 
-        budget = base_value * float(getattr(self, "compensation_ratio", 0.2) or 0.2)
-        return max(0.0, budget)
+        # 使用 compensation_ratio，但确保不低于最低比率
+        actual_ratio = float(getattr(self, "compensation_ratio", 0.2) or 0.2)
+        effective_ratio = max(actual_ratio, MIN_COMPENSATION_RATIO)
+        
+        budget = base_value * effective_ratio
+        
+        # 确保最低劳动预算
+        budget = max(budget, MIN_LABOR_BUDGET)
+        
+        _logger.debug(
+            f"[劳动预算] {self.firm_id}: base={base_value:.2f} (source={source}), "
+            f"ratio={actual_ratio:.2f}→{effective_ratio:.2f}, budget={budget:.2f}"
+        )
+        return budget
 
     def _decide_job_postings_from_data(
         self,
@@ -1169,12 +1201,13 @@ class ManufactureFirm(Firm):
                 f"Firm {self.firm_id} production completed: "
                 f"{total_quantity} units, ${cost_breakdown['total_cost']:.2f} total cost"
             )
-            
+
             return {
                 'production_value': production_value,
                 'total_cost': cost_breakdown['total_cost'],
                 'unit_costs': unit_costs,
                 'cost_breakdown': cost_breakdown,
+                'intermediate_by_industry': intermediate_result.get('by_industry', {}),
                 'success': True
             }
             

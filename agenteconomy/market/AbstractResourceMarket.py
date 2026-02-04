@@ -7,7 +7,7 @@
 3. 根据供需动态调整价格
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -533,6 +533,68 @@ class AbstractResourceMarket:
             }
         
         return stats
+
+    # ========== Checkpoint 支持 ==========
+    
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        """
+        获取市场状态快照（用于 checkpoint）
+        
+        Returns:
+            市场状态字典，包含所有资源的当前价格和需求数据
+        """
+        resources_snapshot = {}
+        for industry_code, resource in self.resources.items():
+            resources_snapshot[industry_code] = {
+                "current_price": resource.current_price,
+                "base_price": resource.base_price,
+                "total_demand": resource.total_demand,
+                "supply_capacity": resource.supply_capacity,
+                "price_history": list(resource.price_history[-12:]),  # 只保存最近12期
+            }
+        
+        return {
+            "resources": resources_snapshot,
+            "industry_to_firm": dict(self.industry_to_firm),
+        }
+    
+    def restore_state(self, state_data: Dict[str, Any]) -> None:
+        """
+        从 checkpoint 恢复市场状态
+        
+        Args:
+            state_data: 市场状态数据
+        """
+        if not state_data:
+            return
+        
+        resources_data = state_data.get("resources", {})
+        restored_count = 0
+        
+        for industry_code, res_data in resources_data.items():
+            if industry_code in self.resources:
+                resource = self.resources[industry_code]
+                
+                # 恢复价格
+                resource.current_price = float(res_data.get("current_price", resource.current_price))
+                
+                # 恢复需求（如果checkpoint在月中保存）
+                resource.total_demand = float(res_data.get("total_demand", 0.0))
+                
+                # 恢复价格历史
+                price_history = res_data.get("price_history", [])
+                if price_history:
+                    resource.price_history = list(price_history)
+                
+                restored_count += 1
+                logger.debug(f"Restored resource {industry_code}: price=${resource.current_price:.4f}")
+        
+        # 恢复行业-企业映射
+        industry_to_firm = state_data.get("industry_to_firm", {})
+        if industry_to_firm:
+            self.industry_to_firm.update(industry_to_firm)
+        
+        logger.info(f"Restored AbstractResourceMarket state: {restored_count} resources")
 
 
 if __name__ == "__main__":

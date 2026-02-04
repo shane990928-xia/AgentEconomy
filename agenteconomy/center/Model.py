@@ -717,6 +717,7 @@ class Transaction(BaseModel):
         'resource_purchase',  # Resource/input purchase
         'tax_collection',     # General tax collection
         'financial',          # Financial transaction
+        'wholesale',          # Wholesale transaction (retailer -> manufacturer)
     ] = Field(default='purchase', description="Type of transaction")
     
     # === Lifecycle Tracking ===

@@ -76,7 +76,8 @@ class EconomicCenter:
         # =========================================================================
         # 3️⃣ 资产存储 (Asset Storage)
         # =========================================================================
-        self.ledger: Dict[str, Ledger] = defaultdict(Ledger)            # 现金账本
+        # 使用 lambda 确保 Ledger 有默认 amount=0.0
+        self.ledger: Dict[str, Ledger] = defaultdict(lambda: Ledger(amount=0.0))  # 现金账本
         self.labor_market = None
 
         # =========================================================================
@@ -140,12 +141,14 @@ class EconomicCenter:
         # =========================================================================
         # Initialize log
         print(f"EconomicCenter initialized with tax policy:")
-        print(f"  📊 个人所得税: 累进税制 ({len(self.income_tax_rate)} 档)")
+        print(f"  📊 个人所得税: 累进税制 ({len(self.income_tax_rate)} 档，年阈值自动转换为月)")
         for i, bracket in enumerate(self.income_tax_rate):
+            monthly_cutoff = bracket.cutoff / 12.0
             if i + 1 < len(self.income_tax_rate):
-                print(f"     档位{i+1}: ${bracket.cutoff:>8,.0f} - ${self.income_tax_rate[i+1].cutoff:>8,.0f} → {bracket.rate:>5.1%}")
+                next_monthly = self.income_tax_rate[i+1].cutoff / 12.0
+                print(f"     档位{i+1}: 月收入 ${monthly_cutoff:>7,.0f} - ${next_monthly:>7,.0f} → {bracket.rate:>5.1%}")
             else:
-                print(f"     档位{i+1}: ${bracket.cutoff:>8,.0f}+          → {bracket.rate:>5.1%}")
+                print(f"     档位{i+1}: 月收入 ${monthly_cutoff:>7,.0f}+          → {bracket.rate:>5.1%}")
         print(f"  💼 企业所得税: {self.corporate_tax_rate:.1%} (固定税率)")
         print(f"  🛒 消费税(VAT): {self.vat_rate:.1%}")
 
@@ -493,18 +496,31 @@ class EconomicCenter:
             return None
         return self.market_price_registry.get(str(market_type), {}).get(str(industry_code))
 
-    def _call_labor_market(self, method_name: str, *args, **kwargs):
+    def _call_labor_market_sync(self, method_name: str, *args, **kwargs):
+        """同步调用 labor_market 方法（仅用于非异步上下文）"""
         if self.labor_market is None:
             return None
         method = getattr(self.labor_market, method_name, None)
         if method is None:
             return None
         if 'ActorHandle' in str(type(self.labor_market)):
+            # 注意：这会在 async actor 中产生警告，但某些同步方法需要它
             return ray.get(method.remote(*args, **kwargs))
+        return method(*args, **kwargs)
+    
+    async def _call_labor_market_async(self, method_name: str, *args, **kwargs):
+        """异步调用 labor_market 方法（在 async 方法中使用）"""
+        if self.labor_market is None:
+            return None
+        method = getattr(self.labor_market, method_name, None)
+        if method is None:
+            return None
+        if 'ActorHandle' in str(type(self.labor_market)):
+            return await method.remote(*args, **kwargs)
         return method(*args, **kwargs)
 
     def _get_labor_snapshot(self) -> Dict[str, Dict[str, int]]:
-        snapshot = self._call_labor_market("get_labor_force_snapshot")
+        snapshot = self._call_labor_market_sync("get_labor_force_snapshot")
         if isinstance(snapshot, dict):
             return snapshot
         return {}
@@ -953,15 +969,20 @@ class EconomicCenter:
         self._ensure_ledger_entry(buyer_id)
         self._ensure_ledger_entry(receiver_id)
 
+        # 使用小的容差来避免浮点数精度问题
+        EPSILON = 0.01  # 1 分钱的容差
+        balance = float(self.ledger[buyer_id].amount or 0.0)
+        cost = float(total_cost or 0.0)
+        
         is_company = buyer_id in self.firm_id
-        if not is_company and self.ledger[buyer_id].amount < total_cost:
+        if not is_company and balance + EPSILON < cost:
             raise ValueError(
-                f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
+                f"Insufficient balance for {buyer_id}: ${balance:.2f} < ${cost:.2f}"
             )
-        elif is_company and self.ledger[buyer_id].amount < total_cost:
+        elif is_company and balance + EPSILON < cost:
             self.logger.info(
                 f"💳 Company {buyer_id} intermediate goods purchase with negative balance: "
-                f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
+                f"${balance:.2f} → ${balance - cost:.2f}"
             )
 
         self.ledger[buyer_id].amount -= total_cost
@@ -1008,24 +1029,37 @@ class EconomicCenter:
         self._ensure_ledger_entry(buyer_id)
         self._ensure_ledger_entry(receiver_id)
 
+        # 使用小的容差来避免浮点数精度问题（如 $141.08 < $141.08 因精度问题判断为 True）
+        EPSILON = 0.01  # 1 分钱的容差
+        balance = float(self.ledger[buyer_id].amount or 0.0)
+        cost = float(total_cost or 0.0)
+        
         is_company = buyer_id in self.firm_id
-        if not is_company and self.ledger[buyer_id].amount < total_cost:
+        if not is_company and balance + EPSILON < cost:
             raise ValueError(
-                f"Insufficient balance for {buyer_id}: ${self.ledger[buyer_id].amount:.2f} < ${total_cost:.2f}"
+                f"Insufficient balance for {buyer_id}: ${balance:.2f} < ${cost:.2f}"
             )
-        elif is_company and self.ledger[buyer_id].amount < total_cost:
+        elif is_company and balance + EPSILON < cost:
             self.logger.info(
                 f"💳 Company {buyer_id} resource purchase with negative balance: "
-                f"${self.ledger[buyer_id].amount:.2f} → ${self.ledger[buyer_id].amount - total_cost:.2f}"
+                f"${balance:.2f} → ${balance - cost:.2f}"
             )
 
         self.ledger[buyer_id].amount -= total_cost
         self.ledger[receiver_id].amount += total_cost
 
+        # 记录买方（企业）的支出
         if is_company:
             self.record_firm_expense(buyer_id, total_cost)
             self.record_firm_monthly_expense(buyer_id, month, total_cost)
             self.firm_monthly_data[buyer_id][month]["production_cost"] += total_cost
+
+        # 记录接收方（服务企业）的收入
+        # 检查 receiver_id 是否为注册的企业（而非虚拟市场账户）
+        is_receiver_company = receiver_id in self.firm_id
+        if is_receiver_company:
+            self.record_firm_income(receiver_id, total_cost)
+            self.record_firm_monthly_income(receiver_id, month, total_cost)
 
         tx = self._record_transaction(
             sender_id=buyer_id,
@@ -1102,10 +1136,11 @@ class EconomicCenter:
         base_price = float(amount)
         total_cost_with_tax = base_price * (1 + self.vat_rate)
         
-        # 检查买家余额
+        # 检查买家余额（使用小容差避免浮点数精度问题）
+        EPSILON = 0.01
         if buyer_id not in self.ledger:
             self.ledger[buyer_id] = Ledger.create(buyer_id, 0.0)
-        if self.ledger[buyer_id].amount < total_cost_with_tax:
+        if self.ledger[buyer_id].amount + EPSILON < total_cost_with_tax:
             self.logger.warning(f"购买失败: 买家 {buyer_id} 余额不足 (需要 {total_cost_with_tax:.2f})")
             return None
 
@@ -1318,19 +1353,35 @@ class EconomicCenter:
     # =========================================================================
     def calculate_progressive_income_tax(self, gross_wage: float) -> float:
         """
-        Calculate the income tax for a given gross wage
+        Calculate the income tax for a given gross wage (MONTHLY).
+        
+        注意：配置文件中的税率阈值是按年定义的（# by year），
+        这里自动转换为月阈值（÷12）进行计算。
+        
+        Args:
+            gross_wage: 月工资（税前）
+        
+        Returns:
+            月应缴个人所得税
         """
-        total_tax = 0
+        total_tax = 0.0
+        
         for i, bracket in enumerate(self.income_tax_rate):
-            if gross_wage > bracket.cutoff:
+            # 将年阈值转换为月阈值
+            monthly_cutoff = bracket.cutoff / 12.0
+            
+            if gross_wage > monthly_cutoff:
                 if i + 1 < len(self.income_tax_rate):
-                    upper_bracket = self.income_tax_rate[i + 1].cutoff
+                    # 下一档的月阈值
+                    upper_monthly_cutoff = self.income_tax_rate[i + 1].cutoff / 12.0
                 else:
-                    upper_bracket = float('inf')
-                taxable_in_bracket = min(gross_wage, upper_bracket) - bracket.cutoff
+                    upper_monthly_cutoff = float('inf')
+                
+                taxable_in_bracket = min(gross_wage, upper_monthly_cutoff) - monthly_cutoff
                 total_tax += taxable_in_bracket * bracket.rate
             else:
                 break
+        
         return total_tax
 
     def compute_household_settlement(self, household_id: str):
@@ -1864,15 +1915,19 @@ class EconomicCenter:
         """
         # 🔧 修改：只检查家庭的余额，企业允许负债
         # 判断是否是企业：firm_id 在 self.firm_id 列表中
+        # 使用小容差避免浮点数精度问题
+        EPSILON = 0.01
         is_company = sender_id in self.firm_id
+        balance = float(self.ledger[sender_id].amount or 0.0)
+        amt = float(amount or 0.0)
         
-        if not is_company and self.ledger[sender_id].amount < amount:
+        if not is_company and balance + EPSILON < amt:
             # 家庭余额不足，不允许交易
-            raise ValueError(f"Insufficient balance for household {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
-        elif is_company and self.ledger[sender_id].amount < amount:
+            raise ValueError(f"Insufficient balance for household {sender_id}: ${balance:.2f} < ${amt:.2f}")
+        elif is_company and balance + EPSILON < amt:
             # 企业余额不足，允许负债交易，记录日志
             self.logger.info(f"💳 Company {sender_id} transaction with negative balance: "
-                      f"${self.ledger[sender_id].amount:.2f} → ${self.ledger[sender_id].amount - amount:.2f}")
+                      f"${balance:.2f} → ${balance - amt:.2f}")
         
         # 直接更新账本
         self.ledger[sender_id].amount -= amount
@@ -1908,10 +1963,21 @@ class EconomicCenter:
         - 不产生VAT/消费税（避免政府自我征税）
         - 记录企业收入
         """
-        # 余额检查
+        # 确保发送方有账本条目
+        if sender_id not in self.ledger:
+            self.ledger[sender_id] = Ledger(amount=0.0)
+        
+        # 确保接收方有账本条目（制造商可能还未注册）
+        if receiver_id not in self.ledger:
+            self.ledger[receiver_id] = Ledger(amount=0.0)
+        
+        # 余额检查（使用小容差避免浮点数精度问题）
+        EPSILON = 0.01
         is_company = sender_id in self.firm_id
-        if not is_company and self.ledger[sender_id].amount < amount:
-            raise ValueError(f"Insufficient balance for {sender_id}: ${self.ledger[sender_id].amount:.2f} < ${amount:.2f}")
+        balance = float(self.ledger[sender_id].amount or 0.0)
+        amt = float(amount or 0.0)
+        if not is_company and balance + EPSILON < amt:
+            raise ValueError(f"Insufficient balance for {sender_id}: ${balance:.2f} < ${amt:.2f}")
 
         # 转账
         self.ledger[sender_id].amount -= amount
@@ -2903,33 +2969,72 @@ class EconomicCenter:
     
     def _calculate_price_index(self, month: int) -> float:
         """
-        计算价格指数（拉氏指数简化版）
+        计算价格指数（Laspeyres 拉氏指数）
         
-        使用商品市场价格注册表计算加权平均价格
+        公式: P = Σ(p_t × q_0) / Σ(p_0 × q_0) × 100
+        其中:
+          - p_t: 当期价格
+          - p_0: 基期价格  
+          - q_0: 基期数量（固定权重）
+        
+        返回基于 100 的价格指数（基期=100）
         """
+        # 尝试使用产品价格注册表计算
         if not hasattr(self, "market_price_registry") or not self.market_price_registry:
-            return 1.0
+            return 100.0  # 默认返回基期值 100
         
-        # 尝试从交易历史计算平均价格
+        # 获取本月交易数据，用于计算当期价格
         transactions = self.tx_by_month.get(month, [])
         if not transactions:
             transactions = [tx for tx in self.tx_history if tx.month == month]
         
-        total_value = 0.0
-        total_quantity = 0.0
+        # 按 SKU 统计当期平均价格
+        sku_current_price: Dict[str, List[float]] = defaultdict(list)
+        sku_quantity: Dict[str, float] = defaultdict(float)
         
         for tx in transactions:
             if str(getattr(tx, "type", "") or "") in ("purchase", "government_procurement"):
                 metadata = getattr(tx, "metadata", {}) or {}
+                sku_id = str(metadata.get("sku_id", metadata.get("product_id", "")) or "")
                 quantity = float(metadata.get("quantity", 0.0) or 0.0)
                 amount = float(getattr(tx, "amount", 0.0) or 0.0)
-                if quantity > 0:
-                    total_value += amount
-                    total_quantity += quantity
+                if sku_id and quantity > 0:
+                    unit_price = amount / quantity
+                    sku_current_price[sku_id].append(unit_price)
+                    sku_quantity[sku_id] += quantity
         
-        if total_quantity > 0:
-            return total_value / total_quantity
-        return 1.0
+        if not sku_current_price:
+            return 100.0  # 无交易数据，返回基期值
+        
+        # 计算拉氏指数
+        # 使用基期数量作为权重，比较当期价格与基期价格
+        base_value = 0.0      # Σ(p_0 × q_0)
+        current_value = 0.0   # Σ(p_t × q_0)
+        
+        for sku_id, prices in sku_current_price.items():
+            # 获取基期价格（从注册表）
+            base_price = 0.0
+            if sku_id in self.market_price_registry:
+                entry = self.market_price_registry[sku_id]
+                base_price = float(entry.get("base_retail_price", entry.get("retail_price", 0)) or 0)
+            
+            if base_price <= 0:
+                # 无基期价格，使用当期价格作为基期
+                base_price = sum(prices) / len(prices) if prices else 0
+            
+            # 当期平均价格
+            current_price = sum(prices) / len(prices) if prices else base_price
+            
+            # 使用当期交易数量作为权重（简化版，实际应用固定篮子）
+            weight_qty = sku_quantity[sku_id]
+            
+            base_value += base_price * weight_qty
+            current_value += current_price * weight_qty
+        
+        # 计算指数（基期=100）
+        if base_value > 0:
+            return (current_value / base_value) * 100.0
+        return 100.0
     
     def _get_previous_month_gdp(self, month: int) -> Optional[Dict[str, float]]:
         """获取上月 GDP 数据（用于计算增长率）"""
@@ -2973,6 +3078,15 @@ class EconomicCenter:
             agent_id: float(ledger.amount)
             for agent_id, ledger in self.ledger.items()
         }
+    
+    def get_all_household_ids(self) -> List[str]:
+        """
+        获取所有家庭 ID 列表
+        
+        Returns:
+            List[household_id]
+        """
+        return list(self.household_id)
     
     def restore_balances(self, ledger_data: Dict[str, float]) -> int:
         """

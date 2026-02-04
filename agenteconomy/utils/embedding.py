@@ -28,7 +28,7 @@ def embedding(text: str):
     # Mean pooling
     pooled_output = mean_pooling(outputs, inputs['attention_mask']).squeeze(0)
     pooled_output = torch.nan_to_num(pooled_output.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    
+
     # Clip extreme values before normalization to prevent overflow
     pooled_output = torch.clamp(pooled_output, min=-1e6, max=1e6)
 

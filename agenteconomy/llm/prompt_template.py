@@ -18,33 +18,39 @@ def build_firm_post_job_prompt(firm):
 # =============================================================================
 
 CONSUMPTION_MAJOR_BUDGET_PROMPT = """\
-  You are allocating a household's total consumption budget into major buckets for this period.
-Time period: one month. This budget allocation corresponds to the household's spending behavior for this month.
+You are allocating a household's monthly consumption budget. Make a realistic and economically rational decision.
 
-Inputs:
-- persona (selected fields): {persona}
-- Recent household situation: {past_household_status}
-- available_balance: {available_balance}
-- expected_income: {expected_income}
-- available_budget: {available_budget}
+## Financial Status
+- available_balance (savings): {available_balance}
+- expected_income (this month): {expected_income}
+- last_month_consumption: {last_month_consumption}
+- historical_monthly_expenditure: {historical_expenditure}
 
-Task:
-1) Infer the household's total consumption budget (total_budget).
-2) Allocate that total_budget into the following budget buckets:
-   - Retail merchandise
-   - housing
-   - healthcare
-   - transportation
-   - utilities
-   - insurance
+## Household Profile
+- persona: {persona}
+- Recent situation: {past_household_status}
 
-Rules:
-- All budgets are floats.
-- The sum of all bucket budgets MUST equal total_budget (allow a small floating error <= 0.01).
-- total_budget MUST be <= available_budget.
-- Use English only.
+## Macroeconomic Environment
+{macro_indicators}
 
-Output STRICT JSON ONLY with this schema:
+## Budget Allocation Principles (IMPORTANT)
+1. **Income-based spending**: If employed, spend 70-90% of monthly income.
+2. **Savings buffer**: Keep at least 3-6 months of expenses in savings for emergencies.
+3. **Consumption smoothing**: Avoid dramatic changes in spending. If last_month_consumption > 0, this month should be within ±20% of it.
+4. **Unemployment response**: If no income but have savings, maintain ~60-80% of historical spending level (draw from savings).
+5. **Minimum needs**: Even with no income, allocate at least $1,500 for basic necessities if savings allow.
+6. **Maximum constraint**: Never spend more than available_balance (savings) in a single month.
+
+## Task
+Decide total_budget and allocate it into these categories:
+- Retail merchandise (food, clothing, household goods)
+- housing (rent, mortgage, maintenance)
+- healthcare (medical, insurance copays)
+- transportation (car, gas, transit)
+- utilities (electricity, water, internet)
+- insurance (life, property, other)
+
+## Output (STRICT JSON ONLY)
 {{
   "total_budget": 0.0,
   "budgets": {{
@@ -55,6 +61,7 @@ Output STRICT JSON ONLY with this schema:
     "utilities": 0.0,
     "insurance": 0.0
   }},
+  "reasoning": "brief explanation of your budget decision",
   "note": "string"
 }}
 """
@@ -140,6 +147,52 @@ Output STRICT JSON ONLY with this schema:
     }}
   ],
   "note": "string"
+}}
+"""
+
+
+PURCHASE_ALL_CATEGORIES_PROMPT = """\
+You are selecting specific products to buy for ALL categories given candidate lists and budgets.
+Time period: one month. This purchase decision corresponds to the household's spending behavior for this month.
+
+Inputs:
+- persona (selected fields): {persona}
+- Recent household situation: {past_household_status}
+- categories_data: {categories_data}
+
+Each category in categories_data contains:
+- category: category name
+- budget: budget for this category (if budget > 0, you MUST spend it)
+- need_descriptions: list of needs to fulfill
+- candidates: list of candidate products (each has product_id, name, price)
+
+Task:
+For EACH category with budget > 0, choose products from its candidates and allocate budget shares.
+
+Rules:
+- IMPORTANT: For each category with budget > 0, you MUST choose at least 1 product. Do NOT leave purchases empty.
+- Each chosen product MUST come from that category's candidates list (use exact product_id).
+- budget_share is a fraction of that category's budget (0.0 ~ 1.0).
+- Sum of budget_share per category should equal 1.0 (spend the entire budget).
+- If a category has budget = 0, you may leave purchases empty for that category.
+- Cover essential needs first; prefer lower price for similar suitability.
+- Use English only.
+
+Output STRICT JSON ONLY with this schema:
+{{
+  "categories": [
+    {{
+      "category": "category_name",
+      "purchases": [
+        {{
+          "product_id": "string",
+          "budget_share": 0.0,
+          "reason": "string"
+        }}
+      ],
+      "note": "string"
+    }}
+  ]
 }}
 """
 
