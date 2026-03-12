@@ -142,6 +142,7 @@ class Simulator:
 
             self.government.initialize()
             self.government.set_labor_market(self.labor_market)  # 设置劳动力市场引用
+            self.government.set_product_market(self.product_market)  # 设置产品市场引用
             
             # Initialize bank
             self.bank = Bank(
@@ -810,6 +811,16 @@ class Simulator:
         # 月初重置供需追踪
         self._call_actor(self.product_market, "reset_supply_demand_tracking")
 
+        # ========== 劳动力市场（与正式月顺序一致）==========
+        with self._time_block("裁员处理", month=month, preheat=True):
+            await self._process_layoffs(econ_month)
+        with self._time_block("发布岗位", month=month, preheat=True):
+            await self._post_jobs(econ_month)
+        with self._time_block("招聘匹配", month=month, preheat=True):
+            await self._match_jobs(econ_month, use_llm=False)
+        with self._time_block("发放工资", month=month, preheat=True):
+            wage_stats = self._pay_wages(econ_month, record_transactions=True)
+
         # ========== 商品市场 ==========
         with self._time_block("消费决策", month=month, preheat=True):
             consumption_results = await self._collect_consumption_plans(top_k=10)
@@ -848,16 +859,8 @@ class Simulator:
                 household_consumption_budget=household_total_budget
             )
         
-        # 更新销售记录（在政府采购之后，以便包含政府采购数据）
+        # 更新销售记录
         self._update_last_sales(econ_month, consumption_stats)
-        
-        # ========== 劳动力市场 ==========
-        with self._time_block("发布岗位", month=month, preheat=True):
-            await self._post_jobs(econ_month, production_stats=production_stats, service_stats=service_consumption_stats, demand_stats=demand_stats)
-        with self._time_block("招聘匹配", month=month, preheat=True):
-            await self._match_jobs(econ_month, use_llm=False)
-        with self._time_block("发放工资", month=month, preheat=True):
-            wage_stats = self._pay_wages(econ_month, record_transactions=True)
         
         # ========== 月末结算 ==========
         with self._time_block("企业所得税", month=month, preheat=True):
@@ -866,6 +869,8 @@ class Simulator:
             await self._pay_bank_interest(econ_month)
         with self._time_block("税收再分配", month=month, preheat=True):
             await self._redistribute_taxes(econ_month)
+        with self._time_block("企业分红", month=month, preheat=True):
+            self._distribute_dividends(econ_month)
         
         with self._time_block("月度汇总", month=month, preheat=True):
             self._record_month_summary(
@@ -1014,6 +1019,9 @@ class Simulator:
         with self._time_block("税收再分配", month=month, preheat=False):
             redistribution_stats = await self._redistribute_taxes(econ_month)
         self._log_redistribution_stats(redistribution_stats)
+
+        with self._time_block("企业分红", month=month, preheat=False):
+            dividend_stats = self._distribute_dividends(econ_month)
 
         if self._debug_enabled() and self.economic_center is not None:
             self._log_firm_financials(econ_month)
@@ -1179,7 +1187,9 @@ class Simulator:
         macro_indicators = self._compute_macro_indicators()
 
         # 分批处理家庭消费，避免ProductMarket actor过载
-        batch_size = int(os.getenv("CONSUMPTION_BATCH_SIZE", "100"))
+        # 默认 50（原 100），每个家庭约 12 个向量搜索请求，50 家庭 ≈ 600 个请求
+        # 配合 ProductMarket._qdrant_semaphore 控制实际 Qdrant 并发
+        batch_size = int(os.getenv("CONSUMPTION_BATCH_SIZE", "50"))
         all_outputs = []
 
         for batch_start in range(0, len(self.households), batch_size):
@@ -1666,6 +1676,7 @@ class Simulator:
 
         for firm, plan in firm_plans.items():
             sku_base_prices = {}
+            sku_current_prices = {}
             for sku_id in plan.keys():
                 snapshot = self._get_product_snapshot_cached(sku_id, snapshot_cache)
                 if not snapshot:
@@ -1677,10 +1688,18 @@ class Simulator:
                     or 1.0
                 )
                 sku_base_prices[sku_id] = price
+                # 生产价值使用当前市场价（动态），而非静态基准价
+                current_price = float(
+                    snapshot.get("manufacturer_price")
+                    or snapshot.get("base_manufacturer_price")
+                    or snapshot.get("retail_price")
+                    or 1.0
+                )
+                sku_current_prices[sku_id] = current_price
             firm_qty = float(sum(plan.values()))
             firm_value = 0.0
             for sku_id, qty in (plan or {}).items():
-                firm_value += float(qty or 0.0) * float(sku_base_prices.get(sku_id, 0.0) or 0.0)
+                firm_value += float(qty or 0.0) * float(sku_current_prices.get(sku_id, 0.0) or 0.0)
             production_stats["by_firm"][firm.firm_id] = {"qty": firm_qty, "value": firm_value}
             production_stats["total_qty"] += firm_qty
             production_stats["total_value"] += firm_value
@@ -2097,67 +2116,30 @@ class Simulator:
             )
     
     async def _execute_government_procurement(
-        self, 
-        month: int, 
+        self,
+        month: int,
         household_consumption_budget: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        执行政府采购
-        
-        政府作为"无限资金"的需求注入器：
-        - 预算基于家庭消费总预算的一定比例（默认30%）
-        - 即使税收为0，也会有最低采购预算（$50,000）
-        - 使用IO表系数决定各行业的采购比例
-        - 不收取VAT（避免政府自我征税）
-        
-        凯恩斯主义需求刺激：
-        政府支出↑ → 企业收入↑ → 招聘↑ → 工资↑ → 消费↑ → 良性循环
-        
-        Args:
-            month: 当前经济月份
-            household_consumption_budget: 家庭消费总预算（用于计算政府需求注入）
-            
-        Returns:
-            采购统计信息
+        政府采购：通过 Government 对象执行采购，向经济体注入需求
+
+        预算基于家庭消费总预算的一定比例（凯恩斯主义需求刺激）
         """
         if self.government is None:
-            return {
-                "total_spent": 0.0,
-                "by_industry": {},
-                "items_count": 0,
-                "success": False,
-                "error": "no government"
-            }
-        
-        # 确保政府有产品市场引用
-        if self.product_market is not None and not hasattr(self.government, 'product_market'):
-            self.government.set_product_market(self.product_market)
-        
-        # 执行采购（传入家庭消费预算用于计算政府需求注入）
+            logger.warning("[政府采购] Government 未初始化")
+            return {"total_spent": 0.0, "by_industry": {}, "items_count": 0, "success": False}
+
         try:
             result = self.government.procure_goods_and_services(
                 period=month,
                 household_consumption_budget=household_consumption_budget
             )
-            
-            if result.get("success") and result.get("total_spent", 0) > 0:
-                logger.info(
-                    f"[政府采购] 总支出=${result['total_spent']:,.2f}, "
-                    f"涉及{len(result.get('by_industry', {}))}个行业, "
-                    f"{result.get('items_count', 0)}个采购项"
-                )
-            
-            return result
-            
+            return result or {"total_spent": 0.0, "by_industry": {}, "items_count": 0, "success": True}
         except Exception as e:
             logger.error(f"[政府采购] 执行失败: {e}")
-            return {
-                "total_spent": 0.0,
-                "by_industry": {},
-                "items_count": 0,
-                "success": False,
-                "error": str(e)
-            }
+            import traceback
+            traceback.print_exc()
+            return {"total_spent": 0.0, "by_industry": {}, "items_count": 0, "success": False, "error": str(e)}
 
     def _execute_orders(
         self,
@@ -2420,13 +2402,13 @@ class Simulator:
             new_wage_cap = expected_revenue * compensation_ratio
             
             # 🛡️ 最低工资帽保护：防止过度裁员导致的死亡螺旋
-            # 至少保留2-3名员工的工资（约 $6000/月），维持基本运营
-            MIN_WAGE_CAP = 6000.0
+            # 至少保留1名员工的工资（约 $2000/月），维持最低运营
+            # 注意：66企业 × MIN_WAGE_CAP 不应超过 GDP 的 30%
+            MIN_WAGE_CAP = 2000.0
             new_wage_cap = max(new_wage_cap, MIN_WAGE_CAP)
             
-            # 📊 额外保护：如果当前员工很少，不裁员
-            # 防止企业从少量员工再裁减到0
-            MIN_EMPLOYEES_TO_KEEP = 2
+            # 📊 额外保护：如果当前员工只有1人，不裁员
+            MIN_EMPLOYEES_TO_KEEP = 1
             current_employees = int(getattr(firm, "employee_count", 0) or 0)
             if current_employees <= MIN_EMPLOYEES_TO_KEEP:
                 continue  # 跳过裁员，保持最低员工数
@@ -2459,13 +2441,51 @@ class Simulator:
                 total_layoffs += layoff_count
                 total_saved += saved
 
-        # 政府公共就业：不参与常规裁员逻辑
-        # 公共就业岗位是政策工具，作为"最后雇主"存在，不应该因预算削减而裁员
-        # 政府通过无限资金保证公共就业岗位的稳定性
-        if self.government is not None:
+        # 政府公共就业：当失业率低于目标时，逐步缩减公共就业岗位
+        # 让劳动力回流到私人部门，避免政府工资永久膨胀
+        if self.government is not None and self.labor_market is not None:
             gov_id = self.government.government_id
-            # 不执行政府裁员，保持公共就业的稳定性
-            logger.debug(f"[政府] 公共就业岗位免于裁员（政策工具）")
+            labor_stats = self._call_actor(self.labor_market, "get_labor_stats") or {}
+            total_labor = float(labor_stats.get("total_labor_hours", 0) or 0)
+            total_matched = float(labor_stats.get("total_matched_jobs", 0) or 0)
+            if total_labor > 0:
+                unemployment_rate = (total_labor - total_matched) / total_labor
+                from agenteconomy.agent.government import PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT
+                # 当失业率低于目标的一半时，开始缩减公共就业
+                shrink_threshold = PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT * 0.5
+                if unemployment_rate < shrink_threshold:
+                    # 获取当前政府工资支出
+                    gov_wage_info = self._call_actor(
+                        self.labor_market, "get_firm_wage_bill", gov_id
+                    ) or {}
+                    current_gov_wage = float(gov_wage_info.get("total_wage", 0.0) or 0.0)
+                    if current_gov_wage > 0:
+                        # 缩减比例：失业率越低，缩减越多（最多缩减20%的工资支出）
+                        shrink_ratio = min(0.20, (shrink_threshold - unemployment_rate) / shrink_threshold * 0.20)
+                        target_wage_cap = current_gov_wage * (1.0 - shrink_ratio)
+                        result = self._call_actor(
+                            self.labor_market,
+                            "layoff_to_budget",
+                            firm_id=gov_id,
+                            target_wage_cap=target_wage_cap,
+                            reason="public_employment_shrink",
+                            month=month,
+                            strategy="lowest_wage",
+                        )
+                        if result and result.get("layoffs"):
+                            gov_layoffs = len(result["layoffs"])
+                            gov_saved = result.get("saved_wage", 0.0)
+                            self.government.employee_count = max(
+                                0, int(getattr(self.government, "employee_count", 0) or 0) - gov_layoffs
+                            )
+                            total_layoffs += gov_layoffs
+                            total_saved += gov_saved
+                            logger.info(
+                                f"[政府] 公共就业缩减: 裁减{gov_layoffs}人, "
+                                f"节省工资${gov_saved:,.2f} (失业率={unemployment_rate:.1%})"
+                            )
+                else:
+                    logger.debug(f"[政府] 公共就业岗位维持 (失业率={unemployment_rate:.1%})")
 
         if total_layoffs > 0:
             logger.info(
@@ -2507,8 +2527,11 @@ class Simulator:
             logger.info(f"[岗位发布] 使用需求数据: 制造商数={len(demand_by_mfg)}, 总需求=${total_demand:,.2f}")
         
         # 企业发布岗位，传入本月需求价值
+        # 注意：只传制造商/零售商的需求数据，不传服务企业的资源流水
+        # 服务企业的"收入"是中间消耗流水（远大于GDP），不应作为劳动预算基础
+        # 服务企业会回退到 _compute_labor_budget 内部的上月实际收入逻辑
         tasks = []
-        service_firms_with_income = []  # 记录有服务收入的企业
+        service_firms_with_income = []  # 记录有服务收入的企业（仅用于日志）
         for firm in (self.firms or []):
             # 获取该企业本月的需求价值（优先使用需求数据，其次使用生产数据）
             demand_value = 0.0
@@ -2522,13 +2545,12 @@ class Simulator:
                 firm_production = production_by_firm.get(firm.firm_id, {})
                 demand_value = float(firm_production.get("value", 0.0) or 0.0)
             
-            # 服务企业使用服务消费数据
+            # 服务企业：不传入资源流水，让其使用上月实际收入（更准确）
             service_income = float(service_by_industry.get(firm.industry, 0.0) or 0.0)
-            # 记录有服务收入的企业
             if service_income > 0:
                 service_firms_with_income.append((firm.firm_id, firm.industry, service_income))
-            # 传给企业作为本月需求基础
-            tasks.append(firm.post_jobs(period=month, current_demand_value=demand_value + service_income))
+            # 传给企业：仅制造商/零售商使用需求数据，服务企业传 demand_value（通常为0，触发内部回退）
+            tasks.append(firm.post_jobs(period=month, current_demand_value=demand_value))
         
         # 打印服务收入统计
         if service_firms_with_income:
@@ -2725,9 +2747,10 @@ class Simulator:
         if self.economic_center is not None:
             firm_financials = self._call_actor(self.economic_center, "query_all_firms_monthly_financials", econ_month)
             gdp_stats = self._call_actor(self.economic_center, "calculate_monthly_gdp", econ_month, production_stats)
-            # 使用新的综合 GDP 计算
+            # 使用新的综合 GDP 计算，传入 Simulator 的价格指数以正确计算 real_gdp
             gdp_comprehensive = self._call_actor(
-                self.economic_center, "calculate_gdp_comprehensive", econ_month, production_stats, 0
+                self.economic_center, "calculate_gdp_comprehensive", econ_month, production_stats, 0,
+                external_price_index_100=self._last_price_index
             )
             # 缓存 GDP 结果用于增长率计算和月末报告打印
             if gdp_comprehensive:
@@ -2774,6 +2797,9 @@ class Simulator:
         balances = [rec.get("balance") for rec in household_by.values()]
         assets_stats = self._calc_distribution_stats([float(v or 0.0) for v in balances])
         assets_stats["gini"] = self._calc_gini([float(v or 0.0) for v in balances])
+        # 收入基尼系数（比财富基尼更能反映经济周期的分配效应）
+        incomes = [float((rec.get("income", {}) or {}).get("total", 0.0) or 0.0) for rec in household_by.values()]
+        assets_stats["income_gini"] = self._calc_gini(incomes)
 
         # 使用实际注册的劳动力数量，数据校验：剔除负值和极端值
         total_labor = max(0.0, float(labor_summary.get("total_labor_hours", 0.0) or 0.0))
@@ -2820,6 +2846,7 @@ class Simulator:
                         "mean": float(assets_stats.get("mean", 0.0) or 0.0),
                         "median": float(assets_stats.get("median", 0.0) or 0.0),
                         "gini": float(assets_stats.get("gini", 0.0) or 0.0),
+                        "income_gini": float(assets_stats.get("income_gini", 0.0) or 0.0),
                         "count": int(assets_stats.get("count", 0) or 0),
                     },
                     # 消费类别分布
@@ -3154,6 +3181,124 @@ class Simulator:
             logger.error(f"税收再分配失败: {e}")
             return {}
     
+    def _distribute_dividends(self, month: int, dividend_rate: float = 0.80) -> Dict[str, Any]:
+        """
+        企业分红：将税后利润的一部分分配给家庭
+        
+        在真实经济中，企业利润通过股息、租金收入等方式回流给家庭。
+        特别是住房行业(HS)的毛利(V003=79.4%)本质是租金收入，应回流给家庭。
+        
+        分配权重按家庭财富(ER85692)占比，财富越多持有的"股份"越多。
+        
+        Args:
+            month: 当前经济月份
+            dividend_rate: 分红比率（税后利润的百分比），默认80%
+            
+        Returns:
+            分红统计 {total_dividends, by_firm, recipients, per_household_avg}
+        """
+        if self.economic_center is None or not self.firms or not self.households:
+            return {"total_dividends": 0.0, "by_firm": {}, "recipients": 0}
+        
+        # 1. 计算每个企业的可分红利润
+        dividends_by_firm: Dict[str, float] = {}
+        total_dividends = 0.0
+        
+        for firm in self.firms:
+            # 查询企业本月财务（企业所得税已扣除后）
+            stats = self._call_actor(
+                self.economic_center,
+                "query_firm_monthly_financials",
+                firm_id=firm.firm_id,
+                month=month,
+            )
+            if not isinstance(stats, dict):
+                continue
+            
+            income = float(stats.get("monthly_income", 0.0) or 0.0)
+            expenses = float(stats.get("monthly_expenses", 0.0) or 0.0)
+            profit = income - expenses
+            
+            # 只有正利润才分红
+            if profit <= 0:
+                continue
+            
+            # 企业所得税已在 _settle_corporate_tax 中扣除
+            # profit 已包含税的扣除（expenses 包含了 corporate_tax）
+            # 但实际上 corporate_tax 是额外结算的，这里的 profit 是税前利润
+            # 需要减去企业所得税
+            corporate_tax_rate = float(getattr(self.config, "corporate_tax_rate", 0.21) or 0.21)
+            after_tax_profit = profit * (1 - corporate_tax_rate)
+            
+            dividend = after_tax_profit * dividend_rate
+            if dividend <= 0.01:
+                continue
+            
+            # 检查企业余额是否足够支付分红
+            firm_balance = float(self._call_actor(
+                self.economic_center, "query_balance", firm.firm_id
+            ) or 0.0)
+            
+            # 预留运营资金：至少保留上月支出的 1.2 倍，确保下月能正常发工资和进货
+            reserved = expenses * 1.2
+            distributable = firm_balance - reserved
+            if distributable <= 0:
+                continue
+            dividend = min(dividend, distributable)
+            
+            if dividend > 0.01:
+                dividends_by_firm[firm.firm_id] = dividend
+                total_dividends += dividend
+        
+        if total_dividends <= 0:
+            return {"total_dividends": 0.0, "by_firm": {}, "recipients": 0}
+        
+        # 2. 按家庭财富权重分配
+        # 使用 PSID ER85692 (Constructed Wealth Including Equity) 作为权重
+        household_weights: Dict[str, float] = {}
+        total_weight = 0.0
+        for hh in self.households:
+            wealth = 0.0
+            try:
+                wealth = float(hh.csv_values.get("ER85692") or 0.0)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            # 确保非负权重，最低给1.0（保证所有人都能分到一点）
+            weight = max(wealth, 1.0)
+            household_weights[hh.household_id] = weight
+            total_weight += weight
+        
+        if total_weight <= 0:
+            return {"total_dividends": 0.0, "by_firm": dividends_by_firm, "recipients": 0}
+        
+        # 3. 执行分红转账（通过 update_balance 批量操作）
+        recipients = 0
+        
+        # 从企业账户扣除
+        for firm_id, div_amount in dividends_by_firm.items():
+            self._call_actor(self.economic_center, "update_balance", firm_id, -div_amount)
+        
+        # 按权重分配给家庭
+        for hh in self.households:
+            weight = household_weights.get(hh.household_id, 1.0)
+            share = total_dividends * (weight / total_weight)
+            if share > 0.01:
+                self._call_actor(self.economic_center, "update_balance", hh.household_id, share)
+                recipients += 1
+        
+        logger.info(
+            f"[企业分红] 月份={month}, 总额=${total_dividends:,.2f}, "
+            f"企业数={len(dividends_by_firm)}, 受益家庭={recipients}, "
+            f"人均=${total_dividends/max(recipients,1):,.2f}"
+        )
+        
+        return {
+            "total_dividends": total_dividends,
+            "by_firm": dividends_by_firm,
+            "recipients": recipients,
+            "per_household_avg": total_dividends / max(recipients, 1),
+        }
+
     # =========================================================================
     # 调试日志辅助方法
     # =========================================================================
@@ -3290,8 +3435,8 @@ class Simulator:
         if not procurement_stats:
             logger.info("  ⚠️  进货统计为空")
             return
-        total = procurement_stats.get("total_cost", 0.0)
-        count = procurement_stats.get("retailers_count", 0)
+        total = procurement_stats.get("total_value", 0.0)
+        count = len(procurement_stats.get("by_retailer", {}))
         logger.info(f"  📥 零售商进货: 零售商数={count}, 总成本=${total:,.2f}")
     
     def _log_consumption_stats(self, consumption_stats: Optional[Dict[str, Any]]) -> None:

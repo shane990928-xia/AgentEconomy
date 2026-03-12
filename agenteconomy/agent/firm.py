@@ -432,9 +432,12 @@ class Firm:
         _logger = logging.getLogger(__name__)
         
         # 常量定义
-        INITIAL_LABOR_BUDGET = 15000.0  # 初始劳动预算（无数据时），可雇3-4人
+        # 注意：这些值需要与经济规模匹配。66企业 × MIN 不应超过 GDP 的 50%
+        # GDP ≈ $400-600K，目标总工资 ≈ 55% GDP ≈ $220-330K
+        # 人均 $330K / 66 firms ≈ $5K，所以 MIN 应远低于此
+        INITIAL_LABOR_BUDGET = 5000.0   # 初始劳动预算（无数据时），可雇1-2人
         MIN_COMPENSATION_RATIO = 0.20   # 最低 compensation 比率（20%，保证资本密集型行业也能招人）
-        MIN_LABOR_BUDGET = 8000.0       # 最低劳动预算（保证每个企业至少能雇2人）
+        MIN_LABOR_BUDGET = 500.0        # 最低劳动预算（降低，让无需求企业真正停止招聘）
         
         base_value = 0.0
         source = "none"
@@ -469,26 +472,64 @@ class Firm:
             except Exception:
                 pass
         
-        # 使用当前现金
+        # 使用当前现金（仅在第一期，即还未有收入历史时）
         if base_value <= 0:
-            cash_val = float(self.cash or 0.0)
-            if cash_val > 0:
-                base_value = cash_val
-                source = "current_cash"
+            current_period = int(period if period is not None else self.current_period or 0)
+            if current_period <= 1:
+                # 第一期允许使用初始现金启动
+                cash_val = float(self.cash or 0.0)
+                if cash_val > 0:
+                    base_value = cash_val
+                    source = "current_cash"
         
-        # 如果还是没有基础值，使用初始预算
+        # 如果所有收入来源均为0（需求=0，上月收入=0，生产历史=0）
+        # 说明该企业没有市场需求，不应继续招人消耗资金
         if base_value <= 0:
             _logger.debug(
-                f"[劳动预算] {self.firm_id}: 所有来源均为0，使用初始预算 "
+                f"[劳动预算] {self.firm_id}: 无收入来源，不发布岗位 "
                 f"(demand={current_demand_value}, cash={self.cash}, history={len(self.production_history or [])})"
             )
-            return INITIAL_LABOR_BUDGET
+            return 0.0
 
         # 使用 compensation_ratio，但确保不低于最低比率
         actual_ratio = float(getattr(self, "compensation_ratio", 0.2) or 0.2)
         effective_ratio = max(actual_ratio, MIN_COMPENSATION_RATIO)
         
         budget = base_value * effective_ratio
+        
+        # ========== 贝弗里奇曲线修正：根据失业率调整职位发布倍数 ==========
+        # 核心经济逻辑：
+        #   低失业率 → 企业预期招人困难 → 超额发布职位（但大部分填不满）→ 高空缺率
+        #   高失业率 → 企业容易招到人 → 只发布刚需职位 → 低空缺率
+        #
+        # 重要：adjustment 的下限是 1.0，不能低于 1.0
+        # 贝弗里奇修正只影响"超额发布倍数"，不压缩实际劳动需求
+        # 否则高失业率 → 企业不招人 → 失业率不降 → 死循环
+        self._beveridge_adjustment = 1.0
+        if self.labor_market is not None:
+            try:
+                labor_summary = self._call_labor_market("summary")
+                if labor_summary and isinstance(labor_summary, dict):
+                    unemployment_rate = float(labor_summary.get("unemployment_rate", 0.5) or 0.5)
+                    if unemployment_rate < 0.05:
+                        # 极低失业：企业疯狂抢人，大幅超额发布（2.5-3.0倍）
+                        self._beveridge_adjustment = 2.5 + (0.05 - unemployment_rate) * 10.0
+                    elif unemployment_rate < 0.10:
+                        # 低失业：超额发布（1.5-2.5倍）
+                        self._beveridge_adjustment = 2.5 - (unemployment_rate - 0.05) * 20.0
+                    elif unemployment_rate < 0.20:
+                        # 中等失业：略微超额发布（1.0-1.5倍）
+                        self._beveridge_adjustment = 1.5 - (unemployment_rate - 0.10) * 5.0
+                    else:
+                        # 高失业：正常发布（1.0倍），不压缩
+                        self._beveridge_adjustment = 1.0
+                    budget = budget * self._beveridge_adjustment
+                    _logger.debug(
+                        f"[劳动预算-贝弗里奇] {self.firm_id}: unemp_rate={unemployment_rate:.3f}, "
+                        f"adjustment={self._beveridge_adjustment:.3f}, budget={budget:.2f}"
+                    )
+            except Exception as e:
+                _logger.debug(f"[劳动预算] 获取失业率失败: {e}")
         
         # 确保最低劳动预算
         budget = max(budget, MIN_LABOR_BUDGET)
@@ -648,6 +689,10 @@ class Firm:
         """
         Post jobs to the labor market
         
+        支持双向调整：
+        - desired > existing: 发布增量职位
+        - desired < existing: 缩减空缺职位（不影响已雇佣的员工）
+        
         Args:
             period: 当前期间
             current_demand_value: 本月的需求/生产价值（用于计算劳动预算）
@@ -662,10 +707,15 @@ class Firm:
                 desired = int(job.positions_available or 0)
                 existing = int(snapshot.get(job.SOC, 0) or 0)
                 delta = desired - existing
-                if delta <= 0:
-                    continue
-                job.positions_available = delta
-                to_post.append(job)
+                if delta > 0:
+                    # 需要增加职位
+                    job.positions_available = delta
+                    to_post.append(job)
+                elif delta < 0:
+                    # 需要缩减空缺职位（市场宽松时减少不必要的空缺）
+                    self._call_labor_market(
+                        "reduce_job_positions", self.firm_id, job.SOC, abs(delta)
+                    )
             if to_post:
                 self._call_labor_market("apply_job_plan", self.firm_id, to_post)
             return to_post

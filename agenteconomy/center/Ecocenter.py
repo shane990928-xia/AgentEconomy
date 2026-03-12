@@ -936,13 +936,14 @@ class EconomicCenter:
         self.wage_history = []
         self.redistribution_record_per_person = defaultdict(float)
 
-        def _default_firm_month() -> Dict[str, float]:
-            return {"income": 0.0, "expenses": 0.0, "wage": 0.0, "tax": 0.0, "production_cost": 0.0}
-
-        self.firm_monthly_data = defaultdict(lambda: defaultdict(_default_firm_month))
+        # 保留 firm_monthly_data：预热期积累的企业收入/支出数据
+        # 正式期 FM1 需要查询预热期 PM3 的收入来计算工资帽和裁员决策
+        # 如果清空，所有企业在 FM1 都会被判定为 zero_revenue → 大规模裁员
+        # self.firm_monthly_data 不清空
         self._corporate_tax_settled_months = set()
-        self.firm_monthly_depreciation = defaultdict(lambda: defaultdict(float))
-        self.firm_monthly_capital_investment = defaultdict(lambda: defaultdict(float))
+        # 保留 firm_monthly_depreciation 和 capital_investment（与 firm_monthly_data 一致）
+        # self.firm_monthly_depreciation 不清空
+        # self.firm_monthly_capital_investment 不清空
         self.unmet_demand_by_month = defaultdict(dict)
 
         if hasattr(self, "production_stats_by_month"):
@@ -1054,12 +1055,21 @@ class EconomicCenter:
             self.record_firm_monthly_expense(buyer_id, month, total_cost)
             self.firm_monthly_data[buyer_id][month]["production_cost"] += total_cost
 
-        # 记录接收方（服务企业）的收入
-        # 检查 receiver_id 是否为注册的企业（而非虚拟市场账户）
+        # 记录接收方的收入
         is_receiver_company = receiver_id in self.firm_id
+        is_buyer_company = buyer_id in self.firm_id
         if is_receiver_company:
             self.record_firm_income(receiver_id, total_cost)
             self.record_firm_monthly_income(receiver_id, month, total_cost)
+            if not is_buyer_company:
+                # 家庭服务消费 → ServiceFirm：自动记录隐含运营成本
+                # 服务业成本结构：~55% 中间投入/运营成本（租金、设备、耗材、折旧等）
+                # 剩余 45% = 工资(~20-30%) + 利润(~15-25%)
+                # 这里只记账面成本，不实际扣钱，影响的是企业所得税税基
+                SERVICE_IMPLICIT_COST_RATIO = 0.55
+                implied_cost = total_cost * SERVICE_IMPLICIT_COST_RATIO
+                self.record_firm_expense(receiver_id, implied_cost)
+                self.record_firm_monthly_expense(receiver_id, month, implied_cost)
 
         tx = self._record_transaction(
             sender_id=buyer_id,
@@ -1232,6 +1242,12 @@ class EconomicCenter:
         # 零售商支付批发价
         self.ledger[retailer_id].amount -= wholesale_amount
 
+        # 记录零售商的进货成本（影响企业所得税税基）
+        # 没有这一步，taxable_profit = 销售收入 - 工资，进货成本被遗漏
+        # 导致零售商利润虚高 → 企业所得税虚高 → 现金枯竭 → 进货失败
+        self.record_firm_expense(retailer_id, wholesale_amount)
+        self.record_firm_monthly_expense(retailer_id, month, wholesale_amount)
+
         # 创建批发交易记录
         wholesale_tx = self._record_transaction(
             sender_id=retailer_id,
@@ -1334,6 +1350,14 @@ class EconomicCenter:
         
         # 企业支出工资
         if firm_id:
+            if firm_id not in self.ledger:
+                self.ledger[firm_id] = Ledger.create(firm_id, 0.0)
+            # 检查余额，防止过度透支
+            if self.ledger[firm_id].amount < gross_wage:
+                self.logger.warning(
+                    f"工资透支: 企业 {firm_id} 余额不足 "
+                    f"(需要 {gross_wage:.2f}, 余额 {self.ledger[firm_id].amount:.2f})"
+                )
             self.ledger[firm_id].amount -= gross_wage
             # 记录企业支出（经济中心层面）
             self.record_firm_expense(firm_id, gross_wage)
@@ -2226,7 +2250,21 @@ class EconomicCenter:
 
             income = float(self.firm_monthly_data.get(firm_id, {}).get(month, {}).get("income", 0.0) or 0.0)
             expenses_pre_tax = float(self.firm_monthly_data.get(firm_id, {}).get(month, {}).get("expenses", 0.0) or 0.0)
-            taxable_profit = max(0.0, income - expenses_pre_tax)
+            
+            # ServiceFirm（svc_前缀）的服务消费收入中，大部分是隐含成本
+            # （地租/折旧/中间投入/工资），不是纯利润。
+            # 按 BEA IO 表，服务业平均利润率约 10-15%。
+            # 这里限制 ServiceFirm 的应税利润不超过收入的 15%。
+            if firm_id.startswith("svc_"):
+                max_profit = income * 0.15  # 服务业利润率上限 15%
+                taxable_profit = min(max(0.0, income - expenses_pre_tax), max_profit)
+            else:
+                taxable_profit = max(0.0, income - expenses_pre_tax)
+            # ServiceFirm（svc_前缀）的利润率上限为 15%
+            # 防止服务消费收入被全额当作利润征税
+            if firm_id.startswith("svc_") and income > 0:
+                max_profit = income * 0.15
+                taxable_profit = min(taxable_profit, max_profit)
             corporate_tax = taxable_profit * float(self.corporate_tax_rate or 0.0)
 
             if corporate_tax <= 1e-9:
@@ -2617,7 +2655,8 @@ class EconomicCenter:
         self, 
         month: int, 
         production_stats: Optional[Dict[str, Any]] = None,
-        base_month: int = 0
+        base_month: int = 0,
+        external_price_index_100: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         综合 GDP 计算：基于实际交易流 + 行业分解 + 实际/名义 GDP
@@ -2722,10 +2761,17 @@ class EconomicCenter:
             elif tx_type == "corporate_tax":
                 corporate_tax_collected += amount
             
-            # 中间投入（原材料采购）
+            # 资源购买：区分家庭服务消费（最终消费 C）和企业原材料采购（中间投入）
             elif tx_type == "resource_purchase":
-                industry = str(metadata.get("industry", "Unknown") or "Unknown")
-                industry_intermediate[industry] += amount
+                industry = str(metadata.get("industry_code", metadata.get("industry", "Unknown")) or "Unknown")
+                if sender_id in self.household_id:
+                    # 家庭购买服务（住房、医疗、交通、水电、保险等）→ 最终消费 C
+                    household_consumption += amount
+                    household_consumption_ex_tax += amount  # 服务消费不含 VAT
+                    industry_sales[industry] += amount
+                else:
+                    # 企业购买原材料 → 中间投入
+                    industry_intermediate[industry] += amount
         
         # =====================================================================
         # 2️⃣ 计算支出法 GDP: C + G + I
@@ -2734,16 +2780,28 @@ class EconomicCenter:
         # 总消费 C（含税，反映实际支付）
         consumption_total = household_consumption
         
-        # 政府支出 G = 政府采购 + 政府工资
+        # 政府支出 G = 政府最终消费支出
+        # SNA 口径：G = 政府采购商品/服务 + 政府部门增加值（雇员报酬）
+        # SNA 国民账户标准：G = 政府最终消费 = 政府采购 + 公务员薪酬
+        # 政府工资是政府"生产"公共服务的成本（增加值），属于 G 的一部分。
+        # 家庭用政府工资收入进行的消费计入 C，两者不重复：
+        #   G 衡量的是政府提供公共服务的价值（用成本法计量）
+        #   C 衡量的是家庭的私人消费支出
         government_expenditure = government_procurement + government_wages
         
-        # 投资 I（存货投资）= 产出 - 销售
+        # 投资 I（存货投资）
+        # 注意：本模型中企业按需生产（shortage-driven），大量商品从库存卖出，
+        # 导致 output << sales。用 output - sales 会严重低估 GDP。
+        # 正确做法：存货投资 = 期末库存价值 - 期初库存价值
+        # 但模型中没有跟踪期初/期末库存价值，因此：
+        # 方案：在封闭经济、无固定资本投资的模型中，
+        #       GDP ≈ C + G（最终消费支出），I 仅作为参考指标。
         total_output = float(ps.get("total_output_value", 0.0) or 0.0)
         total_sales_ex_tax = household_consumption_ex_tax + government_procurement
-        inventory_investment = total_output - total_sales_ex_tax
+        inventory_investment_memo = total_output - total_sales_ex_tax  # 仅供参考
         
-        # 支出法 GDP
-        gdp_expenditure = consumption_total + government_expenditure + inventory_investment
+        # 支出法 GDP = C + G（封闭经济，无固定资本投资，存货变动不可靠时）
+        gdp_expenditure = consumption_total + government_expenditure
         
         # =====================================================================
         # 3️⃣ 计算生产法 GDP: Σ(增加值) + 产品税
@@ -2785,8 +2843,11 @@ class EconomicCenter:
         # 4️⃣ 计算收入法 GDP: 劳动者报酬 + 生产税 + 营业盈余
         # =====================================================================
         
-        # 劳动者报酬（税前）= 实发工资 + 劳动税 + FICA
-        compensation_of_employees = total_wages + labor_tax_collected + fica_tax_collected
+        # 劳动者报酬 = 私人部门工资（净额）
+        # 注意：labor_tax 和 fica_tax 是从工资中扣除的（非雇主额外缴纳），
+        # 且包含政府雇员的税，无法区分。因此 compensation 只用私人部门净工资。
+        # 政府工资不计入（避免与 C 双重计算）。
+        compensation_of_employees = private_wages
         
         # 生产税净额 = VAT + 企业所得税（简化，不考虑补贴）
         taxes_on_production = vat_collected + corporate_tax_collected
@@ -2801,15 +2862,18 @@ class EconomicCenter:
         # 5️⃣ 计算价格指数与实际 GDP
         # =====================================================================
         
-        # 获取当前价格水平
-        current_price_index = self._calculate_price_index(month)
-        base_price_index = self._calculate_price_index(base_month) if base_month != month else 1.0
-        
-        # 价格指数（基期=100）
-        if base_price_index > 0:
-            price_index = (current_price_index / base_price_index) * 100
+        # 获取价格指数
+        # 优先使用外部传入的价格指数（由 Simulator 从消费篮子计算，更准确）
+        if external_price_index_100 is not None and external_price_index_100 > 0:
+            price_index = float(external_price_index_100)
         else:
-            price_index = 100.0
+            # 回退到内部计算
+            current_price_index = self._calculate_price_index(month)
+            base_price_index = self._calculate_price_index(base_month) if base_month != month else 1.0
+            if base_price_index > 0:
+                price_index = (current_price_index / base_price_index) * 100
+            else:
+                price_index = 100.0
         
         # 实际 GDP（去除价格因素）
         deflator = price_index / 100.0 if price_index > 0 else 1.0
@@ -2834,14 +2898,14 @@ class EconomicCenter:
         # 消费率
         consumption_rate = consumption_total / gdp_expenditure if gdp_expenditure > 0 else 0.0
         
-        # 投资率
-        investment_rate = inventory_investment / gdp_expenditure if gdp_expenditure > 0 else 0.0
+        # 投资率（参考值，不计入 GDP）
+        investment_rate = inventory_investment_memo / gdp_expenditure if gdp_expenditure > 0 else 0.0
         
         # 政府支出占比
         government_rate = government_expenditure / gdp_expenditure if gdp_expenditure > 0 else 0.0
         
-        # 劳动报酬占比（收入分配）
-        labor_share = compensation_of_employees / gdp_income if gdp_income > 0 else 0.0
+        # 劳动报酬占比（收入分配）— 分母用支出法 GDP（主指标）
+        labor_share = min(1.0, compensation_of_employees / gdp_expenditure) if gdp_expenditure > 0 else 0.0
         
         # 资本回报率（营业盈余/资本存量）
         total_capital = sum(self.firm_capital_stock.values()) if hasattr(self, "firm_capital_stock") else 0.0
@@ -2883,10 +2947,10 @@ class EconomicCenter:
                 "government": {
                     "total": government_expenditure,
                     "procurement": government_procurement,
-                    "wages": government_wages,
+                    "wages_memo": government_wages,  # 备忘：政府工资（不计入 G，已通过 C 回流）
                 },
                 "investment": {
-                    "inventory_investment": inventory_investment,
+                    "inventory_investment_memo": inventory_investment_memo,  # 参考值（output - sales，不计入 GDP）
                     "total_output": total_output,
                     "total_sales_ex_tax": total_sales_ex_tax,
                 },

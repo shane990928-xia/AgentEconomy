@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import List, Optional, Dict, Any, Set
 import warnings
+import threading
 import ray
 import pandas as pd
 import numpy as np
@@ -59,9 +60,9 @@ def get_retailer_from_manufacturer(manufacturer_code: str) -> str:
         return DEFAULT_RETAILER_CODE
     return MANUFACTURER_TO_RETAILER.get(str(manufacturer_code), DEFAULT_RETAILER_CODE)
 
-# 增大 max_concurrency 以支持大量家庭并发向量搜索
-# 400 个家庭 × 4 个 category × 3 个 need_desc ≈ 4800 个请求
-@ray.remote(num_cpus=8, max_concurrency=1000)
+# 控制 Ray actor 并发：不再无限制放开，避免 Qdrant 被打爆
+# 实际 Qdrant 查询并发由内部信号量 _qdrant_semaphore 控制
+@ray.remote(num_cpus=8, max_concurrency=200)
 class ProductMarket:
     """
     产品市场（Product Market）
@@ -83,6 +84,11 @@ class ProductMarket:
         self.client = load_client()
         self.purchase_records: Dict[str, List[PurchaseRecord]] = {}
         self.logger = get_logger(name="product_market")
+        
+        # Qdrant 并发控制：限制同时发往 Qdrant 的查询数量，防止超时
+        # 默认 20，可通过环境变量调整
+        self._qdrant_max_concurrency = int(os.getenv("QDRANT_MAX_CONCURRENCY", "20"))
+        self._qdrant_semaphore = threading.Semaphore(self._qdrant_max_concurrency)
         
         # 行业平均价格缓存（用于中间品采购的等价单位计算）
         self.industry_avg_prices: Dict[str, Dict[str, float]] = {}
@@ -512,8 +518,8 @@ class ProductMarket:
         avg_unit_cost: float,
         manufacturer_margin: float = 0.15,
         retail_margin: float = 0.25,
-        smoothing_factor: float = 0.3,
-        max_change_ratio: float = 0.2
+        smoothing_factor: float = 0.15,
+        max_change_ratio: float = 0.05
     ) -> int:
         """
         批量更新某制造业行业所有产品的价格
@@ -624,14 +630,14 @@ class ProductMarket:
         
         Returns:
             供需比（supply/demand），>1表示供过于求，<1表示供不应求
-            如果没有需求记录，返回1.0（均衡状态）
+            如果没有需求记录或没有供给记录，返回1.0（均衡状态，不调价）
         """
         stats = self.industry_supply_demand.get(manufacturer_code, {})
         demand = stats.get("demand", 0.0)
         supply = stats.get("supply", 0.0)
         
-        if demand <= 0:
-            return 1.0  # 无需求时视为均衡
+        if demand <= 0 or supply <= 0:
+            return 1.0  # 无需求或无供给时视为均衡，不调价
         return supply / demand
     
     def get_all_supply_demand_stats(self) -> Dict[str, Dict[str, float]]:
@@ -790,16 +796,18 @@ class ProductMarket:
     def adjust_prices_by_supply_demand(
         self,
         manufacturer_code: str,
-        base_adjustment: float = 0.05,
-        max_adjustment: float = 0.15
+        base_adjustment: float = 0.015,
+        max_adjustment: float = 0.04
     ) -> int:
         """
-        根据供需比调整价格
+        根据供需比调整价格，并施加均值回归力
         
         价格调整逻辑：
         - 供需比 > 1（供过于求）：降价
         - 供需比 < 1（供不应求）：涨价
+        - 供需比 = 1.0（均衡/无数据）：仅施加均值回归
         - 调整幅度 = base_adjustment * |ln(供需比)|，最大不超过 max_adjustment
+        - 均值回归：每期强制向基准价回归，偏离越大回归越强
         
         Args:
             manufacturer_code: 制造商行业代码
@@ -812,26 +820,53 @@ class ProductMarket:
         ratio = self.get_supply_demand_ratio(manufacturer_code)
         products = self.products_by_industry.get(manufacturer_code, [])
         
-        if not products or ratio == 1.0:
+        if not products:
             return 0
         
-        # 计算调整幅度：使用对数函数使调整更平滑
         import math
-        # ln(ratio): ratio>1时为正（降价），ratio<1时为负（涨价）
-        log_ratio = math.log(ratio) if ratio > 0 else 0
-        adjustment = base_adjustment * abs(log_ratio)
-        adjustment = min(adjustment, max_adjustment)
         
-        # 供过于求时降价，供不应求时涨价
-        if ratio > 1:
-            price_multiplier = 1 - adjustment  # 降价
+        # 计算供需调整乘数
+        if ratio == 1.0:
+            price_multiplier = 1.0  # 均衡/无数据，不调价（仅靠均值回归）
+        elif ratio > 1:
+            log_ratio = math.log(ratio)
+            adjustment = min(base_adjustment * log_ratio, max_adjustment)
+            price_multiplier = 1 - adjustment  # 供过于求，降价
         else:
-            price_multiplier = 1 + adjustment  # 涨价
+            log_ratio = math.log(ratio)
+            adjustment = min(base_adjustment * abs(log_ratio), max_adjustment)
+            price_multiplier = 1 + adjustment  # 供不应求，涨价
+        
+        # 均值回归：每期强制向基准价回归
+        # 基础回归力 6%/期，偏离超过 15% 时加速到最大 20%
+        MEAN_REVERSION_BASE = 0.08
+        MEAN_REVERSION_MAX = 0.30
+        DEVIATION_THRESHOLD = 0.10
         
         updated_count = 0
         for product in products:
-            product.manufacturer_price = max(0.01, product.manufacturer_price * price_multiplier)
-            product.retail_price = max(0.01, product.retail_price * price_multiplier)
+            new_mfg = product.manufacturer_price * price_multiplier
+            new_ret = product.retail_price * price_multiplier
+            
+            base_mfg = product.base_manufacturer_price
+            base_ret = product.base_retail_price
+            
+            # 计算偏离度
+            deviation_mfg = abs(new_mfg - base_mfg) / base_mfg if base_mfg > 0 else 0
+            deviation_ret = abs(new_ret - base_ret) / base_ret if base_ret > 0 else 0
+            
+            # 动态回归系数：偏离越大回归越强
+            reversion_mfg = min(MEAN_REVERSION_MAX, 
+                               MEAN_REVERSION_BASE + max(0, deviation_mfg - DEVIATION_THRESHOLD) * 0.3)
+            reversion_ret = min(MEAN_REVERSION_MAX,
+                               MEAN_REVERSION_BASE + max(0, deviation_ret - DEVIATION_THRESHOLD) * 0.3)
+            
+            # 应用均值回归
+            new_mfg = new_mfg * (1 - reversion_mfg) + base_mfg * reversion_mfg
+            new_ret = new_ret * (1 - reversion_ret) + base_ret * reversion_ret
+            
+            product.manufacturer_price = max(0.01, new_mfg)
+            product.retail_price = max(0.01, new_ret)
             updated_count += 1
         
         self.logger.info(
@@ -986,21 +1021,26 @@ class ProductMarket:
             retry_delay = 1.0  # 秒
 
             while len(results) < top_k and offset < max_fetch:
-                # 带重试的 Qdrant 查询
+                # 带重试的 Qdrant 查询（通过信号量限制并发）
                 hits_resp = None
                 last_error = None
                 
                 for attempt in range(max_retries):
                     try:
-                        hits_resp = self.client.query_points(
-                            collection_name=collection_name,
-                            query=query_embedding,
-                            query_filter=search_filter,  # Cloud/Docker 用 Qdrant filter，Local 用 None
-                            limit=search_limit,
-                            offset=offset,
-                            with_payload=True,
-                            with_vectors=False,
-                        )
+                        # 信号量控制：限制同时访问 Qdrant 的线程数
+                        self._qdrant_semaphore.acquire()
+                        try:
+                            hits_resp = self.client.query_points(
+                                collection_name=collection_name,
+                                query=query_embedding,
+                                query_filter=search_filter,  # Cloud/Docker 用 Qdrant filter，Local 用 None
+                                limit=search_limit,
+                                offset=offset,
+                                with_payload=True,
+                                with_vectors=False,
+                            )
+                        finally:
+                            self._qdrant_semaphore.release()
                         break  # 成功，退出重试循环
                     except Exception as e:
                         last_error = e
@@ -1271,14 +1311,15 @@ class ProductMarket:
         for product in self.products:
             if product.product_id in product_data_by_id:
                 data = product_data_by_id[product.product_id]
-                # 注意：product.price 是只读 property，需要设置 retail_price
-                product.retail_price = float(data.get("price") or product.retail_price or 0.0)
-                product.stock = float(data.get("stock") or product.stock or 0.0)
-                product.is_active = bool(data.get("is_active", product.is_active))
+                # 恢复价格：优先使用 retail_price，兼容旧版 price 字段
+                product.retail_price = float(data.get("retail_price") or data.get("price") or product.retail_price or 0.0)
+                # 恢复库存：优先使用 available_stock，兼容旧版 stock 字段
+                product.available_stock = float(data.get("available_stock") or data.get("stock") or product.available_stock or 0.0)
                 restored += 1
                 
-                # 重建活跃SKU集合
-                if product.is_active:
+                # 重建活跃SKU集合（Product 没有 is_active 字段，用 checkpoint 数据判断）
+                is_active = bool(data.get("is_active", True))
+                if is_active:
                     self._active_sku_set.add(product.product_id)
         
         self.logger.info(f"Restored {restored} product states from checkpoint, {len(self._active_sku_set)} active SKUs")

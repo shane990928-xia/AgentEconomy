@@ -985,8 +985,8 @@ class Household:
         MINIMUM_LIVING_EXPENSE = 1500.0   # 最低生活费
         ABSOLUTE_MAX = 15000.0            # 绝对上限
         INCOME_CONSUMPTION_RATE = 0.85    # 收入的消费倾向（85%用于消费）
-        MAX_CONSUMPTION_DROP = 0.08       # 消费下降的最大幅度（8%/月）
-        MAX_CONSUMPTION_RISE = 0.15       # 消费上升的最大幅度（15%/月）
+        MAX_CONSUMPTION_DROP = 0.10       # 消费下降的最大幅度（10%/月）
+        MAX_CONSUMPTION_RISE = 0.40       # 消费上升的最大幅度（40%/月，允许收入增加时快速响应）
         
         # 储蓄提取率：根据收入情况动态调整
         # - 有稳定收入时：少动用储蓄（1.5%）
@@ -1056,7 +1056,12 @@ class Household:
                     budget = max(base_budget, MINIMUM_LIVING_EXPENSE)
             # 如果基础预算高于惯性上限
             elif base_budget > max_budget:
-                budget = max_budget
+                # 收入大幅增加时（如新就业），允许消费直接跟随收入
+                income_based = income * INCOME_CONSUMPTION_RATE
+                if income_based > max_budget * 1.5:
+                    budget = income_based
+                else:
+                    budget = max_budget
             else:
                 budget = base_budget
         else:
@@ -2396,19 +2401,23 @@ class Household:
         if not top_matches:
             return []
         if not use_llm:
-            # minimal rule: apply to the best one
-            j0 = top_matches[0].job
-            return [
-                JobApplication.create(
-                    job_id=j0.job_id,
-                    household_id=self.household_id,
-                    lh_type=labor_hour.lh_type,
-                    expected_wage=float(getattr(j0, "wage_per_hour", 0.0) or 0.0),
-                    worker_skills=dict(labor_hour.skill_profile or {}),
-                    worker_abilities=dict(labor_hour.ability_profile or {}),
-                    month=month,
+            # 申请所有匹配到的职位（最多top_k个），提高匹配成功率
+            # 之前只申请1个导致大量竞争失败，结构性失业率居高不下
+            applications = []
+            for m in top_matches:
+                job = m.job
+                applications.append(
+                    JobApplication.create(
+                        job_id=job.job_id,
+                        household_id=self.household_id,
+                        lh_type=labor_hour.lh_type,
+                        expected_wage=float(getattr(job, "wage_per_hour", 0.0) or 0.0),
+                        worker_skills=dict(labor_hour.skill_profile or {}),
+                        worker_abilities=dict(labor_hour.ability_profile or {}),
+                        month=month,
+                    )
                 )
-            ]
+            return applications
 
         jobs_view = [
             {

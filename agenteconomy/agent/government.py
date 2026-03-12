@@ -50,20 +50,20 @@ GOVERNMENT_PROCUREMENT_RATIO = 0.35
 
 # ========== 政府作为"无限资金"需求注入器的参数 ==========
 # 政府支出占家庭消费总预算的比例（凯恩斯主义需求刺激）
-# 设为0.50意味着政府额外注入相当于家庭消费50%的需求，帮助维持企业生存
-GOVERNMENT_DEMAND_INJECTION_RATIO = 0.50
+# 设为0.30意味着政府额外注入相当于家庭消费30%的需求，帮助维持企业生存
+GOVERNMENT_DEMAND_INJECTION_RATIO = 0.30
 # 政府最低采购预算（保证政府始终能采购，维持企业最低运营）
-GOVERNMENT_MIN_PROCUREMENT_BUDGET = 300000.0
+GOVERNMENT_MIN_PROCUREMENT_BUDGET = 150000.0
 # 政府最高采购预算上限（防止无限膨胀）
-GOVERNMENT_MAX_PROCUREMENT_BUDGET = 1000000.0
+GOVERNMENT_MAX_PROCUREMENT_BUDGET = 350000.0
 
 # ========== 政府公共就业计划（兜底就业）参数 ==========
 # 目标失业率（当失业率高于此值时，政府启动公共就业计划）
-PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT = 0.30  # 目标：失业率不超过30%
+PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT = 0.15  # 目标：失业率不超过15%
 # 公共就业岗位的最低工资（使用较低工资，鼓励市场就业）
 PUBLIC_EMPLOYMENT_MIN_WAGE = 15.0  # $15/小时
 # 公共就业预算上限（政府每月用于公共就业的最大支出）
-PUBLIC_EMPLOYMENT_MAX_BUDGET = 500000.0
+PUBLIC_EMPLOYMENT_MAX_BUDGET = 150000.0
 # 公共就业岗位类型（低技能要求的通用岗位）
 PUBLIC_EMPLOYMENT_SOC_CODES = [
     "43-9061",  # Office Clerks, General
@@ -266,52 +266,41 @@ class Government:
         """
         计算政府劳动力预算
         
-        基于政府服务费收入（企业购买政府服务支付的费用）：
-        - 政府服务费 × compensation系数 = 劳动力预算
-        
-        逻辑：服务费收入 → 雇佣公务员 → 提供政府服务
-        
-        如果没有服务费收入（如预热第一个月），使用初始预算。
-        确保最低预算，保证政府能维持基本运作。
+        基于政府账户余额（税收收入积累）：
+        - 政府通过税收（个税+消费税+企业所得税）获得收入
+        - 将一部分用于公务员工资（劳动力预算）
+        - 现实中政府支出约占 GDP 的 15-20%，其中约 60% 是人员经费
         
         Returns:
             本期可用于雇佣的预算
         """
-        # 初始预算：保证政府在第一个月也能招聘公务员
-        INITIAL_GOVERNMENT_LABOR_BUDGET = 50000.0  # 政府初始劳动预算
-        # 最低劳动预算：确保政府能维持基本运作（初始预算的20%）
-        MIN_GOVERNMENT_LABOR_BUDGET = 10000.0
+        INITIAL_GOVERNMENT_LABOR_BUDGET = 20000.0
+        MIN_GOVERNMENT_LABOR_BUDGET = 5000.0
+        # 政府将账户余额的一定比例用于劳动力支出
+        # 不能花光，需要留钱给采购和转移支付
+        LABOR_SHARE_OF_BALANCE = 0.15  # 每月最多用余额的 15% 发工资
+        MAX_GOVERNMENT_LABOR_BUDGET = 120000.0  # 上限，防止政府雇太多人
         
-        # 获取政府服务费收入
-        service_fee_summary = self.get_service_fee_summary(period=period)
-        service_fee_income = service_fee_summary.get("total", 0.0)
-        by_type = service_fee_summary.get("by_type", {})
+        # 查询政府账户余额
+        gov_balance = 0.0
+        if self.economic_center is not None:
+            try:
+                import ray
+                gov_balance = float(ray.get(self.economic_center.query_balance.remote(self.government_id)) or 0.0)
+            except Exception:
+                pass
         
-        if service_fee_income <= 0:
-            self.logger.info(f"政府服务费收入为0，使用初始预算: {INITIAL_GOVERNMENT_LABOR_BUDGET:.2f}")
+        if gov_balance <= 0:
+            self.logger.info(f"政府余额不足({gov_balance:.0f})，使用初始预算: {INITIAL_GOVERNMENT_LABOR_BUDGET:.2f}")
             return INITIAL_GOVERNMENT_LABOR_BUDGET
         
-        # 获取各政府部门的 compensation 比率
-        ratios = self._get_government_compensation_ratios()
-        
-        # 按各部门服务费收入加权计算劳动力预算
-        labor_budget = 0.0
-        for gov_code, fee_amount in by_type.items():
-            comp_ratio = ratios.get(gov_code, 0.4)
-            # 服务费收入 × compensation系数 = 该部门的劳动力预算
-            labor_budget += fee_amount * comp_ratio
-        
-        # 如果没有分类数据，使用平均比率
-        if labor_budget <= 0 and service_fee_income > 0:
-            avg_ratio = sum(ratios.values()) / len(ratios) if ratios else 0.4
-            labor_budget = service_fee_income * avg_ratio
-        
-        # 确保最低预算
-        final_budget = max(labor_budget, MIN_GOVERNMENT_LABOR_BUDGET)
+        # 基于余额计算劳动预算
+        labor_budget = gov_balance * LABOR_SHARE_OF_BALANCE
+        final_budget = max(min(labor_budget, MAX_GOVERNMENT_LABOR_BUDGET), MIN_GOVERNMENT_LABOR_BUDGET)
         
         self.logger.info(
             f"政府劳动预算: {final_budget:.2f} "
-            f"(计算值={labor_budget:.2f}, 服务费收入={service_fee_income:.2f}, 部门数={len(by_type)})"
+            f"(余额={gov_balance:.0f}, 计算值={labor_budget:.0f}, 占比={LABOR_SHARE_OF_BALANCE:.0%})"
         )
         return final_budget
     
@@ -467,6 +456,11 @@ class Government:
         当失业率超过目标值时，政府发布低技能公益岗位吸收失业人员。
         这些岗位没有技能要求，任何劳动力都可以匹配。
         
+        设计原则：
+        - 预热期不启动（让企业先招人，避免挤出私人就业）
+        - 渐进式雇佣（每月最多创造 MAX_MONTHLY_NEW_JOBS 个岗位）
+        - 预算上限约束
+        
         Args:
             period: 当前期数
             
@@ -474,6 +468,11 @@ class Government:
             公共就业 Job 列表
         """
         from agenteconomy.agent.firm import _load_job_skill_data
+        
+        # 预热期第1月不启动（让企业先招人），第2-3月渐进式启动（上限更低）
+        if period is not None and period <= 1:
+            self.logger.info(f"公共就业计划: 预热期(M{period})，不启动，让企业优先招聘")
+            return []
         
         # 获取劳动力市场统计
         labor_stats = self._call_labor_market("summary")
@@ -496,16 +495,21 @@ class Government:
             )
             return []
         
-        # 计算需要创造的岗位数量
+        # 计算需要创造的岗位数量（渐进式：每月最多 MAX_MONTHLY_NEW_JOBS 个）
+        # 预热期上限更低（20人），正式期 40 人
+        if period is not None and period <= 3:
+            MAX_MONTHLY_NEW_JOBS = 20  # 预热期：每月最多 20 个，避免挤出私人就业
+        else:
+            MAX_MONTHLY_NEW_JOBS = 40  # 正式期：每月最多 40 个
         unemployed = total_labor - total_matched
         target_employed = int(total_labor * (1.0 - PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT))
         jobs_needed = max(0, target_employed - total_matched)
         
-        # 限制预算
+        # 渐进式限制 + 预算限制
         hours_per_period = 160.0  # 月工时
         monthly_wage = PUBLIC_EMPLOYMENT_MIN_WAGE * hours_per_period
         max_affordable = int(PUBLIC_EMPLOYMENT_MAX_BUDGET / monthly_wage)
-        jobs_to_create = min(jobs_needed, max_affordable)
+        jobs_to_create = min(jobs_needed, max_affordable, MAX_MONTHLY_NEW_JOBS)
         
         if jobs_to_create <= 0:
             return []

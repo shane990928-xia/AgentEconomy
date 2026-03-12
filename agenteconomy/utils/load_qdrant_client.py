@@ -9,13 +9,17 @@ def load_client():
     
     支持三种模式：
     - local: 本地文件存储
-    - cloud: Qdrant Cloud（带超时和重试配置）
+    - cloud: Qdrant Cloud（带超时配置）
     - docker: 本地 Docker 部署
+    
+    注意：实际查询并发由 ProductMarket._qdrant_semaphore 控制，
+    这里只负责超时配置。超时默认 60s（原来 30s 在高并发下不够用）。
     """
     qdrant_mode = os.getenv("QDRANT_MODE")
     
-    # 从环境变量获取超时配置（秒），默认值适合云端
-    timeout = int(os.getenv("QDRANT_TIMEOUT", "30"))
+    # 超时配置（秒）：高并发场景下需要更大的超时
+    # 因为请求会在信号量处排队，实际等待时间可能较长
+    timeout = int(os.getenv("QDRANT_TIMEOUT", "60"))
     
     if qdrant_mode == "local":
         qdrant_client = QdrantClient(
@@ -25,9 +29,8 @@ def load_client():
         qdrant_client = QdrantClient(
             url=os.getenv("QDRANT_URL"), 
             api_key=os.getenv("QDRANT_API_KEY"),
-            timeout=timeout,  # 连接和读取超时
-            # gRPC 配置（如果使用 gRPC）
-            prefer_grpc=False,  # HTTP 更稳定
+            timeout=timeout,
+            prefer_grpc=False,
         )
     elif qdrant_mode == "docker":
         qdrant_client = QdrantClient(

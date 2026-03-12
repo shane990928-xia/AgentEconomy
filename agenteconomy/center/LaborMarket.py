@@ -188,6 +188,33 @@ class LaborMarket:
             added[job.SOC] = added.get(job.SOC, 0) + int(job.positions_available)
         return added
 
+    def reduce_job_positions(self, firm_id: str, soc: str, reduce_by: int) -> int:
+        """
+        缩减某个企业某个SOC的空缺职位数量（只缩减未匹配的空缺，不影响已雇佣的员工）
+        
+        Args:
+            firm_id: 企业ID
+            soc: SOC代码
+            reduce_by: 需要缩减的职位数
+            
+        Returns:
+            实际缩减的职位数
+        """
+        reduced = 0
+        for job in self.job_openings:
+            if job.firm_id != firm_id or job.SOC != soc:
+                continue
+            if job.positions_available <= 0:
+                continue
+            can_reduce = min(reduce_by - reduced, job.positions_available)
+            job.positions_available -= can_reduce
+            reduced += can_reduce
+            if job.positions_available <= 0:
+                job.is_valid = False
+            if reduced >= reduce_by:
+                break
+        return reduced
+
     def align_job(self, household_id: str, job: Job, lh_type: str) -> Optional[Job]:
         """
         Aligns a job with a household, reducing the available positions.
@@ -239,6 +266,14 @@ class LaborMarket:
             if total_job_positions > 0 else 0.0
         )
         
+        # 私人部门统计（排除政府岗位，用于 Beveridge 曲线和空缺率）
+        # 政府公益岗位是兜底性质的，不代表真正的劳动力市场紧张度
+        gov_openings = sum(j.positions_available for j in self.job_openings if str(getattr(j, "firm_id", "")).startswith("gov_"))
+        gov_matched = sum(1 for m in self.matched_jobs if str(getattr(m, "firm_id", "") or getattr(getattr(m, "job", None), "firm_id", "")).startswith("gov_"))
+        private_positions = total_job_positions - gov_openings - gov_matched
+        private_matched = total_matched - gov_matched
+        private_fill_rate = private_matched / private_positions if private_positions > 0 else 0.0
+        
         return {
             "total_jobs": len(self.job_openings),
             "total_job_positions": total_job_positions,
@@ -250,7 +285,38 @@ class LaborMarket:
             "unemployment_rate": unemployment_rate,
             "average_wage": average_wage,
             "job_fill_rate": job_fill_rate,
+            # 私人部门（排除政府）
+            "private_job_positions": private_positions,
+            "private_matched_jobs": private_matched,
+            "private_fill_rate": private_fill_rate,
+            "gov_matched_jobs": gov_matched,
+            "gov_job_positions": gov_openings + gov_matched,
         }
+    
+    def get_market_tightness(self) -> float:
+        """
+        计算劳动力市场紧张度 (Market Tightness)
+        
+        定义：tightness = 职位空缺数 / 失业人数
+        - tightness > 1: 市场紧张（空缺多，失业少）- 工人容易找工作，企业难招人
+        - tightness < 1: 市场宽松（空缺少，失业多）- 工人难找工作，企业容易招人
+        
+        Returns:
+            市场紧张度（>= 0），如果失业人数为0则返回一个很大的值（如10.0）
+        """
+        # 计算职位空缺数（未匹配的职位）
+        vacancies = sum(job.positions_available for job in self.job_openings if job.is_valid)
+        
+        # 计算失业人数
+        unemployed = sum(1 for lh in self.labor_hours 
+                        if lh.is_valid and lh.firm_id is None)
+        
+        if unemployed <= 0:
+            # 如果没有人失业，市场非常紧张
+            return 10.0
+        
+        tightness = vacancies / unemployed
+        return max(0.0, tightness)
 
     def match_jobs(self, labor_hour: LaborHour) -> List[Job]:
         """

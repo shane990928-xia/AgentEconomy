@@ -444,7 +444,8 @@ class AbstractResourceMarket:
         """
         根据供需调整所有资源的价格
         
-        在每期结束时调用
+        在每期结束时调用。
+        涨跌对称 + 均值回归，防止价格单调漂移。
         """
         for industry_code, resource in self.resources.items():
             # 计算供需比
@@ -455,11 +456,13 @@ class AbstractResourceMarket:
             
             old_price = resource.current_price
             
-            # 价格调整逻辑（平滑调整）
+            # 价格调整逻辑（对称调整，幅度缩小）
             if demand_supply_ratio > 1.1:  # 供不应求
-                adjustment = 1.05  # 涨价5%
-            elif demand_supply_ratio > 1.02:
                 adjustment = 1.02  # 涨价2%
+            elif demand_supply_ratio > 1.02:
+                adjustment = 1.01  # 涨价1%
+            elif demand_supply_ratio == 0:  # 完全无需求
+                adjustment = 0.95  # 降价5%
             elif demand_supply_ratio < 0.85:  # 供过于求
                 adjustment = 0.97  # 降价3%
             elif demand_supply_ratio < 0.95:
@@ -467,10 +470,16 @@ class AbstractResourceMarket:
             else:
                 adjustment = 1.0  # 维持
             
-            # 更新价格（但不能偏离基准价太远，比如±50%）
+            # 应用供需调整
             new_price = resource.current_price * adjustment
-            min_price = resource.base_price * 0.5
-            max_price = resource.base_price * 1.5
+            
+            # 均值回归：向基准价回归（每期 5%）
+            mean_reversion = 0.08
+            new_price = new_price * (1 - mean_reversion) + resource.base_price * mean_reversion
+            
+            # 价格上下限（不能偏离基准价太远，±30%）
+            min_price = resource.base_price * 0.7
+            max_price = resource.base_price * 1.3
             new_price = max(min_price, min(max_price, new_price))
             
             resource.current_price = new_price

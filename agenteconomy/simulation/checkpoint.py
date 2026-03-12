@@ -428,17 +428,29 @@ class CheckpointManager:
         
         # 恢复 Households
         households_data = {d["household_id"]: d for d in checkpoint_data.get("households", [])}
+        hh_restored = 0
         for hh in (simulator.households or []):
             if hh.household_id in households_data:
                 self._deserialize_household(hh, households_data[hh.household_id])
-        logger.info(f"Restored {len(households_data)} households")
+                hh_restored += 1
+        logger.info(f"Restored {hh_restored}/{len(households_data)} households (matched/in checkpoint)")
+        if hh_restored < len(households_data):
+            logger.warning(f"⚠️ {len(households_data) - hh_restored} households in checkpoint not matched!")
         
         # 恢复 Firms
         firms_data = {d["firm_id"]: d for d in checkpoint_data.get("firms", [])}
+        firms_restored = 0
         for firm in (simulator.firms or []):
             if firm.firm_id in firms_data:
                 self._deserialize_firm(firm, firms_data[firm.firm_id])
-        logger.info(f"Restored {len(firms_data)} firms")
+                firms_restored += 1
+        logger.info(f"Restored {firms_restored}/{len(firms_data)} firms (matched/in checkpoint)")
+        if firms_restored < len(firms_data):
+            logger.warning(
+                f"⚠️ {len(firms_data) - firms_restored} firms in checkpoint not matched! "
+                f"Checkpoint IDs sample: {list(firms_data.keys())[:3]}, "
+                f"Current IDs sample: {[f.firm_id for f in (simulator.firms or [])[:3]]}"
+            )
         
         # 恢复 Government
         if simulator.government and checkpoint_data.get("government"):

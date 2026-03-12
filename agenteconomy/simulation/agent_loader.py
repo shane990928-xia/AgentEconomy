@@ -243,7 +243,7 @@ def create_firms(
     cat1 = industry_cate_map.get("category_1_manufacturers", {})
     for industry_code, industry_name in cat1.get("industries", {}).items():
         firm = ManufactureFirm(
-            firm_id=f"mfg_{industry_code}_{uuid4().hex[:8]}",
+            firm_id=f"mfg_{industry_code}",
             name=industry_name,
             industry=industry_code,
             industry_type="category_1_manufacturers",
@@ -258,7 +258,7 @@ def create_firms(
     cat2 = industry_cate_map.get("category_2_retailers", {})
     for industry_code, industry_name in cat2.get("industries", {}).items():
         firm = RetailFirm(
-            firm_id=f"ret_{industry_code}_{uuid4().hex[:8]}",
+            firm_id=f"ret_{industry_code}",
             name=industry_name,
             industry=industry_code,
             industry_type="category_2_retailers",
@@ -280,7 +280,7 @@ def create_firms(
             continue
             
         for industry_code, industry_name in subgroup_info.get("industries", {}).items():
-            firm_id = f"svc_{industry_code}_{uuid4().hex[:8]}"
+            firm_id = f"svc_{industry_code}"
             firm = ServiceFirm(
                 firm_id=firm_id,
                 name=industry_name,
