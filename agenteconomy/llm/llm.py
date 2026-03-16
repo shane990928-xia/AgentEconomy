@@ -4,8 +4,11 @@ load_dotenv()
 from litellm import Router
 import os
 import asyncio
+from pathlib import Path
 from typing import Literal
 import warnings
+
+from agenteconomy.llm.agent_method import get_agent_method, normalize_agent_name
 
 # 简单粗暴屏蔽所有 Pydantic 序列化警告
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
@@ -47,6 +50,8 @@ import logging
 _llm_logger = logging.getLogger("llm")
 _llm_logger.info(f"LLM max concurrency initialized: {_llm_max_concurrency}")
 
+CONFIG_PATH = Path(__file__).with_name("config.yaml")
+
 
 def configure_concurrency(max_concurrent: int) -> None:
     """
@@ -73,28 +78,67 @@ async def call_llm_simple(prompt: str, system_prompt: str = "You are a helpful a
     """
     调用简单推理模型（适用于简单任务、快速响应）
     """
-    response = await router.acompletion(
-        model="simple",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content
+    return await call_llm(prompt, system_prompt=system_prompt, model_type="simple")
 
 
 async def call_llm_strong(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
     """
     调用强推理模型（适用于复杂任务、需要深度推理）
     """
+    return await call_llm(prompt, system_prompt=system_prompt, model_type="strong")
+
+
+def _read_configured_agent_name() -> str | None:
+    try:
+        config_text = CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if raw_line != raw_line.lstrip():
+            continue
+        if not line.startswith("agent_name:"):
+            continue
+        agent_name = line.split(":", 1)[1].strip().strip("'\"")
+        if agent_name.lower() in {"", "none", "null", "~"}:
+            return None
+        return normalize_agent_name(agent_name)
+    return None
+
+
+async def _call_direct_llm_raw(
+    prompt: str,
+    system_prompt: str,
+    model_type: Literal["simple", "strong"],
+) -> str:
     response = await router.acompletion(
-        model="strong",
+        model=model_type,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ]
     )
     return response.choices[0].message.content
+
+
+async def _call_agent_method(
+    prompt: str,
+    system_prompt: str,
+    model_type: Literal["simple", "strong"],
+    agent_name: str,
+) -> str:
+    agent_method = get_agent_method(agent_name)
+    if agent_method is None:
+        raise ValueError(f"Unsupported agent method: {agent_name}")
+    return await agent_method(
+        call_model=_call_direct_llm_raw,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        model_type=model_type,
+    )
 
 
 async def call_llm(
@@ -117,17 +161,26 @@ async def call_llm(
     """
     async with _llm_semaphore:
         # 超时只计算实际API调用时间，不包括等待信号量的时间
-        response = await asyncio.wait_for(
-            router.acompletion(
-                model=model_type,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
+        configured_agent = _read_configured_agent_name()
+        if get_agent_method(configured_agent) is None:
+            return await asyncio.wait_for(
+                _call_direct_llm_raw(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model_type=model_type,
+                ),
+                timeout=timeout
+            )
+
+        return await asyncio.wait_for(
+            _call_agent_method(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model_type=model_type,
+                agent_name=configured_agent,
             ),
             timeout=timeout
         )
-        return response.choices[0].message.content
 
 
 async def main():
