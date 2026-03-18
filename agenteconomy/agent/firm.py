@@ -534,6 +534,15 @@ class Firm:
         # 确保最低劳动预算
         budget = max(budget, MIN_LABOR_BUDGET)
         
+        # 偿付能力检查：如果企业现金严重为负（超过 3 个月工资），冻结招聘
+        # 允许轻微负债（正常经营周转），但防止无限负债招人
+        cash_val = float(self.cash or 0.0)
+        if cash_val < -budget * 3:
+            _logger.debug(
+                f"[劳动预算] {self.firm_id}: 现金严重不足 (cash={cash_val:.2f}, budget={budget:.2f})，冻结招聘"
+            )
+            return 0.0
+        
         _logger.debug(
             f"[劳动预算] {self.firm_id}: base={base_value:.2f} (source={source}), "
             f"ratio={actual_ratio:.2f}→{effective_ratio:.2f}, budget={budget:.2f}"

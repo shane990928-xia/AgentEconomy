@@ -814,6 +814,8 @@ class Simulator:
         # ========== 劳动力市场（与正式月顺序一致）==========
         with self._time_block("裁员处理", month=month, preheat=True):
             await self._process_layoffs(econ_month)
+        # 裁员后立即刷新家庭就业状态，确保被裁员工本月可重新求职
+        self._refresh_household_employment_status()
         with self._time_block("发布岗位", month=month, preheat=True):
             await self._post_jobs(econ_month)
         with self._time_block("招聘匹配", month=month, preheat=True):
@@ -932,6 +934,9 @@ class Simulator:
                 f"[裁员] 本月裁员{layoff_stats['total_layoffs']}人, "
                 f"节省工资${layoff_stats['total_saved']:.2f}"
             )
+
+        # 裁员后立即刷新家庭就业状态，确保被裁员工本月可重新求职
+        self._refresh_household_employment_status()
 
         # 再发布岗位（可能补缺或扩招）
         with self._time_block("发布岗位", month=month, preheat=False):
@@ -1547,8 +1552,10 @@ class Simulator:
         for hh, result in consumption_results:
             step0 = result.get("step0", {}) if isinstance(result, dict) else {}
             budgets = step0.get("budgets", {}) if isinstance(step0, dict) else {}
-            if budgets:
-                hh.apply_consumption(budgets)
+            # 注意：不再在此处调用 apply_consumption(budgets)
+            # 计划预算 ≠ 实际支出，实际余额扣减在 _execute_orders 的交易中完成
+            # apply_consumption 改为在 _update_household_consumption_history 中
+            # 使用实际交易金额调用
             
             # 提取商品消费预算 (Retail merchandise)
             goods_budget = float(budgets.get("Retail merchandise", 0.0) or 0.0)
@@ -2097,10 +2104,20 @@ class Simulator:
         
         # 更新每个家庭的上月消费
         updated_count = 0
-        for hh, _ in consumption_results:
+        for hh, out in consumption_results:
             goods_spent = float(goods_by_hh.get(hh.household_id, 0.0) or 0.0)
             service_spent = float(service_by_hh.get(hh.household_id, 0.0) or 0.0)
             total_spent = goods_spent + service_spent
+            
+            # 用实际交易金额更新家庭消费记录和余额
+            # （替代之前在 _build_orders 中用计划预算调用 apply_consumption 的做法）
+            step0 = out.get("step0", {}) if isinstance(out, dict) else {}
+            budgets = step0.get("budgets", {}) if isinstance(step0, dict) else {}
+            if budgets:
+                # 用实际商品消费金额替换零售计划预算
+                actual_budgets = dict(budgets)
+                actual_budgets["Retail merchandise"] = goods_spent
+                hh.apply_consumption(actual_budgets)
             
             # 调用家庭的更新方法
             if hasattr(hh, "update_last_month_consumption"):
@@ -2430,6 +2447,18 @@ class Simulator:
 
                 # 更新企业员工数
                 firm.employee_count = max(0, firm.employee_count - layoff_count)
+
+                # 从 employee_list 中移除被裁员工
+                laid_off_hh_ids = set()
+                for lay in result["layoffs"]:
+                    hh_id = lay.get("household_id") or lay.get("agent_id")
+                    if hh_id:
+                        laid_off_hh_ids.add(hh_id)
+                if laid_off_hh_ids and firm.employee_list:
+                    firm.employee_list = [
+                        lh for lh in firm.employee_list
+                        if getattr(lh, "agent_id", None) not in laid_off_hh_ids
+                    ]
 
                 layoffs_by_firm[firm.firm_id] = {
                     "count": layoff_count,

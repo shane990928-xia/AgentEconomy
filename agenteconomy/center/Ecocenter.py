@@ -1900,8 +1900,15 @@ class EconomicCenter:
     # =========================================================================
     def add_interest_tx(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
         """
-        添加利息交易记录
+        添加利息交易记录，同时更新双方账本。
+        sender（银行/系统）扣款，receiver（家庭）收款。
         """
+        amt = float(amount or 0.0)
+        if amt > 0:
+            if sender_id in self.ledger:
+                self.ledger[sender_id].amount -= amt
+            if receiver_id in self.ledger:
+                self.ledger[receiver_id].amount += amt
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
@@ -1910,10 +1917,18 @@ class EconomicCenter:
             month=month,
         )
         return tx.id
+
     def add_redistribution_tx(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
         """
-        添加再分配交易记录
+        添加再分配交易记录，同时更新双方账本。
+        sender（政府）扣款，receiver（家庭）收款。
         """
+        amt = float(amount or 0.0)
+        if amt > 0:
+            if sender_id in self.ledger:
+                self.ledger[sender_id].amount -= amt
+            if receiver_id in self.ledger:
+                self.ledger[receiver_id].amount += amt
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
@@ -2849,11 +2864,15 @@ class EconomicCenter:
         # 政府工资不计入（避免与 C 双重计算）。
         compensation_of_employees = private_wages
         
-        # 生产税净额 = VAT + 企业所得税（简化，不考虑补贴）
-        taxes_on_production = vat_collected + corporate_tax_collected
+        # 生产税净额 = VAT（产品税）
+        # 注意：企业所得税是收入税（income tax），不是生产税（production tax）。
+        # 在 SNA 框架中，生产税仅包含 VAT、消费税等间接税。
+        # 企业所得税已隐含在营业盈余中（盈余 = 税前利润，所得税从中扣除）。
+        taxes_on_production = vat_collected
         
-        # 营业盈余 = 增加值 - 劳动者报酬
-        operating_surplus = total_value_added - compensation_of_employees
+        # 营业盈余 = 增加值 - 劳动者报酬 - 生产税
+        # 这里的盈余是税前概念，企业所得税从盈余中缴纳
+        operating_surplus = total_value_added - compensation_of_employees - taxes_on_production
         
         # 收入法 GDP
         gdp_income = compensation_of_employees + taxes_on_production + operating_surplus

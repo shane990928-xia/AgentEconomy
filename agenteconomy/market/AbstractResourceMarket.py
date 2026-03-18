@@ -451,8 +451,12 @@ class AbstractResourceMarket:
             # 计算供需比
             if resource.supply_capacity > 0:
                 demand_supply_ratio = resource.total_demand / resource.supply_capacity
+            elif resource.total_demand > 0:
+                # 有需求但无供给 → 极度稀缺，应涨价
+                demand_supply_ratio = 2.0
             else:
-                demand_supply_ratio = 0
+                # 无需求也无供给 → 市场不活跃，维持价格
+                demand_supply_ratio = 1.0
             
             old_price = resource.current_price
             
