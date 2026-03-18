@@ -17,35 +17,41 @@ def render():
 
     # ── 架构图 ──
     st.subheader("System Architecture")
-    st.markdown("""
-    ```
-    ┌─────────────────────────────────────────────────────────────┐
-    │                    Simulation Engine                        │
-    │                  (Monthly Loop × 30)                        │
-    ├──────────┬──────────┬──────────┬────────────┬──────────────┤
-    │ 300      │ 66 Firms │Government│   Bank     │  Markets     │
-    │Households│ (Mfg/Ret │(Tax &    │(Deposits & │              │
-    │          │  /Svc)   │ Redist)  │ Interest)  │              │
-    ├──────────┴──────────┴──────────┴────────────┤              │
-    │                Agent Layer                   │              │
-    │  ┌─────────────────────────────────────┐    │  ┌──────────┐│
-    │  │  LLM Decision Engine (DeepSeek)     │    │  │  Labor   ││
-    │  │  • Budget allocation (Step0)        │    │  │  Market  ││
-    │  │  • Need generation  (Step1)         │    │  ├──────────┤│
-    │  │  • Purchase decision (Step3)        │    │  │ Product  ││
-    │  │  • Job application / offer          │    │  │  Market  ││
-    │  └──────────┬──────────────────────────┘    │  ├──────────┤│
-    │             │                                │  │Intermed. ││
-    │  ┌──────────▼──────────────────────────┐    │  │  Goods   ││
-    │  │  Qdrant Vector DB + MiniLM-L6-v2    │    │  │Procurem. ││
-    │  │  (Semantic product matching, Step2)  │    │  └──────────┘│
-    │  └─────────────────────────────────────┘    │              │
-    ├──────────────────────────────────────────────┴──────────────┤
-    │                     Data Layer                              │
-    │  PSID Survey │ O*NET Skills │ BLS IO Table │ BLS Products  │
-    └─────────────────────────────────────────────────────────────┘
-    ```
-    """)
+
+    # 用 Streamlit 原生组件替代 ASCII art
+    st.markdown("##### Simulation Engine (Monthly Loop × 30)")
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.info("**300 Households**\n\nPSID-initialized\nheterogeneous agents")
+    a2.info("**66 Firms**\n\nManufacturing (20)\nRetail (4) / Service (42)")
+    a3.info("**Government**\n\nTax collection\n& redistribution")
+    a4.info("**Bank**\n\nDeposits\n& interest")
+
+    st.markdown("##### Agent Decision Layer")
+    b1, b2 = st.columns([3, 2])
+    with b1:
+        st.success(
+            "**LLM Decision Engine (DeepSeek)**\n\n"
+            "- Budget allocation (Step 0)\n"
+            "- Need generation (Step 1)\n"
+            "- Purchase decision (Step 3)\n"
+            "- Job application / offer acceptance"
+        )
+        st.success(
+            "**Qdrant Vector DB + MiniLM-L6-v2**\n\n"
+            "Semantic product matching (Step 2)"
+        )
+    with b2:
+        st.warning("**Labor Market**\n\nSkill-based z-score matching")
+        st.warning("**Product Market**\n\nMulti-sector goods & services")
+        st.warning("**Intermediate Goods**\n\nIO-table procurement")
+
+    st.markdown("##### Data Layer")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.caption("📊 PSID Survey")
+    d2.caption("🔧 O*NET Skills")
+    d3.caption("🏭 BLS IO Table")
+    d4.caption("🛒 BLS Products")
 
     st.markdown("---")
 

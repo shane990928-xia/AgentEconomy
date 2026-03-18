@@ -33,13 +33,14 @@ You are allocating a household's monthly consumption budget. Make a realistic an
 ## Macroeconomic Environment
 {macro_indicators}
 
-## Budget Allocation Principles (IMPORTANT)
-1. **Income-based spending**: If employed, spend 70-90% of monthly income.
+## Budget Allocation Principles (IMPORTANT — follow strictly)
+1. **Savings-first rule**: total_budget MUST be at most 70-85% of expected_income. The remaining 15-30% is mandatory savings. Do NOT spend 100% of income.
 2. **Savings buffer**: Keep at least 3-6 months of expenses in savings for emergencies.
 3. **Consumption smoothing**: Avoid dramatic changes in spending. If last_month_consumption > 0, this month should be within ±20% of it.
 4. **Unemployment response**: If no income but have savings, maintain ~60-80% of historical spending level (draw from savings).
 5. **Minimum needs**: Even with no income, allocate at least $1,500 for basic necessities if savings allow.
 6. **Maximum constraint**: Never spend more than available_balance (savings) in a single month.
+7. **Income ceiling**: total_budget must NEVER exceed expected_income unless unemployed and drawing from savings.
 
 ## Task
 Decide total_budget and allocate it into these categories:

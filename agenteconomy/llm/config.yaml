@@ -1,4 +1,4 @@
-agent_name: cot
+agent_name: none
 
 model_list:
   # --- 1. 定义 OpenAI 模型 ---
