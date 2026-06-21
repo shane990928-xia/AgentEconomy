@@ -66,6 +66,30 @@ class EconomyConfig:
     firm_initial_cash: float = 100_000.0
     firm_initial_capital: float = 500_000.0
 
+    # Government policy instruments
+    num_households: int = 300
+    government_procurement_ratio: float = 0.35
+    government_demand_injection_ratio: float = 0.30
+    government_min_procurement_budget: float = 150_000.0
+    government_max_procurement_budget: float = 350_000.0
+    government_min_procurement_budget_per_household: float = 500.0
+    government_max_procurement_budget_per_household: float = 1166.6667
+    government_labor_budget_share_of_balance: float = 0.15
+    government_initial_labor_budget: float = 20_000.0
+    government_min_labor_budget: float = 5_000.0
+    government_max_labor_budget: float = 120_000.0
+    government_max_labor_budget_per_household: float = 400.0
+    public_employment_target_unemployment: float = 0.15
+    public_employment_min_wage: float = 15.0
+    public_employment_max_budget: float = 150_000.0
+    public_employment_max_budget_per_household: float = 500.0
+    public_employment_start_period: int = 2
+    public_employment_warmup_max_monthly_jobs: int = 20
+    public_employment_max_monthly_jobs: int = 40
+    public_employment_max_monthly_job_share: float = 0.10
+    public_employment_shrink_threshold_multiplier: float = 0.5
+    public_employment_max_monthly_shrink_ratio: float = 0.20
+
 
 @dataclass
 class SimulationContext:
@@ -210,6 +234,48 @@ class SimulationInitializer:
             initial_budget=self.config.government_budget,
             tax_policy=tax_policy,
             economic_center=self.context.economic_center,
+            household_count=self.config.num_households,
+            procurement_ratio=self.config.government_procurement_ratio,
+            demand_injection_ratio=self.config.government_demand_injection_ratio,
+            min_procurement_budget=self.config.government_min_procurement_budget,
+            max_procurement_budget=self.config.government_max_procurement_budget,
+            min_procurement_budget_per_household=(
+                self.config.government_min_procurement_budget_per_household
+            ),
+            max_procurement_budget_per_household=(
+                self.config.government_max_procurement_budget_per_household
+            ),
+            government_labor_budget_share_of_balance=(
+                self.config.government_labor_budget_share_of_balance
+            ),
+            government_initial_labor_budget=self.config.government_initial_labor_budget,
+            government_min_labor_budget=self.config.government_min_labor_budget,
+            government_max_labor_budget=self.config.government_max_labor_budget,
+            government_max_labor_budget_per_household=(
+                self.config.government_max_labor_budget_per_household
+            ),
+            public_employment_target_unemployment=(
+                self.config.public_employment_target_unemployment
+            ),
+            public_employment_min_wage=self.config.public_employment_min_wage,
+            public_employment_max_budget=self.config.public_employment_max_budget,
+            public_employment_max_budget_per_household=(
+                self.config.public_employment_max_budget_per_household
+            ),
+            public_employment_start_period=self.config.public_employment_start_period,
+            public_employment_warmup_max_monthly_jobs=(
+                self.config.public_employment_warmup_max_monthly_jobs
+            ),
+            public_employment_max_monthly_jobs=self.config.public_employment_max_monthly_jobs,
+            public_employment_max_monthly_job_share=(
+                self.config.public_employment_max_monthly_job_share
+            ),
+            public_employment_shrink_threshold_multiplier=(
+                self.config.public_employment_shrink_threshold_multiplier
+            ),
+            public_employment_max_monthly_shrink_ratio=(
+                self.config.public_employment_max_monthly_shrink_ratio
+            ),
         )
         self.context.government.initialize()
         logger.info(f"  ✓ Government initialized (budget: ${self.config.government_budget:,.0f})")

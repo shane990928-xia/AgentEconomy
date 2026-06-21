@@ -4,10 +4,14 @@
 解决Category 1（制造业）之间的中间品交易问题
 """
 
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Mapping, Optional, Sequence
 import random
-from dataclasses import dataclass
-import ray
+from dataclasses import asdict, dataclass
+
+try:
+    import ray
+except ImportError:  # pragma: no cover - only used when callers pass Ray actors
+    ray = None
 
 from agenteconomy.data.industry_cate_map import industry_cate_map
 
@@ -30,6 +34,42 @@ class PurchaseItem:
     total_cost: float
 
 
+@dataclass(frozen=True)
+class IntermediateGoodsReservation:
+    """Pure planning reservation; it does not mutate market stock."""
+
+    supplier_industry: str
+    sku_id: str
+    unit_price: float
+    available_quantity: float
+    reserved_quantity: float
+    reserved_cost: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class IntermediateGoodsProcurementPlan:
+    """Quote/scale result for intermediate goods procurement."""
+
+    target_output: float
+    planned_cost: float
+    feasible_scale: float
+    scaled_cost: float
+    by_industry: Dict[str, Dict[str, Any]]
+    reservations: List[IntermediateGoodsReservation]
+    shortages: List[Dict[str, Any]]
+    shortage: bool
+    reason: str
+    diagnostics: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["reservations"] = [reservation.to_dict() for reservation in self.reservations]
+        return data
+
+
 class IntermediateGoodsProcurement:
     """中间品采购策略"""
     
@@ -44,6 +84,8 @@ class IntermediateGoodsProcurement:
         """调用market方法，自动处理Ray Actor对象"""
         method = getattr(self.product_market, method_name)
         if self.is_ray_actor:
+            if ray is None:
+                raise RuntimeError("ray is required when product_market is a Ray Actor")
             # Ray Actor，需要调用.remote()并ray.get()
             result = method.remote(*args, **kwargs)
             return ray.get(result)
@@ -84,7 +126,344 @@ class IntermediateGoodsProcurement:
         equivalent_units = value_needed / industry_avg_price
         
         return value_needed, equivalent_units
-    
+
+    def quote_intermediate_goods_plan(
+        self,
+        target_output: float,
+        io_suppliers: Sequence[Mapping[str, Any]],
+        supplier_quotes: Any,
+        budget: Optional[float] = None,
+    ) -> IntermediateGoodsProcurementPlan:
+        """
+        Build a pure quote/scale plan for intermediate goods.
+
+        This method does not purchase goods, reserve ProductMarket stock, or write
+        ledger entries. It only computes the global scale that can be supported by
+        supplier quotes and an optional budget.
+        """
+        return self.plan_intermediate_goods_procurement(
+            target_output=target_output,
+            io_suppliers=io_suppliers,
+            supplier_quotes=supplier_quotes,
+            budget=budget,
+        )
+
+    def plan_intermediate_goods_procurement(
+        self,
+        target_output: float,
+        io_suppliers: Sequence[Mapping[str, Any]],
+        supplier_quotes: Any,
+        budget: Optional[float] = None,
+    ) -> IntermediateGoodsProcurementPlan:
+        """
+        Plan intermediate goods procurement without executing transactions.
+
+        Args:
+            target_output: Desired production output/value for this planning step.
+            io_suppliers: IO rows with supplier/industry and coefficient fields.
+            supplier_quotes: Quote data keyed by industry or a flat list of quote
+                dicts/objects. Quotes may expose price fields
+                (unit_price/manufacturer_price/price) and stock fields
+                (available_quantity/available_stock/quantity/stock), or an
+                explicit available_value.
+            budget: Optional cash budget for all intermediate inputs.
+
+        Returns:
+            IntermediateGoodsProcurementPlan with planned_cost, feasible_scale,
+            scaled_cost, shortages, and industry-level cost scaling.
+        """
+        target = self._coerce_nonnegative_float(target_output)
+        normalized_suppliers = self._normalize_io_suppliers(io_suppliers)
+        by_industry: Dict[str, Dict[str, Any]] = {}
+        shortages: List[Dict[str, Any]] = []
+        input_scales: List[float] = []
+
+        for supplier in normalized_suppliers:
+            industry = supplier["supplier"]
+            coefficient = supplier["coefficient"]
+            planned_cost = target * coefficient
+            quotes = self._quotes_for_industry(supplier_quotes, industry)
+            available_cost = self._available_cost_from_quotes(quotes)
+
+            if planned_cost > 0.0:
+                available_scale = min(1.0, available_cost / planned_cost)
+            else:
+                available_scale = 1.0
+
+            input_scales.append(available_scale)
+            shortage_reason = None
+            if planned_cost > 0.0 and available_scale < 1.0:
+                shortage_reason = "no_supplier_quotes" if not quotes else "input_shortage"
+                shortages.append(
+                    {
+                        "type": "input",
+                        "reason": shortage_reason,
+                        "supplier": industry,
+                        "planned_cost": planned_cost,
+                        "available_cost": available_cost,
+                        "available_scale": available_scale,
+                    }
+                )
+
+            by_industry[industry] = {
+                "planned_cost": planned_cost,
+                "available_cost": available_cost,
+                "available_scale": available_scale,
+                "feasible_scale": None,
+                "scaled_cost": None,
+                "shortage": shortage_reason,
+                "quote_count": len(quotes),
+            }
+
+        planned_cost = sum(row["planned_cost"] for row in by_industry.values())
+        budget_value = None if budget is None else self._coerce_nonnegative_float(budget)
+
+        if target <= 0.0:
+            feasible_scale = 0.0
+            reason = "zero_target_output"
+            budget_scale = 1.0
+        elif planned_cost <= 0.0:
+            feasible_scale = 1.0
+            reason = "no_planned_intermediate_inputs"
+            budget_scale = 1.0
+        else:
+            input_scale = min(input_scales) if input_scales else 1.0
+            budget_scale = 1.0
+            if budget_value is not None:
+                budget_scale = min(1.0, budget_value / planned_cost)
+                if budget_scale < 1.0:
+                    shortages.append(
+                        {
+                            "type": "budget",
+                            "reason": "budget_shortage",
+                            "planned_cost": planned_cost,
+                            "available_budget": budget_value,
+                            "budget_scale": budget_scale,
+                        }
+                    )
+
+            feasible_scale = max(0.0, min(1.0, input_scale, budget_scale))
+            reason_types = {
+                shortage["reason"]
+                for shortage in shortages
+                if shortage.get("reason") in {"input_shortage", "no_supplier_quotes", "budget_shortage"}
+            }
+            if not reason_types:
+                reason = "fully_feasible"
+            elif len(reason_types) > 1:
+                reason = "multiple_constraints"
+            elif "budget_shortage" in reason_types:
+                reason = "budget_shortage"
+            elif "no_supplier_quotes" in reason_types:
+                reason = "no_supplier_quotes"
+            else:
+                reason = "input_shortage"
+
+        for row in by_industry.values():
+            row["feasible_scale"] = feasible_scale
+            row["scaled_cost"] = row["planned_cost"] * feasible_scale
+
+        scaled_cost = planned_cost * feasible_scale
+        reservations = self._build_scaled_reservations(
+            supplier_quotes=supplier_quotes,
+            by_industry=by_industry,
+        )
+
+        diagnostics = {
+            "budget": budget_value,
+            "budget_scale": budget_scale,
+            "included_supplier_count": len(normalized_suppliers),
+            "ignored_supplier_count": max(0, len(io_suppliers or []) - len(normalized_suppliers)),
+        }
+
+        return IntermediateGoodsProcurementPlan(
+            target_output=target,
+            planned_cost=planned_cost,
+            feasible_scale=feasible_scale,
+            scaled_cost=scaled_cost,
+            by_industry=by_industry,
+            reservations=reservations,
+            shortages=shortages,
+            shortage=bool(shortages),
+            reason=reason,
+            diagnostics=diagnostics,
+        )
+
+    def _normalize_io_suppliers(
+        self,
+        io_suppliers: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized = []
+        for supplier in io_suppliers or []:
+            supplier_code = (
+                supplier.get("supplier")
+                or supplier.get("industry")
+                or supplier.get("supplier_industry")
+                or supplier.get("industry_code")
+            )
+            if not supplier_code:
+                continue
+            supplier_code = str(supplier_code)
+            if not self._is_category_1(supplier_code):
+                continue
+
+            coefficient = self._coerce_nonnegative_float(supplier.get("coefficient", 0.0))
+            normalized.append({"supplier": supplier_code, "coefficient": coefficient})
+        return normalized
+
+    @classmethod
+    def _coerce_nonnegative_float(cls, value: Any) -> float:
+        try:
+            result = float(value or 0.0)
+        except (TypeError, ValueError):
+            result = 0.0
+        return max(0.0, result)
+
+    def _quotes_for_industry(self, supplier_quotes: Any, industry: str) -> List[Any]:
+        if supplier_quotes is None:
+            return []
+
+        if isinstance(supplier_quotes, Mapping):
+            if industry in supplier_quotes:
+                return self._as_quote_list(supplier_quotes[industry])
+            matches = []
+            for quote in supplier_quotes.values():
+                if self._quote_industry(quote) == industry:
+                    matches.extend(self._as_quote_list(quote))
+            return matches
+
+        matches = []
+        for quote in self._as_quote_list(supplier_quotes):
+            if self._quote_industry(quote) == industry:
+                matches.append(quote)
+        return matches
+
+    @classmethod
+    def _as_quote_list(cls, raw_quotes: Any) -> List[Any]:
+        if raw_quotes is None:
+            return []
+        if isinstance(raw_quotes, (str, bytes)):
+            return []
+        if isinstance(raw_quotes, Mapping):
+            return [raw_quotes]
+        try:
+            return list(raw_quotes)
+        except TypeError:
+            return [raw_quotes]
+
+    def _quote_industry(self, quote: Any) -> Optional[str]:
+        value = self._read_quote_field(
+            quote,
+            "supplier",
+            "supplier_industry",
+            "industry",
+            "industry_code",
+            "manufacturer_code",
+        )
+        if value in (None, ""):
+            return None
+        return str(value)
+
+    def _available_cost_from_quotes(self, quotes: Sequence[Any]) -> float:
+        return sum(self._quote_available_cost(quote) for quote in quotes)
+
+    def _quote_available_cost(self, quote: Any) -> float:
+        explicit_value = self._read_quote_field(
+            quote,
+            "available_value",
+            "available_cost",
+            "available_budget",
+        )
+        if explicit_value is not None:
+            return self._coerce_nonnegative_float(explicit_value)
+
+        price = self._quote_unit_price(quote)
+        quantity = self._quote_available_quantity(quote)
+        if price <= 0.0 or quantity <= 0.0:
+            return 0.0
+        return price * quantity
+
+    def _quote_unit_price(self, quote: Any) -> float:
+        value = self._read_quote_field(
+            quote,
+            "unit_price",
+            "manufacturer_price",
+            "price",
+            "current_price",
+        )
+        return self._coerce_nonnegative_float(value)
+
+    def _quote_available_quantity(self, quote: Any) -> float:
+        value = self._read_quote_field(
+            quote,
+            "available_quantity",
+            "available_stock",
+            "quantity",
+            "stock",
+            "amount",
+        )
+        return self._coerce_nonnegative_float(value)
+
+    @classmethod
+    def _quote_sku_id(cls, quote: Any) -> str:
+        value = cls._read_quote_field(quote, "sku_id", "product_id", "id")
+        return "" if value in (None, "") else str(value)
+
+    @classmethod
+    def _read_quote_field(cls, quote: Any, *field_names: str) -> Any:
+        if isinstance(quote, Mapping):
+            for field_name in field_names:
+                if field_name in quote:
+                    return quote[field_name]
+            return None
+        for field_name in field_names:
+            if hasattr(quote, field_name):
+                return getattr(quote, field_name)
+        return None
+
+    def _build_scaled_reservations(
+        self,
+        supplier_quotes: Any,
+        by_industry: Mapping[str, Dict[str, Any]],
+    ) -> List[IntermediateGoodsReservation]:
+        reservations: List[IntermediateGoodsReservation] = []
+        for industry, row in by_industry.items():
+            remaining_cost = float(row.get("scaled_cost") or 0.0)
+            if remaining_cost <= 0.0:
+                continue
+
+            for quote in self._quotes_for_industry(supplier_quotes, industry):
+                price = self._quote_unit_price(quote)
+                available_quantity = self._quote_available_quantity(quote)
+                available_cost = self._quote_available_cost(quote)
+                if price <= 0.0 or available_cost <= 0.0:
+                    continue
+
+                reserved_cost = min(remaining_cost, available_cost)
+                reserved_quantity = reserved_cost / price
+                if available_quantity > 0.0:
+                    reserved_quantity = min(reserved_quantity, available_quantity)
+                    reserved_cost = reserved_quantity * price
+
+                if reserved_cost <= 0.0:
+                    continue
+
+                reservations.append(
+                    IntermediateGoodsReservation(
+                        supplier_industry=industry,
+                        sku_id=self._quote_sku_id(quote),
+                        unit_price=price,
+                        available_quantity=available_quantity,
+                        reserved_quantity=reserved_quantity,
+                        reserved_cost=reserved_cost,
+                    )
+                )
+                remaining_cost -= reserved_cost
+                if remaining_cost <= 1e-9:
+                    break
+
+        return reservations
+
     def purchase_by_equivalent_units(
         self,
         supplier_industry: str,
@@ -139,9 +518,25 @@ class IntermediateGoodsProcurement:
             sku_equivalent_value = sku.base_manufacturer_price / self.get_industry_average_price(supplier_industry)
             quantity_to_buy = max(1, int(units_remaining / sku_equivalent_value))
             
-            # 检查库存
-            available_quantity = sku.available_stock
-            actual_quantity = min(quantity_to_buy, available_quantity)
+            # 检查并扣减制造商库存；ProductMarket 负责按可用量截断，避免负库存
+            product_id = getattr(sku, "product_id", None)
+            stock_result = {}
+            if product_id:
+                try:
+                    stock_result = self._call_market_method(
+                        'purchase_manufacturer_stock',
+                        product_id,
+                        quantity_to_buy,
+                    ) or {}
+                except AttributeError:
+                    stock_result = {}
+            if stock_result:
+                actual_quantity = stock_result.get("actual_quantity", 0.0)
+            else:
+                available_quantity = max(0.0, float(getattr(sku, "available_stock", 0.0) or 0.0))
+                actual_quantity = min(quantity_to_buy, available_quantity)
+                if actual_quantity > 0:
+                    sku.available_stock = max(0.0, available_quantity - actual_quantity)
             
             if actual_quantity > 0:
                 # 执行采购
@@ -173,15 +568,14 @@ class IntermediateGoodsProcurement:
                 purchased_value = total_cost
                 units_purchased += purchased_value / self.get_industry_average_price(supplier_industry)
                 
-                # 更新ProductMarket中的库存（同步到Ray Actor）
-                try:
-                    self._call_market_method('update_stock', sku.product_id, -actual_quantity)
-                except Exception as e:
-                    # 如果同步失败，仍然继续（本地对象已更新）
-                    pass
-                
-                # 同时更新本地对象以保持一致性
-                sku.available_stock -= actual_quantity
+                if stock_result and hasattr(sku, "available_stock"):
+                    try:
+                        sku.available_stock = max(
+                            0.0,
+                            float(stock_result.get("available_after", 0.0) or 0.0),
+                        )
+                    except Exception:
+                        pass
             
             # 移除已尝试的SKU
             available_skus.pop(0)

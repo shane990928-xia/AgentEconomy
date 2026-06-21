@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+output/
+qdrant_database/
+.agents/
+.codex/
+*.log
+.ipynb_checkpoints/

@@ -1,0 +1,48 @@
+simulation:
+  num_months: 2
+  preheat_months: 1
+  num_households: 40
+  debug_logging: true
+  debug_max_households: 5
+  debug_max_firms: 10
+  local_record_dir: "output/smoke_records_fixcheck"
+  enable_accounting_invariant_checks: true
+  num_firms: 20
+  num_banks: 10
+  num_government: 1
+  consumption_use_llm: false
+  consumption_llm_mode: "off"
+  firm_job_posting_use_llm: false
+  active_production_planning: true
+  production_apply_capacity_constraints: true
+
+checkpoint:
+  checkpoint_interval: 999
+  checkpoint_output_dir: "output/checkpoints"
+  checkpoint_compress: false
+
+tax:
+  income_tax_rate:
+    - cutoff: 0
+      rate: 0.1
+    - cutoff: 11601
+      rate: 0.12
+    - cutoff: 47151
+      rate: 0.22
+    - cutoff: 100526
+      rate: 0.24
+    - cutoff: 191951
+      rate: 0.32
+    - cutoff: 243726
+      rate: 0.35
+    - cutoff: 609351
+      rate: 0.37
+  corporate_tax_rate: 0.21
+  vat_rate: 0.08
+  fica_tax_rate: 0.0765
+  interest:
+    rate: 0.005
+
+concurrent config:
+  max_concurrent_tasks: 50
+  max_llm_concurrent: 50

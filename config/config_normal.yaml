@@ -6,9 +6,83 @@ simulation:
   debug_max_households: 10
   debug_max_firms: 80
   local_record_dir: "output/monthly_records"
+  enable_accounting_invariant_checks: true
   num_firms: 100
   num_banks: 10
   num_government: 1
+
+  # Long-run household consumption uses LLM for low-frequency preference
+  # profiles, then applies monthly empirical budget, price, stock, and liquidity
+  # constraints. Set consumption_llm_mode: "monthly" for the older full
+  # Step0/Step1/Step3 LLM decision each month.
+  consumption_use_llm: true
+  consumption_llm_mode: "profile"
+  consumption_profile_refresh_months: 12
+  firm_job_posting_use_llm: false
+  labor_match_top_k: 30
+  labor_match_offer_backups: 10
+  labor_match_demand_priority_weight: 5000.0
+  labor_offer_acceptance_policy: "demand_adjusted_wage"
+  labor_offer_demand_wage_bonus: 12.0
+  firm_min_part_time_hours_per_month: 8.0
+  firm_max_startup_part_time_hours_per_month: 160.0
+  firm_min_job_budget_coverage: 0.4
+  firm_labor_backlog_demand_share: 0.5
+  firm_retail_labor_value_share: 0.25
+  firm_allow_cash_based_startup_hiring: false
+  firm_layoff_min_wage_cap: 0.0
+  firm_layoff_min_employees_to_keep: 0
+  firm_layoff_wage_cap_tolerance: 0.25
+  retail_channel_diversification_enabled: true
+  retail_channel_max_household_share: 0.70
+  retail_channel_min_purchase_count: 3
+
+  # Fiscal demand injection and public employment are policy instruments, not
+  # accounting rules. Fixed floors are scaled by household count in small runs.
+  government_procurement_ratio: 0.35
+  government_demand_injection_ratio: 0.30
+  government_min_procurement_budget: 150000.0
+  government_max_procurement_budget: 350000.0
+  government_min_procurement_budget_per_household: 500.0
+  government_max_procurement_budget_per_household: 1166.6667
+  government_labor_budget_share_of_balance: 0.15
+  government_initial_labor_budget: 20000.0
+  government_min_labor_budget: 5000.0
+  government_max_labor_budget: 120000.0
+  government_max_labor_budget_per_household: 400.0
+  public_employment_target_unemployment: 0.15
+  public_employment_min_wage: 15.0
+  public_employment_max_budget: 150000.0
+  public_employment_max_budget_per_household: 500.0
+  public_employment_start_period: 2
+  public_employment_warmup_max_monthly_jobs: 20
+  public_employment_max_monthly_jobs: 40
+  public_employment_max_monthly_job_share: 0.10
+  public_employment_max_new_job_share: 0.05
+  public_employment_max_stock_share: 0.20
+  public_employment_shrink_threshold_multiplier: 0.5
+  public_employment_max_monthly_shrink_ratio: 0.20
+
+  # Active production planning replenishes toward target inventory rather than
+  # only reacting to realized shortages. Capacity constraints keep production
+  # tied to hired labor, capital, and cash instead of allowing free output.
+  active_production_planning: true
+  production_target_inventory_months: 1.0
+  production_ema_alpha: 0.5
+  production_apply_capacity_constraints: true
+  production_labor_productivity: 2.5
+  production_value_calibrated_labor_productivity: true
+  production_unit_cash_cost_share: 0.6
+  firm_initial_capital_multiplier: 1.5
+  firm_min_initial_cash: 10000.0
+  firm_initial_inventory_cover_months: 1.0
+  firm_initial_inactive_sku_stock: 0.0
+  firm_initial_min_active_sku_stock: 1.0
+  firm_capital_output_ratio: 3.0
+  firm_inventory_value_share: 0.5
+  firm_credit_annual_interest_rate: 0.08
+  firm_credit_repayment_cash_buffer: 1000.0
+  firm_credit_default_distress_months: 3
   
 
 # Checkpoint 配置

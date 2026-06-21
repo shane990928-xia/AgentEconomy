@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import ast
 import csv
+import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -15,6 +16,11 @@ from agenteconomy.center.LaborMarket import LaborMarket
 from agenteconomy.center.ProductMarket import ProductMarket
 from agenteconomy.market.AbstractResourceMarket import AbstractResourceMarket
 from agenteconomy.market.IntermediateGoodsProcurement import IntermediateGoodsProcurement
+from agenteconomy.agent.firm_planning_policy import (
+    ProductionPlan,
+    ProductionPlanInput,
+    ProductionPlanningPolicy,
+)
 from agenteconomy.utils.logger import get_logger
 from agenteconomy.utils.load_io_table import get_suppliers_for_industry, get_cost_structure
 from agenteconomy.data.industry_cate_map import industry_cate_map
@@ -413,7 +419,13 @@ class Firm:
             return ray.get(method.remote(*args, **kwargs))
         return method(*args, **kwargs)
 
-    def _compute_labor_budget(self, period: Optional[int] = None, current_demand_value: Optional[float] = None) -> float:
+    def _compute_labor_budget(
+        self,
+        period: Optional[int] = None,
+        current_demand_value: Optional[float] = None,
+        allow_cash_based_startup_hiring: bool = False,
+        retail_labor_value_share: float = 0.25,
+    ) -> float:
         """
         计算本期劳动预算
         
@@ -421,23 +433,20 @@ class Firm:
         1. 当前需求价值（如果传入且 > 0）× compensation_ratio
         2. 上月收入的 compensation_ratio 比例
         3. 生产历史中最近一次的生产价值
-        4. 当前现金
-        5. 初始预算（用于第一个月没有任何数据的情况）
+        4. 可选：当前现金（仅当配置显式允许 startup hiring 时）
         
         Args:
             period: 当前期间
             current_demand_value: 本月的需求/生产价值（从 simulator 传入），可以是 0 或 None
+            allow_cash_based_startup_hiring: 是否允许第一期用现金余额代理启动期收入
+            retail_labor_value_share: 零售历史总销售额转附加值/毛利基数的份额
         """
         import logging
         _logger = logging.getLogger(__name__)
         
-        # 常量定义
-        # 注意：这些值需要与经济规模匹配。66企业 × MIN 不应超过 GDP 的 50%
-        # GDP ≈ $400-600K，目标总工资 ≈ 55% GDP ≈ $220-330K
-        # 人均 $330K / 66 firms ≈ $5K，所以 MIN 应远低于此
-        INITIAL_LABOR_BUDGET = 5000.0   # 初始劳动预算（无数据时），可雇1-2人
-        MIN_COMPENSATION_RATIO = 0.20   # 最低 compensation 比率（20%，保证资本密集型行业也能招人）
-        MIN_LABOR_BUDGET = 500.0        # 最低劳动预算（降低，让无需求企业真正停止招聘）
+        # Keep labor budgets proportional to observed demand or income. A fixed
+        # dollar floor would turn tiny demand signals into real payroll costs.
+        MIN_COMPENSATION_RATIO = 0.20   # 回退到基线（劳动成本杠杆经实测为收缩性，就业靠需求侧解决）
         
         base_value = 0.0
         source = "none"
@@ -475,12 +484,15 @@ class Firm:
         # 使用当前现金（仅在第一期，即还未有收入历史时）
         if base_value <= 0:
             current_period = int(period if period is not None else self.current_period or 0)
-            if current_period <= 1:
-                # 第一期允许使用初始现金启动
-                cash_val = float(self.cash or 0.0)
-                if cash_val > 0:
-                    base_value = cash_val
-                    source = "current_cash"
+            if allow_cash_based_startup_hiring and current_period <= 1:
+                industry_type = str(getattr(self, "industry_type", "") or "")
+                is_service_provider = industry_type.startswith("category_3_") or str(self.firm_id).startswith("svc_")
+                if not is_service_provider:
+                    # 第一期制造商/零售商允许使用初始现金启动；服务企业等待真实服务收入。
+                    cash_val = float(self.cash or 0.0)
+                    if cash_val > 0:
+                        base_value = cash_val
+                        source = "current_cash"
         
         # 如果所有收入来源均为0（需求=0，上月收入=0，生产历史=0）
         # 说明该企业没有市场需求，不应继续招人消耗资金
@@ -490,6 +502,14 @@ class Firm:
                 f"(demand={current_demand_value}, cash={self.cash}, history={len(self.production_history or [])})"
             )
             return 0.0
+
+        industry_type = str(getattr(self, "industry_type", "") or "")
+        is_retailer = industry_type == "retail" or str(self.firm_id).startswith("ret_")
+        if is_retailer and source in {"last_month_income", "current_cash"}:
+            share = max(0.0, min(1.0, float(retail_labor_value_share or 0.0)))
+            if share > 0.0:
+                base_value *= share
+                source = f"{source}_retail_value_added"
 
         # 使用 compensation_ratio，但确保不低于最低比率
         actual_ratio = float(getattr(self, "compensation_ratio", 0.2) or 0.2)
@@ -531,9 +551,6 @@ class Firm:
             except Exception as e:
                 _logger.debug(f"[劳动预算] 获取失业率失败: {e}")
         
-        # 确保最低劳动预算
-        budget = max(budget, MIN_LABOR_BUDGET)
-        
         _logger.debug(
             f"[劳动预算] {self.firm_id}: base={base_value:.2f} (source={source}), "
             f"ratio={actual_ratio:.2f}→{effective_ratio:.2f}, budget={budget:.2f}"
@@ -544,7 +561,12 @@ class Firm:
         self,
         period: Optional[int] = None,
         max_job_types: int = 10,
-        current_demand_value: Optional[float] = None
+        current_demand_value: Optional[float] = None,
+        min_part_time_hours_per_month: Optional[float] = None,
+        max_startup_part_time_hours_per_month: Optional[float] = None,
+        min_job_budget_coverage: float = 1.0,
+        allow_cash_based_startup_hiring: bool = False,
+        retail_labor_value_share: float = 0.25,
     ) -> List[Job]:
         if not self.industry:
             return []
@@ -584,29 +606,106 @@ class Firm:
         if total_weight <= 0:
             total_weight = float(len(candidate_socs))
 
-        labor_budget = self._compute_labor_budget(period, current_demand_value=current_demand_value)
+        labor_budget = self._compute_labor_budget(
+            period,
+            current_demand_value=current_demand_value,
+            allow_cash_based_startup_hiring=allow_cash_based_startup_hiring,
+            retail_labor_value_share=retail_labor_value_share,
+        )
         if labor_budget <= 0:
             return []
 
         hours_per_week = 40.0
         weeks_per_month = 4.0
         hours_per_period = hours_per_week * weeks_per_month
-
-        jobs: List[Job] = []
-        remaining_budget = labor_budget
+        if min_part_time_hours_per_month is None:
+            try:
+                min_part_time_hours = float(os.getenv("FIRM_MIN_PART_TIME_HOURS_PER_MONTH", "20.0") or 20.0)
+            except ValueError:
+                min_part_time_hours = 20.0
+        else:
+            min_part_time_hours = float(min_part_time_hours_per_month or 20.0)
+        if max_startup_part_time_hours_per_month is None:
+            try:
+                max_startup_part_time_hours = float(os.getenv("FIRM_MAX_STARTUP_PART_TIME_HOURS_PER_MONTH", "160.0") or 160.0)
+            except ValueError:
+                max_startup_part_time_hours = 160.0
+        else:
+            max_startup_part_time_hours = float(max_startup_part_time_hours_per_month or 160.0)
+        min_part_time_hours = max(1.0, min(min_part_time_hours, hours_per_period))
+        max_startup_part_time_hours = max(min_part_time_hours, min(max_startup_part_time_hours, hours_per_period))
 
         ranked_socs = sorted(candidate_socs, key=lambda s: weights.get(s, 0.0), reverse=True)
+        soc_infos: List[Dict[str, Any]] = []
+        cheapest_min_job_cost = 0.0
         for soc in ranked_socs[:max_job_types]:
             info = job_data.get(soc)
             if not info:
                 continue
-            hourly_wage = float(info.get("wage", 0.0) or 0.0)
-            if hourly_wage <= 0:
+            hourly_wage = float(info.get("wage", 0.0) or 0.0) * float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0)
+            if hourly_wage <= 0.0:
                 continue
-            monthly_wage = hourly_wage * hours_per_period
+            min_job_cost = hourly_wage * min_part_time_hours
+            full_job_cost = hourly_wage * hours_per_period
+            if min_job_cost <= 0.0:
+                continue
+            soc_infos.append(
+                {
+                    "soc": soc,
+                    "info": info,
+                    "hourly_wage": hourly_wage,
+                    "min_job_cost": min_job_cost,
+                    "full_job_cost": full_job_cost,
+                    "weight": float(weights.get(soc, 1.0) or 1.0),
+                }
+            )
+            if cheapest_min_job_cost <= 0.0 or min_job_cost < cheapest_min_job_cost:
+                cheapest_min_job_cost = min_job_cost
+        if not soc_infos:
+            return []
+
+        coverage = max(0.0, float(min_job_budget_coverage or 0.0))
+        if cheapest_min_job_cost > 0.0 and labor_budget < cheapest_min_job_cost * coverage:
+            logger.debug(
+                f"[劳动预算] {self.firm_id}: budget={labor_budget:.2f} below minimum "
+                f"job cost threshold={cheapest_min_job_cost * coverage:.2f}"
+            )
+            return []
+
+        jobs: List[Job] = []
+        remaining_budget = labor_budget
+        planned_socs: set[str] = set()
+
+        def _make_job(soc_info: Dict[str, Any], hours: float, positions: int) -> Job:
+            info = soc_info["info"]
+            job = Job.create(
+                soc=soc_info["soc"],
+                title=info.get("title") or soc_info["soc"],
+                wage_per_hour=float(soc_info["hourly_wage"] or 0.0),
+                firm_id=self.firm_id,
+                description=info.get("description"),
+                hours_per_period=hours,
+                required_skills=info.get("skills") or {},
+                required_abilities=info.get("abilities") or {},
+            )
+            job.positions_available = int(positions)
+            return job
+
+        def _add_full_position(soc_info: Dict[str, Any]) -> None:
+            soc = str(soc_info["soc"])
+            if soc in planned_socs:
+                for job in jobs:
+                    if job.SOC == soc:
+                        job.positions_available += 1
+                        return
+            jobs.append(_make_job(soc_info, hours_per_period, 1))
+            planned_socs.add(soc)
+
+        for soc_info in soc_infos:
+            monthly_wage = float(soc_info["full_job_cost"] or 0.0)
             if monthly_wage <= 0:
                 continue
-            budget_share = labor_budget * (weights.get(soc, 1.0) / total_weight)
+            budget_share = labor_budget * (float(soc_info["weight"] or 1.0) / total_weight)
             positions = int(budget_share // monthly_wage)
             if positions <= 0:
                 continue
@@ -616,50 +715,40 @@ class Firm:
             positions = min(positions, max_affordable)
             remaining_budget -= positions * monthly_wage
 
-            job = Job.create(
-                soc=soc,
-                title=info.get("title") or soc,
-                wage_per_hour=hourly_wage,
-                firm_id=self.firm_id,
-                description=info.get("description"),
-                hours_per_period=hours_per_period,
-                required_skills=info.get("skills") or {},
-                required_abilities=info.get("abilities") or {},
-            )
-            job.positions_available = positions
-            jobs.append(job)
+            jobs.append(_make_job(soc_info, hours_per_period, positions))
+            planned_socs.add(str(soc_info["soc"]))
 
-        if not jobs:
-            # Fallback: try to hire 1 lowest-wage role
-            cheapest_soc = None
-            cheapest_monthly = 0.0
-            for soc in ranked_socs:
-                info = job_data.get(soc)
-                if not info:
+        # Use the residual aggregate budget instead of letting SOC weight
+        # fragmentation suppress all hiring. Full positions are added one round at
+        # a time across SOCs to keep a broad applicant pool.
+        while True:
+            allocated = False
+            for soc_info in soc_infos:
+                monthly_wage = float(soc_info["full_job_cost"] or 0.0)
+                if monthly_wage <= 0.0 or remaining_budget < monthly_wage:
                     continue
-                hourly_wage = float(info.get("wage", 0.0) or 0.0)
-                if hourly_wage <= 0:
-                    continue
-                monthly_wage = hourly_wage * hours_per_period
-                if monthly_wage <= 0:
-                    continue
-                if cheapest_soc is None or monthly_wage < cheapest_monthly:
-                    cheapest_soc = soc
-                    cheapest_monthly = monthly_wage
-            if cheapest_soc and remaining_budget >= cheapest_monthly:
-                info = job_data[cheapest_soc]
-                job = Job.create(
-                    soc=cheapest_soc,
-                    title=info.get("title") or cheapest_soc,
-                    wage_per_hour=float(info.get("wage", 0.0) or 0.0),
-                    firm_id=self.firm_id,
-                    description=info.get("description"),
-                    hours_per_period=hours_per_period,
-                    required_skills=info.get("skills") or {},
-                    required_abilities=info.get("abilities") or {},
-                )
-                job.positions_available = 1
-                jobs.append(job)
+                _add_full_position(soc_info)
+                remaining_budget -= monthly_wage
+                allocated = True
+            if not allocated:
+                break
+
+        # If the remaining budget cannot buy a full position, post one part-time
+        # job only when the firm can fund the configured minimum hours.
+        for soc_info in soc_infos:
+            if remaining_budget < float(soc_info["min_job_cost"] or 0.0):
+                continue
+            if str(soc_info["soc"]) in planned_socs:
+                continue
+
+            hourly_wage = float(soc_info["hourly_wage"] or 0.0)
+            if hourly_wage <= 0.0:
+                continue
+            affordable_hours = min(max_startup_part_time_hours, remaining_budget / hourly_wage)
+            if affordable_hours >= min_part_time_hours:
+                jobs.append(_make_job(soc_info, affordable_hours, 1))
+                planned_socs.add(str(soc_info["soc"]))
+                remaining_budget -= affordable_hours * hourly_wage
 
         if jobs and naics_title:
             logger.info(
@@ -685,7 +774,17 @@ class Firm:
         return self.employee_count, self.employee_list
 
     # Labor market operations
-    async def post_jobs(self, period: Optional[int] = None, current_demand_value: Optional[float] = None):
+    async def post_jobs(
+        self,
+        period: Optional[int] = None,
+        current_demand_value: Optional[float] = None,
+        min_part_time_hours_per_month: Optional[float] = None,
+        max_startup_part_time_hours_per_month: Optional[float] = None,
+        min_job_budget_coverage: float = 1.0,
+        allow_cash_based_startup_hiring: bool = False,
+        retail_labor_value_share: float = 0.25,
+        use_llm: bool = False,
+    ):
         """
         Post jobs to the labor market
         
@@ -696,17 +795,46 @@ class Firm:
         Args:
             period: 当前期间
             current_demand_value: 本月的需求/生产价值（用于计算劳动预算）
+            use_llm: If True, allow the legacy LLM fallback when no data-driven
+                job plan can be produced.
         """
-        jobs = self._decide_job_postings_from_data(period=period, current_demand_value=current_demand_value)
+        jobs = self._decide_job_postings_from_data(
+            period=period,
+            current_demand_value=current_demand_value,
+            min_part_time_hours_per_month=min_part_time_hours_per_month,
+            max_startup_part_time_hours_per_month=max_startup_part_time_hours_per_month,
+            min_job_budget_coverage=min_job_budget_coverage,
+            allow_cash_based_startup_hiring=allow_cash_based_startup_hiring,
+            retail_labor_value_share=retail_labor_value_share,
+        )
         if jobs:
             snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
             if not isinstance(snapshot, dict):
                 snapshot = {}
+            employed_by_soc: Dict[str, int] = {}
+            wage_bill = self._call_labor_market("get_firm_wage_bill", self.firm_id)
+            if isinstance(wage_bill, dict):
+                for employee in wage_bill.get("employees", []) or []:
+                    if not isinstance(employee, dict):
+                        continue
+                    soc = employee.get("job_SOC") or employee.get("soc")
+                    if not soc:
+                        continue
+                    employed_by_soc[str(soc)] = employed_by_soc.get(str(soc), 0) + 1
+            desired_socs = {job.SOC for job in jobs}
+            for soc, positions in snapshot.items():
+                if soc in desired_socs:
+                    continue
+                reduce_by = int(positions or 0)
+                if reduce_by > 0:
+                    self._call_labor_market("reduce_job_positions", self.firm_id, soc, reduce_by)
             to_post: List[Job] = []
             for job in jobs:
                 desired = int(job.positions_available or 0)
+                current_staff = int(employed_by_soc.get(str(job.SOC), 0) or 0)
                 existing = int(snapshot.get(job.SOC, 0) or 0)
-                delta = desired - existing
+                target_open = max(0, desired - current_staff)
+                delta = target_open - existing
                 if delta > 0:
                     # 需要增加职位
                     job.positions_available = delta
@@ -719,6 +847,16 @@ class Firm:
             if to_post:
                 self._call_labor_market("apply_job_plan", self.firm_id, to_post)
             return to_post
+
+        snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
+        if isinstance(snapshot, dict):
+            for soc, positions in snapshot.items():
+                reduce_by = int(positions or 0)
+                if reduce_by > 0:
+                    self._call_labor_market("reduce_job_positions", self.firm_id, soc, reduce_by)
+
+        if not use_llm:
+            return []
 
         prompt = build_firm_post_job_prompt(self) # TODO
         response = await call_llm(prompt)
@@ -754,6 +892,77 @@ class Firm:
     def production_plan(self):
         """Generate a production plan"""
         pass
+
+    def _estimate_available_labor_for_planning(self) -> float:
+        total_hours = 0.0
+        for employee in self.employee_list or []:
+            hours = getattr(employee, "total_hours", None)
+            if hours is None:
+                hours = getattr(employee, "hours_per_period", None)
+            try:
+                total_hours += max(0.0, float(hours or 0.0))
+            except (TypeError, ValueError):
+                continue
+
+        if total_hours <= 0.0 and self.employee_count > 0:
+            total_hours = float(self.employee_count) * 160.0
+        return total_hours
+
+    def build_production_plan(
+        self,
+        sales_history: Optional[Iterable[Any]] = None,
+        unmet_demand_history: Optional[Iterable[Any]] = None,
+        current_inventory: Any = 0.0,
+        target_inventory_months: float = 1.0,
+        ema_alpha: float = 0.5,
+        include_unmet_demand: bool = True,
+        fallback_expected_demand: float = 0.0,
+        available_labor: Optional[float] = None,
+        labor_productivity: float = 1.0,
+        capital_stock: Optional[float] = None,
+        capital_productivity: float = 1.0,
+        cash: Optional[float] = None,
+        unit_cash_cost: Optional[float] = None,
+        cash_reserve: float = 0.0,
+        approved_credit: Optional[float] = None,
+        credit_limit: Optional[float] = None,
+        credit_outstanding: float = 0.0,
+        use_current_state_constraints: bool = True,
+    ) -> ProductionPlan:
+        """
+        Build an aggregate active production plan without executing production.
+
+        Existing `produce()` callers remain unchanged. This method is a planning
+        surface for the simulator to translate aggregate intent into SKU plans.
+        """
+        if use_current_state_constraints:
+            if available_labor is None:
+                available_labor = self._estimate_available_labor_for_planning()
+            if capital_stock is None:
+                capital_stock = self.capital_stock
+            if cash is None and unit_cash_cost is not None:
+                cash = self.cash
+
+        plan_input = ProductionPlanInput(
+            sales_history=[] if sales_history is None else sales_history,
+            unmet_demand_history=[] if unmet_demand_history is None else unmet_demand_history,
+            current_inventory=current_inventory,
+            target_inventory_months=target_inventory_months,
+            ema_alpha=ema_alpha,
+            include_unmet_demand=include_unmet_demand,
+            fallback_expected_demand=fallback_expected_demand,
+            available_labor=available_labor,
+            labor_productivity=labor_productivity,
+            capital_stock=capital_stock,
+            capital_productivity=capital_productivity,
+            cash=cash,
+            unit_cash_cost=unit_cash_cost,
+            cash_reserve=cash_reserve,
+            approved_credit=approved_credit,
+            credit_limit=credit_limit,
+            credit_outstanding=credit_outstanding,
+        )
+        return ProductionPlanningPolicy().build_plan(plan_input)
 
 
 class ManufactureFirm(Firm):
@@ -796,6 +1005,9 @@ class ManufactureFirm(Firm):
         if sku_obj is not None:
             owner_id = getattr(sku_obj, "owner_id", None)
             if owner_id:
+                owner_id = str(owner_id)
+                if owner_id.startswith(("mfg_", "ret_", "svc_")):
+                    return owner_id
                 firm_id = self._call_economic_center("resolve_market_price_id", "intermediate_goods", owner_id)
                 if firm_id:
                     return firm_id
@@ -995,19 +1207,6 @@ class ManufactureFirm(Firm):
 
                 if transaction:
                     costs[supplier_code] = transaction['total_cost']
-                    if self.economic_center is not None:
-                        self._call_economic_center(
-                            "record_resource_purchase",
-                            month=period,
-                            buyer_id=self.firm_id,
-                            industry_code=supplier_code,
-                            quantity=physical_qty,
-                            unit_price=transaction.get('unit_price', 0.0),
-                            total_cost=transaction.get('total_cost', 0.0),
-                            unit=transaction.get('unit'),
-                            base_price=transaction.get('base_price'),
-                        )
-
                     supplier_name = supplier.get('name', supplier_code)
                     logger.info(
                         f"Firm {self.firm_id} purchased {supplier_name}: "
@@ -1253,6 +1452,7 @@ class ManufactureFirm(Firm):
             )
 
             return {
+                'production_plan': production_plan.copy(),
                 'production_value': production_value,
                 'total_cost': cost_breakdown['total_cost'],
                 'unit_costs': unit_costs,

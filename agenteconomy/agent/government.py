@@ -1,6 +1,7 @@
 from typing import Optional, Dict, List, Any, Tuple
 from functools import lru_cache
 from collections import defaultdict
+from math import ceil
 import os
 import json
 import pandas as pd
@@ -64,6 +65,7 @@ PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT = 0.15  # 目标：失业率不超过15%
 PUBLIC_EMPLOYMENT_MIN_WAGE = 15.0  # $15/小时
 # 公共就业预算上限（政府每月用于公共就业的最大支出）
 PUBLIC_EMPLOYMENT_MAX_BUDGET = 150000.0
+PUBLIC_EMPLOYMENT_MATCHING_LOSS_FLOOR = 20000.0
 # 公共就业岗位类型（低技能要求的通用岗位）
 PUBLIC_EMPLOYMENT_SOC_CODES = [
     "43-9061",  # Office Clerks, General
@@ -96,7 +98,31 @@ class Government:
                  government_id: str,
                  initial_budget: float = 0.0,
                  tax_policy: TaxPolicy = None,
-                 economic_center: Optional[EconomicCenter] = None):
+                 economic_center: Optional[EconomicCenter] = None,
+                 household_count: Optional[int] = None,
+                 procurement_ratio: float = GOVERNMENT_PROCUREMENT_RATIO,
+                 demand_injection_ratio: float = GOVERNMENT_DEMAND_INJECTION_RATIO,
+                 min_procurement_budget: float = GOVERNMENT_MIN_PROCUREMENT_BUDGET,
+                 max_procurement_budget: float = GOVERNMENT_MAX_PROCUREMENT_BUDGET,
+                 min_procurement_budget_per_household: float = 500.0,
+                 max_procurement_budget_per_household: float = 1166.6667,
+                 government_labor_budget_share_of_balance: float = 0.15,
+                 government_initial_labor_budget: float = 20000.0,
+                 government_min_labor_budget: float = 5000.0,
+                 government_max_labor_budget: float = 120000.0,
+                 government_max_labor_budget_per_household: float = 400.0,
+                 public_employment_target_unemployment: float = PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT,
+                 public_employment_min_wage: float = PUBLIC_EMPLOYMENT_MIN_WAGE,
+                 public_employment_max_budget: float = PUBLIC_EMPLOYMENT_MAX_BUDGET,
+                 public_employment_max_budget_per_household: float = 500.0,
+                 public_employment_start_period: int = 2,
+                 public_employment_warmup_max_monthly_jobs: int = 20,
+                 public_employment_max_monthly_jobs: int = 40,
+                 public_employment_max_monthly_job_share: float = 0.10,
+                 public_employment_max_new_job_share: float = 0.10,
+                 public_employment_max_stock_share: float = 0.20,
+                 public_employment_shrink_threshold_multiplier: float = 0.5,
+                 public_employment_max_monthly_shrink_ratio: float = 0.20):
         """
         ## Initialize Government Agent
         Creates a new government agent with full tax management capabilities.
@@ -122,9 +148,90 @@ class Government:
         self.government_id = government_id
         self.tax_policy = tax_policy.model_copy()
         self.initial_budget = initial_budget
+        self.household_count = max(0, int(household_count or 0))
+        self.procurement_ratio = max(0.0, float(procurement_ratio or 0.0))
+        self.demand_injection_ratio = max(0.0, float(demand_injection_ratio or 0.0))
+        self.min_procurement_budget = max(0.0, float(min_procurement_budget or 0.0))
+        self.max_procurement_budget = max(0.0, float(max_procurement_budget or 0.0))
+        self.min_procurement_budget_per_household = max(
+            0.0, float(min_procurement_budget_per_household or 0.0)
+        )
+        self.max_procurement_budget_per_household = max(
+            0.0, float(max_procurement_budget_per_household or 0.0)
+        )
+        self.government_labor_budget_share_of_balance = max(
+            0.0, float(government_labor_budget_share_of_balance or 0.0)
+        )
+        self.government_initial_labor_budget = max(0.0, float(government_initial_labor_budget or 0.0))
+        self.government_min_labor_budget = max(0.0, float(government_min_labor_budget or 0.0))
+        self.government_max_labor_budget = max(0.0, float(government_max_labor_budget or 0.0))
+        self.government_max_labor_budget_per_household = max(
+            0.0, float(government_max_labor_budget_per_household or 0.0)
+        )
+        self.public_employment_target_unemployment = min(
+            1.0, max(0.0, float(public_employment_target_unemployment or 0.0))
+        )
+        self.public_employment_min_wage = max(0.0, float(public_employment_min_wage or 0.0))
+        self.public_employment_max_budget = max(0.0, float(public_employment_max_budget or 0.0))
+        self.public_employment_max_budget_per_household = max(
+            0.0, float(public_employment_max_budget_per_household or 0.0)
+        )
+        self.public_employment_start_period = max(0, int(public_employment_start_period or 0))
+        self.public_employment_warmup_max_monthly_jobs = max(
+            0, int(public_employment_warmup_max_monthly_jobs or 0)
+        )
+        self.public_employment_max_monthly_jobs = max(
+            0, int(public_employment_max_monthly_jobs or 0)
+        )
+        self.public_employment_max_monthly_job_share = max(
+            0.0, float(public_employment_max_monthly_job_share or 0.0)
+        )
+        self.public_employment_max_new_job_share = max(
+            0.0, float(public_employment_max_new_job_share or 0.0)
+        )
+        self.public_employment_max_stock_share = min(
+            1.0, max(0.0, float(public_employment_max_stock_share or 0.0))
+        )
+        self.public_employment_shrink_threshold_multiplier = max(
+            0.0, float(public_employment_shrink_threshold_multiplier or 0.0)
+        )
+        self.public_employment_max_monthly_shrink_ratio = max(
+            0.0, float(public_employment_max_monthly_shrink_ratio or 0.0)
+        )
         # Store dependencies
         self.economic_center = economic_center
         self.logger = get_logger(name="government")
+
+    def _scale_budget_by_households(self, base_budget: float, per_household: float) -> float:
+        if self.household_count <= 0 or per_household <= 0:
+            return max(0.0, float(base_budget or 0.0))
+        return min(max(0.0, float(base_budget or 0.0)), per_household * self.household_count)
+
+    def _effective_min_procurement_budget(self) -> float:
+        return self._scale_budget_by_households(
+            self.min_procurement_budget,
+            self.min_procurement_budget_per_household,
+        )
+
+    def _effective_max_procurement_budget(self, min_budget: Optional[float] = None) -> float:
+        effective_max = self._scale_budget_by_households(
+            self.max_procurement_budget,
+            self.max_procurement_budget_per_household,
+        )
+        floor = self._effective_min_procurement_budget() if min_budget is None else float(min_budget)
+        return max(floor, effective_max)
+
+    def _effective_public_employment_budget(self) -> float:
+        return self._scale_budget_by_households(
+            self.public_employment_max_budget,
+            self.public_employment_max_budget_per_household,
+        )
+
+    def _effective_government_labor_budget_ceiling(self) -> float:
+        return self._scale_budget_by_households(
+            self.government_max_labor_budget,
+            self.government_max_labor_budget_per_household,
+        )
 
     def initialize(self):
         """
@@ -274,33 +381,37 @@ class Government:
         Returns:
             本期可用于雇佣的预算
         """
-        INITIAL_GOVERNMENT_LABOR_BUDGET = 20000.0
-        MIN_GOVERNMENT_LABOR_BUDGET = 5000.0
-        # 政府将账户余额的一定比例用于劳动力支出
-        # 不能花光，需要留钱给采购和转移支付
-        LABOR_SHARE_OF_BALANCE = 0.15  # 每月最多用余额的 15% 发工资
-        MAX_GOVERNMENT_LABOR_BUDGET = 120000.0  # 上限，防止政府雇太多人
-        
         # 查询政府账户余额
         gov_balance = 0.0
         if self.economic_center is not None:
             try:
                 import ray
-                gov_balance = float(ray.get(self.economic_center.query_balance.remote(self.government_id)) or 0.0)
+                method = getattr(self.economic_center, "query_balance")
+                if 'ActorHandle' in str(type(self.economic_center)):
+                    gov_balance = float(ray.get(method.remote(self.government_id)) or 0.0)
+                else:
+                    gov_balance = float(method(self.government_id) or 0.0)
             except Exception:
                 pass
         
         if gov_balance <= 0:
-            self.logger.info(f"政府余额不足({gov_balance:.0f})，使用初始预算: {INITIAL_GOVERNMENT_LABOR_BUDGET:.2f}")
-            return INITIAL_GOVERNMENT_LABOR_BUDGET
+            fallback_budget = min(
+                self.government_initial_labor_budget,
+                self._effective_government_labor_budget_ceiling(),
+            )
+            self.logger.info(f"政府余额不足({gov_balance:.0f})，使用初始预算: {fallback_budget:.2f}")
+            return fallback_budget
         
         # 基于余额计算劳动预算
-        labor_budget = gov_balance * LABOR_SHARE_OF_BALANCE
-        final_budget = max(min(labor_budget, MAX_GOVERNMENT_LABOR_BUDGET), MIN_GOVERNMENT_LABOR_BUDGET)
+        labor_budget = gov_balance * self.government_labor_budget_share_of_balance
+        budget_ceiling = self._effective_government_labor_budget_ceiling()
+        budget_floor = min(self.government_min_labor_budget, budget_ceiling)
+        final_budget = max(min(labor_budget, budget_ceiling), budget_floor)
         
         self.logger.info(
             f"政府劳动预算: {final_budget:.2f} "
-            f"(余额={gov_balance:.0f}, 计算值={labor_budget:.0f}, 占比={LABOR_SHARE_OF_BALANCE:.0%})"
+            f"(余额={gov_balance:.0f}, 计算值={labor_budget:.0f}, "
+            f"占比={self.government_labor_budget_share_of_balance:.0%})"
         )
         return final_budget
     
@@ -469,8 +580,8 @@ class Government:
         """
         from agenteconomy.agent.firm import _load_job_skill_data
         
-        # 预热期第1月不启动（让企业先招人），第2-3月渐进式启动（上限更低）
-        if period is not None and period <= 1:
+        # 早期先让私人部门招聘，再按配置启动兜底就业。
+        if period is not None and period < self.public_employment_start_period:
             self.logger.info(f"公共就业计划: 预热期(M{period})，不启动，让企业优先招聘")
             return []
         
@@ -482,40 +593,56 @@ class Government:
         
         total_labor = int(labor_stats.get("total_labor_hours", 0) or 0)
         total_matched = int(labor_stats.get("total_matched_jobs", 0) or 0)
+        current_public_jobs = int(labor_stats.get("gov_matched_jobs", 0) or 0)
         
         if total_labor <= 0:
             return []
         
         unemployment_rate = (total_labor - total_matched) / total_labor
         
+        target_unemployment = self.public_employment_target_unemployment
+        if target_unemployment <= 0.0:
+            return []
+
         # 检查是否需要启动公共就业计划
-        if unemployment_rate <= PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:
+        if unemployment_rate <= target_unemployment:
             self.logger.info(
-                f"公共就业计划: 失业率 {unemployment_rate:.1%} <= 目标 {PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:.1%}，无需启动"
+                f"公共就业计划: 失业率 {unemployment_rate:.1%} <= 目标 {target_unemployment:.1%}，无需启动"
             )
             return []
         
         # 计算需要创造的岗位数量（渐进式：每月最多 MAX_MONTHLY_NEW_JOBS 个）
         # 预热期上限更低（20人），正式期 40 人
         if period is not None and period <= 3:
-            MAX_MONTHLY_NEW_JOBS = 20  # 预热期：每月最多 20 个，避免挤出私人就业
+            max_monthly_new_jobs = self.public_employment_warmup_max_monthly_jobs
         else:
-            MAX_MONTHLY_NEW_JOBS = 40  # 正式期：每月最多 40 个
+            max_monthly_new_jobs = self.public_employment_max_monthly_jobs
+        if self.public_employment_max_monthly_job_share > 0.0:
+            labor_scaled_max = max(1, ceil(total_labor * self.public_employment_max_monthly_job_share))
+            max_monthly_new_jobs = min(max_monthly_new_jobs, labor_scaled_max)
+        if self.public_employment_max_new_job_share > 0.0:
+            labor_scaled_max = max(1, ceil(total_labor * self.public_employment_max_new_job_share))
+            max_monthly_new_jobs = min(max_monthly_new_jobs, labor_scaled_max)
         unemployed = total_labor - total_matched
-        target_employed = int(total_labor * (1.0 - PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT))
+        target_employed = int(total_labor * (1.0 - target_unemployment))
         jobs_needed = max(0, target_employed - total_matched)
+        if self.public_employment_max_stock_share > 0.0:
+            max_public_stock = max(1, int(total_labor * self.public_employment_max_stock_share))
+            jobs_needed = min(jobs_needed, max(0, max_public_stock - current_public_jobs))
         
         # 渐进式限制 + 预算限制
         hours_per_period = 160.0  # 月工时
-        monthly_wage = PUBLIC_EMPLOYMENT_MIN_WAGE * hours_per_period
-        max_affordable = int(PUBLIC_EMPLOYMENT_MAX_BUDGET / monthly_wage)
-        jobs_to_create = min(jobs_needed, max_affordable, MAX_MONTHLY_NEW_JOBS)
+        monthly_wage = self.public_employment_min_wage * hours_per_period
+        if monthly_wage <= 0.0:
+            return []
+        max_affordable = int(self._effective_public_employment_budget() / monthly_wage)
+        jobs_to_create = min(jobs_needed, max_affordable, max_monthly_new_jobs)
         
         if jobs_to_create <= 0:
             return []
         
         self.logger.info(
-            f"公共就业计划: 失业率 {unemployment_rate:.1%} > 目标 {PUBLIC_EMPLOYMENT_TARGET_UNEMPLOYMENT:.1%}, "
+            f"公共就业计划: 失业率 {unemployment_rate:.1%} > 目标 {target_unemployment:.1%}, "
             f"失业人数 {unemployed}, 计划创造 {jobs_to_create} 个公益岗位"
         )
         
@@ -544,11 +671,12 @@ class Government:
                 SOC=soc,
                 title=title,  # Job模型使用title，不是job_title
                 firm_id=self.government_id,
-                wage_per_hour=PUBLIC_EMPLOYMENT_MIN_WAGE,
+                wage_per_hour=self.public_employment_min_wage,
                 hours_per_period=hours_per_period,
                 positions_available=positions,
                 required_skills={},  # 无技能要求
                 required_abilities={},  # 无能力要求
+                matching_loss_floor=PUBLIC_EMPLOYMENT_MATCHING_LOSS_FLOOR,
                 is_valid=True,
             )
             jobs.append(job)
@@ -757,22 +885,26 @@ class Government:
         # 方法1：基于家庭消费预算（优先）
         if household_consumption_budget is not None and household_consumption_budget > 0:
             # 政府支出 = 家庭消费 × 注入比例
-            demand_injection = household_consumption_budget * GOVERNMENT_DEMAND_INJECTION_RATIO
+            demand_injection = household_consumption_budget * self.demand_injection_ratio
             
             # 应用上下限约束
-            procurement_budget = max(demand_injection, GOVERNMENT_MIN_PROCUREMENT_BUDGET)
-            procurement_budget = min(procurement_budget, GOVERNMENT_MAX_PROCUREMENT_BUDGET)
+            min_budget = self._effective_min_procurement_budget()
+            max_budget = self._effective_max_procurement_budget(min_budget)
+            procurement_budget = max(demand_injection, min_budget)
+            procurement_budget = min(procurement_budget, max_budget)
             
             self.logger.info(
                 f"政府采购预算: ${procurement_budget:,.2f} "
-                f"(家庭消费=${household_consumption_budget:,.2f} × {GOVERNMENT_DEMAND_INJECTION_RATIO:.0%} "
+                f"(家庭消费=${household_consumption_budget:,.2f} × {self.demand_injection_ratio:.0%} "
                 f"= ${demand_injection:,.2f}, 约束后=${procurement_budget:,.2f})"
             )
             return procurement_budget
         
         # 方法2：基于上月税收（兜底）
+        min_budget = self._effective_min_procurement_budget()
+        max_budget = self._effective_max_procurement_budget(min_budget)
         if self.economic_center is None:
-            return GOVERNMENT_MIN_PROCUREMENT_BUDGET
+            return min_budget
         
         current_period = period or 0
         prev_period = current_period - 1
@@ -789,15 +921,16 @@ class Government:
                 self.logger.warning(f"获取上月税收汇总失败: {e}")
         
         if total_tax > 0:
-            tax_based_budget = total_tax * GOVERNMENT_PROCUREMENT_RATIO
-            procurement_budget = max(tax_based_budget, GOVERNMENT_MIN_PROCUREMENT_BUDGET)
+            tax_based_budget = total_tax * self.procurement_ratio
+            procurement_budget = max(tax_based_budget, min_budget)
+            procurement_budget = min(procurement_budget, max_budget)
             self.logger.info(
                 f"政府采购预算: ${procurement_budget:,.2f} "
-                f"(税收=${total_tax:,.2f} × {GOVERNMENT_PROCUREMENT_RATIO:.0%}, 最低=${GOVERNMENT_MIN_PROCUREMENT_BUDGET:,.2f})"
+                f"(税收=${total_tax:,.2f} × {self.procurement_ratio:.0%}, 最低=${min_budget:,.2f})"
             )
         else:
             # 使用最低预算保障
-            procurement_budget = GOVERNMENT_MIN_PROCUREMENT_BUDGET
+            procurement_budget = min_budget
             self.logger.info(
                 f"政府采购预算: ${procurement_budget:,.2f} (使用最低保障预算)"
             )
@@ -808,7 +941,8 @@ class Government:
         self, 
         period: int,
         budget_override: Optional[float] = None,
-        household_consumption_budget: Optional[float] = None
+        household_consumption_budget: Optional[float] = None,
+        planned_demand_by_product: Optional[Dict[str, float]] = None
     ) -> Dict[str, Any]:
         """
         执行政府采购
@@ -880,19 +1014,46 @@ class Government:
                 "error": "no procurement weights"
             }
         
-        # 按行业分配预算并采购
+        # First clear the ex-ante SKU demand signal. Production planning has
+        # already used this demand, so execution should not strand it behind
+        # IO weights for sectors that have no modeled SKU inventory.
         total_spent = 0.0
         spent_by_industry = {}
         items_count = 0
-        industries_attempted = 0
+        planned_spent, planned_count, planned_by_industry = self._procure_planned_skus(
+            budget=budget,
+            period=period,
+            weights=weights,
+            planned_demand_by_product=planned_demand_by_product or {},
+        )
+        if planned_spent > 0.0:
+            total_spent += planned_spent
+            items_count += planned_count
+            for industry_code, spent in planned_by_industry.items():
+                spent_by_industry[str(industry_code)] = (
+                    spent_by_industry.get(str(industry_code), 0.0) + spent
+                )
+
+        remaining_budget = max(0.0, budget - total_spent)
+        available_industry_weights = self._available_procurement_industry_weights(
+            weights,
+            period=period,
+        )
+        weight_total = sum(weight for _, weight in available_industry_weights)
+        industries_attempted = len(available_industry_weights)
         industries_succeeded = 0
-        
-        for industry_code, weight in weights.items():
-            industry_budget = budget * weight
+        if planned_spent > 0.0:
+            industries_succeeded += len(planned_by_industry)
+
+        # Use remaining budget only where modeled inventory exists. Raw IO
+        # weights contain many sectors absent from the reduced simulation;
+        # without this reweighting most government demand silently vanishes.
+        for industry_code, weight in available_industry_weights:
+            if remaining_budget <= 0.0 or weight_total <= 0.0:
+                break
+            industry_budget = remaining_budget * (weight / weight_total)
             if industry_budget < 1.0:  # 最小采购金额
                 continue
-            
-            industries_attempted += 1
             
             # 尝试从该行业采购
             try:
@@ -902,7 +1063,7 @@ class Government:
                     period=period
                 )
                 if spent > 0:
-                    spent_by_industry[industry_code] = spent
+                    spent_by_industry[industry_code] = spent_by_industry.get(industry_code, 0.0) + spent
                     total_spent += spent
                     items_count += count
                     industries_succeeded += 1
@@ -924,8 +1085,405 @@ class Government:
             "total_spent": total_spent,
             "by_industry": spent_by_industry,
             "items_count": items_count,
+            "planned_items_count": sum(
+                1
+                for qty in (planned_demand_by_product or {}).values()
+                if self._safe_positive_float(qty) > 0.0
+            ),
             "success": True
         }
+
+    def plan_procurement_demand(
+        self,
+        period: int,
+        budget_override: Optional[float] = None,
+        household_consumption_budget: Optional[float] = None,
+        max_skus_per_industry: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Build an ex-ante product demand signal for government procurement.
+
+        This method is intentionally non-mutating: it does not reserve stock,
+        purchase inventory, or write ledger transactions. Actual procurement is
+        still performed by procure_goods_and_services after production.
+        """
+        if not hasattr(self, "product_market") or self.product_market is None:
+            return {
+                "budget": 0.0,
+                "total_planned_value": 0.0,
+                "total_planned_qty": 0.0,
+                "demand_by_product": {},
+                "by_industry": {},
+                "items_count": 0,
+                "success": False,
+                "error": "product_market not set",
+            }
+
+        if budget_override is not None:
+            budget = max(0.0, float(budget_override or 0.0))
+        else:
+            budget = self._compute_procurement_budget(
+                period=period,
+                household_consumption_budget=household_consumption_budget,
+            )
+        if budget <= 0.0:
+            return {
+                "budget": 0.0,
+                "total_planned_value": 0.0,
+                "total_planned_qty": 0.0,
+                "demand_by_product": {},
+                "by_industry": {},
+                "items_count": 0,
+                "success": True,
+            }
+
+        weights = self._get_government_procurement_weights()
+        if not weights:
+            return {
+                "budget": budget,
+                "total_planned_value": 0.0,
+                "total_planned_qty": 0.0,
+                "demand_by_product": {},
+                "by_industry": {},
+                "items_count": 0,
+                "success": False,
+                "error": "no procurement weights",
+            }
+
+        max_skus = max(1, int(max_skus_per_industry or 1))
+        demand_by_product: Dict[str, float] = defaultdict(float)
+        by_industry: Dict[str, Dict[str, Any]] = {}
+        total_planned_value = 0.0
+        total_planned_qty = 0.0
+        items_count = 0
+        industries_attempted = 0
+        industries_planned = 0
+
+        industry_candidates: List[Tuple[str, float, List[Any]]] = []
+        candidate_weight_total = 0.0
+        for industry_code, weight in self._iter_weighted_procurement_industries(weights):
+            industries_attempted += 1
+
+            candidates = self._get_procurement_candidate_skus(
+                str(industry_code),
+                period=period,
+                available_only=False,
+            )
+            candidates = self._select_procurement_plan_candidates(candidates, max_skus)
+            if not candidates:
+                continue
+            industry_candidates.append((str(industry_code), weight, candidates))
+            candidate_weight_total += weight
+
+        if candidate_weight_total <= 0.0:
+            return {
+                "budget": budget,
+                "total_planned_value": 0.0,
+                "total_planned_qty": 0.0,
+                "demand_by_product": {},
+                "by_industry": {},
+                "items_count": 0,
+                "industries_attempted": industries_attempted,
+                "industries_planned": 0,
+                "success": True,
+            }
+
+        for industry_code, weight, candidates in industry_candidates:
+            industry_budget = budget * (weight / candidate_weight_total)
+            if industry_budget < 1.0:
+                continue
+
+            per_sku_budget = industry_budget / len(candidates)
+            industry_value = 0.0
+            industry_qty = 0.0
+            industry_items = 0
+            for sku in candidates:
+                product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+                if not product_id:
+                    continue
+                unit_price = self._get_procurement_unit_price(sku)
+                if unit_price <= 0.0:
+                    continue
+
+                quantity = int(per_sku_budget / unit_price)
+                if quantity <= 0:
+                    continue
+
+                planned_value = float(quantity) * unit_price
+                product_key = str(product_id)
+                demand_by_product[product_key] += float(quantity)
+                industry_value += planned_value
+                industry_qty += float(quantity)
+                industry_items += 1
+
+            if industry_items <= 0:
+                continue
+
+            by_industry[str(industry_code)] = {
+                "budget": industry_budget,
+                "planned_value": industry_value,
+                "planned_qty": industry_qty,
+                "items_count": industry_items,
+            }
+            total_planned_value += industry_value
+            total_planned_qty += industry_qty
+            items_count += industry_items
+            industries_planned += 1
+
+        return {
+            "budget": budget,
+            "total_planned_value": total_planned_value,
+            "total_planned_qty": total_planned_qty,
+            "demand_by_product": dict(demand_by_product),
+            "by_industry": by_industry,
+            "items_count": items_count,
+            "industries_attempted": industries_attempted,
+            "industries_planned": industries_planned,
+            "success": True,
+        }
+
+    def _get_procurement_candidate_skus(
+        self,
+        industry_code: str,
+        period: int,
+        available_only: bool,
+    ) -> List[Any]:
+        io_to_name = _load_io_code_to_industry_name()
+        industry_name = io_to_name.get(str(industry_code), str(industry_code))
+
+        candidates: List[Any] = []
+        seen = set()
+        for lookup_key in (industry_name, str(industry_code)):
+            if not lookup_key:
+                continue
+            skus = None
+            if not available_only:
+                skus = self._call_product_market(
+                    "get_skus_by_industry",
+                    lookup_key,
+                    available_only=False,
+                )
+            if skus is None:
+                skus = self._call_product_market(
+                    "get_available_skus",
+                    industry=lookup_key,
+                    period=period,
+                )
+            for sku in skus or []:
+                product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+                if not product_id:
+                    continue
+                product_key = str(product_id)
+                if product_key in seen:
+                    continue
+                seen.add(product_key)
+                candidates.append(sku)
+
+        return candidates
+
+    def _select_procurement_plan_candidates(
+        self,
+        candidates: List[Any],
+        max_skus: int,
+    ) -> List[Any]:
+        valid = []
+        for sku in candidates or []:
+            product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+            unit_price = self._get_procurement_unit_price(sku)
+            if product_id and unit_price > 0.0:
+                valid.append(sku)
+        valid.sort(
+            key=lambda sku: (
+                -float(getattr(sku, "available_stock", 0.0) or getattr(sku, "quantity", 0.0) or 0.0),
+                str(getattr(sku, "product_id", None) or getattr(sku, "id", "")),
+            )
+        )
+        return valid[:max(1, int(max_skus or 1))]
+
+    def _get_procurement_unit_price(self, sku: Any) -> float:
+        for attr in ("manufacturer_price", "base_manufacturer_price", "price"):
+            try:
+                value = float(getattr(sku, attr, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0.0:
+                return value
+        return 0.0
+
+    @staticmethod
+    def _safe_positive_float(value: Any) -> float:
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _iter_weighted_procurement_industries(
+        self,
+        weights: Dict[str, float],
+    ) -> List[Tuple[str, float]]:
+        weighted_industries: List[Tuple[str, float]] = []
+        for industry_code, weight in (weights or {}).items():
+            try:
+                normalized_weight = max(0.0, float(weight or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if normalized_weight <= 0.0:
+                continue
+            weighted_industries.append((str(industry_code), normalized_weight))
+        return weighted_industries
+
+    def _available_procurement_industry_weights(
+        self,
+        weights: Dict[str, float],
+        period: int,
+    ) -> List[Tuple[str, float]]:
+        available: List[Tuple[str, float]] = []
+        for industry_code, weight in self._iter_weighted_procurement_industries(weights):
+            candidates = self._get_procurement_candidate_skus(
+                industry_code,
+                period=period,
+                available_only=True,
+            )
+            if candidates:
+                available.append((industry_code, weight))
+                continue
+
+            io_to_name = _load_io_code_to_industry_name()
+            industry_name = io_to_name.get(str(industry_code), str(industry_code))
+            services = self._call_product_market(
+                "get_available_services",
+                industry=industry_name,
+                period=period,
+            )
+            if services:
+                available.append((industry_code, weight))
+        return available
+
+    def _procure_planned_skus(
+        self,
+        budget: float,
+        period: int,
+        weights: Dict[str, float],
+        planned_demand_by_product: Dict[str, float],
+    ) -> Tuple[float, int, Dict[str, float]]:
+        if not planned_demand_by_product or budget <= 0.0:
+            return 0.0, 0, {}
+
+        planned_ids = {
+            str(product_id): self._safe_positive_float(qty)
+            for product_id, qty in planned_demand_by_product.items()
+            if product_id and self._safe_positive_float(qty) > 0.0
+        }
+        if not planned_ids:
+            return 0.0, 0, {}
+
+        planned_skus: List[Tuple[str, Any]] = []
+        seen_products = set()
+        for industry_code, _ in self._iter_weighted_procurement_industries(weights):
+            candidate_skus = self._get_procurement_candidate_skus(
+                industry_code,
+                period=period,
+                available_only=True,
+            )
+            for sku in candidate_skus:
+                product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+                if not product_id:
+                    continue
+                product_key = str(product_id)
+                if product_key not in planned_ids or product_key in seen_products:
+                    continue
+                seen_products.add(product_key)
+                planned_skus.append((industry_code, sku))
+
+        planned_skus.sort(
+            key=lambda item: (
+                -planned_ids.get(str(getattr(item[1], "product_id", None) or getattr(item[1], "id", "")), 0.0)
+                * self._get_procurement_unit_price(item[1]),
+                str(getattr(item[1], "product_id", None) or getattr(item[1], "id", "")),
+            )
+        )
+
+        total_spent = 0.0
+        items_purchased = 0
+        spent_by_industry: Dict[str, float] = defaultdict(float)
+        remaining_budget = max(0.0, float(budget or 0.0))
+        for industry_code, sku in planned_skus:
+            if remaining_budget <= 0.0:
+                break
+            product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+            planned_qty = planned_ids.get(str(product_id), 0.0)
+            if planned_qty <= 0.0:
+                continue
+            spent, count = self._purchase_procurement_sku(
+                sku=sku,
+                industry_code=industry_code,
+                period=period,
+                remaining_budget=remaining_budget,
+                desired_quantity=planned_qty,
+            )
+            if spent <= 0.0 or count <= 0:
+                continue
+            total_spent += spent
+            remaining_budget -= spent
+            items_purchased += count
+            spent_by_industry[str(industry_code)] += spent
+
+        return total_spent, items_purchased, dict(spent_by_industry)
+
+    def _procure_planned_skus_from_industry(
+        self,
+        industry_code: str,
+        budget: float,
+        period: int,
+        planned_demand_by_product: Dict[str, float],
+    ) -> Tuple[float, int]:
+        if not planned_demand_by_product or budget <= 0.0:
+            return 0.0, 0
+
+        candidate_skus = self._get_procurement_candidate_skus(
+            industry_code,
+            period=period,
+            available_only=True,
+        )
+        planned_ids = {
+            str(product_id): self._safe_positive_float(qty)
+            for product_id, qty in planned_demand_by_product.items()
+            if product_id and self._safe_positive_float(qty) > 0.0
+        }
+        if not planned_ids:
+            return 0.0, 0
+
+        planned_skus = []
+        for sku in candidate_skus:
+            product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+            if product_id and str(product_id) in planned_ids:
+                planned_skus.append(sku)
+        planned_skus.sort(key=lambda sku: str(getattr(sku, "product_id", None) or getattr(sku, "id", "")))
+
+        total_spent = 0.0
+        items_purchased = 0
+        remaining_budget = max(0.0, float(budget or 0.0))
+        for sku in planned_skus:
+            if remaining_budget <= 0.0:
+                break
+            product_id = getattr(sku, "product_id", None) or getattr(sku, "id", None)
+            planned_qty = planned_ids.get(str(product_id), 0.0)
+            if planned_qty <= 0.0:
+                continue
+            spent, count = self._purchase_procurement_sku(
+                sku=sku,
+                industry_code=industry_code,
+                period=period,
+                remaining_budget=remaining_budget,
+                desired_quantity=planned_qty,
+            )
+            if spent <= 0.0 or count <= 0:
+                continue
+            total_spent += spent
+            remaining_budget -= spent
+            items_purchased += count
+
+        return total_spent, items_purchased
     
     def _procure_from_industry(
         self,
@@ -984,62 +1542,81 @@ class Government:
         for sku in available_skus:
             if remaining_budget <= 0:
                 break
-            
-            # 获取SKU信息
-            unit_price = getattr(sku, 'manufacturer_price', None) or getattr(sku, 'price', 0)
-            available_stock = getattr(sku, 'available_stock', 0) or getattr(sku, 'quantity', 0)
-            product_id = getattr(sku, 'product_id', None) or getattr(sku, 'id', '')
-            product_name = getattr(sku, 'product_name', '') or getattr(sku, 'name', 'Unknown')
-            
-            if unit_price <= 0 or available_stock <= 0:
+
+            spent, count = self._purchase_procurement_sku(
+                sku=sku,
+                industry_code=industry_code,
+                period=period,
+                remaining_budget=remaining_budget,
+            )
+            if spent <= 0.0 or count <= 0:
                 continue
-            
-            # 计算可购买数量
-            max_affordable = int(remaining_budget / unit_price)
-            quantity_to_buy = min(max_affordable, int(available_stock))
-            
-            if quantity_to_buy <= 0:
-                continue
-            
-            purchase_cost = quantity_to_buy * unit_price
-            
-            # 确定卖方ID
-            receiver_id = getattr(sku, 'firm_id', None) or getattr(sku, 'seller_id', None)
-            if receiver_id is None:
-                # 尝试从产品市场获取
-                receiver_id = self._call_product_market(
-                    'get_seller_id', product_id
-                )
-            if receiver_id is None:
-                receiver_id = f"market_{industry_code}"
-            
-            # 执行采购交易（不含VAT）
-            try:
-                self._call_economic_center(
-                    "add_government_procurement_transaction",
-                    month=period,
-                    sender_id=self.government_id,
-                    receiver_id=receiver_id,
-                    amount=purchase_cost,
-                    product_id=product_id,
-                    quantity=quantity_to_buy,
-                    product_name=product_name,
-                    unit_price=unit_price,
-                    product_classification=industry_code,
-                    consume_inventory=True
-                )
-                
-                # 更新库存
-                self._call_product_market('update_stock', product_id, -quantity_to_buy)
-                
-                total_spent += purchase_cost
-                remaining_budget -= purchase_cost
-                items_purchased += 1
-                
-            except Exception as e:
-                self.logger.warning(
-                    f"政府采购交易失败 {product_id}: {e}"
-                )
-                continue
+            total_spent += spent
+            remaining_budget -= spent
+            items_purchased += count
         
         return total_spent, items_purchased
+
+    def _purchase_procurement_sku(
+        self,
+        sku: Any,
+        industry_code: str,
+        period: int,
+        remaining_budget: float,
+        desired_quantity: Optional[float] = None,
+    ) -> Tuple[float, int]:
+        unit_price = self._get_procurement_unit_price(sku)
+        available_stock = getattr(sku, "available_stock", 0) or getattr(sku, "quantity", 0)
+        product_id = getattr(sku, "product_id", None) or getattr(sku, "id", "")
+        product_name = getattr(sku, "product_name", "") or getattr(sku, "name", "Unknown")
+
+        try:
+            available_qty = int(float(available_stock or 0.0))
+        except (TypeError, ValueError):
+            available_qty = 0
+        if unit_price <= 0.0 or available_qty <= 0 or not product_id:
+            return 0.0, 0
+
+        max_affordable = int(float(remaining_budget or 0.0) / unit_price)
+        desired_cap = available_qty
+        if desired_quantity is not None:
+            desired_cap = min(desired_cap, int(max(0.0, float(desired_quantity or 0.0))))
+        quantity_to_buy = min(max_affordable, desired_cap)
+        if quantity_to_buy <= 0:
+            return 0.0, 0
+
+        stock_result = self._call_product_market(
+            "purchase_manufacturer_stock",
+            product_id,
+            quantity_to_buy,
+        ) or {}
+        actual_quantity = int(float(stock_result.get("actual_quantity", 0.0) or 0.0))
+        if actual_quantity <= 0:
+            return 0.0, 0
+
+        purchase_cost = actual_quantity * unit_price
+        receiver_id = getattr(sku, "firm_id", None) or getattr(sku, "seller_id", None)
+        if receiver_id is None:
+            receiver_id = self._call_product_market("get_seller_id", product_id)
+        if receiver_id is None:
+            receiver_id = f"market_{industry_code}"
+
+        try:
+            self._call_economic_center(
+                "add_government_procurement_transaction",
+                month=period,
+                sender_id=self.government_id,
+                receiver_id=receiver_id,
+                amount=purchase_cost,
+                product_id=product_id,
+                quantity=actual_quantity,
+                product_name=product_name,
+                unit_price=unit_price,
+                product_classification=industry_code,
+                consume_inventory=True,
+            )
+            return purchase_cost, 1
+        except Exception as e:
+            self._call_product_market("restore_manufacturer_stock", product_id, actual_quantity)
+            self.logger.warning(f"政府采购交易失败 {product_id}: {e}")
+            return 0.0, 0

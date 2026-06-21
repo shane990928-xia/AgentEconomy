@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import ray
 
@@ -34,10 +34,11 @@ class ConsumptionProgressTracker:
         self._step3_done = 0
         self._all_done = 0
         self._enabled = False
+        self._mode = "monthly"
         self._log_interval = 10  # 每完成 N 个家庭打印一次日志
         self._logger = None
     
-    def reset(self, total: int, log_interval: int = 10, logger_instance=None):
+    def reset(self, total: int, log_interval: int = 10, logger_instance=None, mode: str = "monthly"):
         """重置进度追踪器"""
         with self._lock:
             self._total = total
@@ -47,6 +48,7 @@ class ConsumptionProgressTracker:
             self._step3_done = 0
             self._all_done = 0
             self._enabled = True
+            self._mode = str(mode or "monthly")
             self._log_interval = max(1, log_interval)
             self._logger = logger_instance
     
@@ -65,6 +67,23 @@ class ConsumptionProgressTracker:
             self._logger.info(msg)
         else:
             print(msg)
+
+    def _label(self, step: str) -> str:
+        if self._mode in {"profile", "off"}:
+            labels = {
+                "step0": "Step0(预算约束)",
+                "step1": "Step1(品类分配)",
+                "step2": "Step2(候选商品)",
+                "step3": "Step3(购买计划)",
+            }
+            return labels.get(step, step)
+        labels = {
+            "step0": "Step0(预算分配)",
+            "step1": "Step1(需求分类)",
+            "step2": "Step2(向量搜索)",
+            "step3": "Step3(LLM决策)",
+        }
+        return labels.get(step, step)
     
     def step0_complete(self):
         """标记 step0 完成"""
@@ -73,7 +92,7 @@ class ConsumptionProgressTracker:
                 return
             self._step0_done += 1
             if self._should_log(self._step0_done):
-                self._log(f"[消费进度] Step0(预算分配): {self._step0_done}/{self._total}")
+                self._log(f"[消费进度] {self._label('step0')}: {self._step0_done}/{self._total}")
     
     def step1_complete(self):
         """标记 step1 完成"""
@@ -82,7 +101,7 @@ class ConsumptionProgressTracker:
                 return
             self._step1_done += 1
             if self._should_log(self._step1_done):
-                self._log(f"[消费进度] Step1(需求分类): {self._step1_done}/{self._total}")
+                self._log(f"[消费进度] {self._label('step1')}: {self._step1_done}/{self._total}")
     
     def step2_complete(self):
         """标记 step2 完成"""
@@ -91,7 +110,7 @@ class ConsumptionProgressTracker:
                 return
             self._step2_done += 1
             if self._should_log(self._step2_done):
-                self._log(f"[消费进度] Step2(向量搜索): {self._step2_done}/{self._total}")
+                self._log(f"[消费进度] {self._label('step2')}: {self._step2_done}/{self._total}")
     
     def step3_complete(self):
         """标记 step3 完成"""
@@ -100,7 +119,7 @@ class ConsumptionProgressTracker:
                 return
             self._step3_done += 1
             if self._should_log(self._step3_done):
-                self._log(f"[消费进度] Step3(LLM决策): {self._step3_done}/{self._total}")
+                self._log(f"[消费进度] {self._label('step3')}: {self._step3_done}/{self._total}")
     
     def all_complete(self):
         """标记全部完成"""
@@ -132,6 +151,7 @@ _JOB_SKILLS_CSV = Path(__file__).resolve().parents[1] / "data" / "jobs_with_skil
 from agenteconomy.center.Model import Job, JobApplication, LaborHour, Product
 from agenteconomy.llm.llm import call_llm
 from agenteconomy.llm.prompt_template import (
+    CONSUMPTION_PROFILE_PROMPT,
     CONSUMPTION_MAJOR_BUDGET_PROMPT,
     CONSUMPTION_NEEDS_BY_CATEGORY_PROMPT,
     PURCHASE_BY_CATEGORY_PROMPT,
@@ -139,6 +159,10 @@ from agenteconomy.llm.prompt_template import (
     JOB_APPLICATION_DECISION_PROMPT,
     JOB_OFFER_DECISION_PROMPT,
     PERSONA_UPDATE_PROMPT,
+)
+from agenteconomy.agent.household_consumption_policy import (
+    build_constrained_llm_consumption_plan,
+    build_rule_based_consumption_plan,
 )
 from agenteconomy.utils.logger import get_logger
 
@@ -424,6 +448,8 @@ class Household:
         
         # 上月实际消费（用于消费惯性计算）
         self._last_month_consumption: float = 0.0
+        self._consumption_profile_params: Optional[Dict[str, Any]] = None
+        self._consumption_profile_last_month: Optional[int] = None
 
     @classmethod
     def _normalize_census_code_4(cls, code: Any) -> Optional[str]:
@@ -1663,6 +1689,175 @@ class Household:
             except Exception:
                 return {}  # 解析失败返回空字典
 
+    @staticmethod
+    def _clamp_unit(value: Any, default: float = 0.5) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            out = float(default)
+        if out > 1.0 and out <= 100.0:
+            out = out / 100.0
+        return max(0.0, min(1.0, out))
+
+    @staticmethod
+    def _clamp_signed_unit(value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            out = float(default)
+        if abs(out) > 1.0 and abs(out) <= 100.0:
+            out = out / 100.0
+        return max(-1.0, min(1.0, out))
+
+    def _heuristic_consumption_profile_params(
+        self,
+        *,
+        macro_indicators: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        persona_text = json.dumps(self.get_persona_prompt_view(), ensure_ascii=False).lower()
+        csv_values = self.csv_values or {}
+        monthly_income = self._as_float(csv_values.get("ER85629"))
+        available_cash = self._as_float(csv_values.get("ER85692"))
+        historical_spend = self._as_float(csv_values.get("ER85768"))
+        household_size = max(1.0, self._as_float(csv_values.get("ER82017")) or 1.0)
+        basic_floor = 1000.0 + 450.0 * max(0.0, household_size - 1.0)
+        macro = macro_indicators or {}
+
+        price_sensitivity = 0.50
+        liquidity_preference = 0.50
+        habit_strength = 0.35
+        essential_bias = 0.0
+
+        if monthly_income > 0.0 and monthly_income < basic_floor * 1.6:
+            price_sensitivity += 0.18
+            liquidity_preference += 0.12
+            essential_bias += 0.22
+        if available_cash < max(basic_floor * 2.0, monthly_income):
+            price_sensitivity += 0.12
+            liquidity_preference += 0.18
+        if historical_spend > 0.0:
+            habit_strength += 0.08
+        if household_size >= 3.0:
+            essential_bias += 0.12
+
+        if any(word in persona_text for word in ("frugal", "budget", "careful", "conservative", "low income")):
+            price_sensitivity += 0.18
+            liquidity_preference += 0.12
+        if any(word in persona_text for word in ("affluent", "wealthy", "luxury", "professional", "high income")):
+            price_sensitivity -= 0.16
+            liquidity_preference -= 0.08
+            essential_bias -= 0.12
+        if any(word in persona_text for word in ("retired", "elderly", "medical", "health")):
+            liquidity_preference += 0.10
+            habit_strength += 0.10
+            essential_bias += 0.12
+        if any(word in persona_text for word in ("young", "student", "mobile", "flexible")):
+            habit_strength -= 0.08
+
+        if float(macro.get("inflation_rate") or 0.0) > 0.02:
+            price_sensitivity += 0.08
+            essential_bias += 0.08
+        if float(macro.get("unemployment_rate") or 0.0) > 0.10:
+            liquidity_preference += 0.10
+
+        return {
+            "price_sensitivity": round(self._clamp_unit(price_sensitivity), 4),
+            "liquidity_preference": round(self._clamp_unit(liquidity_preference), 4),
+            "habit_strength": round(self._clamp_unit(habit_strength, 0.35), 4),
+            "essential_bias": round(self._clamp_signed_unit(essential_bias), 4),
+            "strategy_type": "heuristic_profile",
+            "explanation": "Heuristic profile inferred from household state and persona.",
+            "profile_source": "heuristic",
+        }
+
+    def _normalize_consumption_profile_params(
+        self,
+        raw: Any,
+        *,
+        fallback: Mapping[str, Any],
+        source: str,
+    ) -> Dict[str, Any]:
+        parsed = raw if isinstance(raw, Mapping) else {}
+        return {
+            "price_sensitivity": round(
+                self._clamp_unit(parsed.get("price_sensitivity"), fallback.get("price_sensitivity", 0.5)),
+                4,
+            ),
+            "liquidity_preference": round(
+                self._clamp_unit(parsed.get("liquidity_preference"), fallback.get("liquidity_preference", 0.5)),
+                4,
+            ),
+            "habit_strength": round(
+                self._clamp_unit(parsed.get("habit_strength"), fallback.get("habit_strength", 0.35)),
+                4,
+            ),
+            "essential_bias": round(
+                self._clamp_signed_unit(parsed.get("essential_bias"), fallback.get("essential_bias", 0.0)),
+                4,
+            ),
+            "strategy_type": str(parsed.get("strategy_type") or fallback.get("strategy_type") or "consumption_profile"),
+            "explanation": str(parsed.get("explanation") or fallback.get("explanation") or ""),
+            "profile_source": source,
+        }
+
+    def _consumption_profile_is_fresh(self, *, current_month: Optional[int], refresh_months: int) -> bool:
+        if self._consumption_profile_params is None:
+            return False
+        if refresh_months <= 0:
+            return True
+        if current_month is None or self._consumption_profile_last_month is None:
+            return True
+        return int(current_month) - int(self._consumption_profile_last_month) < int(refresh_months)
+
+    async def get_consumption_profile_params(
+        self,
+        *,
+        macro_indicators: Optional[Dict[str, Any]] = None,
+        current_month: Optional[int] = None,
+        refresh_months: int = 12,
+        use_llm: bool = True,
+    ) -> Dict[str, Any]:
+        refresh = max(0, int(refresh_months or 0))
+        if self._consumption_profile_is_fresh(current_month=current_month, refresh_months=refresh):
+            return dict(self._consumption_profile_params or {})
+
+        fallback = self._heuristic_consumption_profile_params(macro_indicators=macro_indicators)
+        profile = dict(fallback)
+        if use_llm:
+            household_state = {
+                "available_cash": self.csv_values.get("ER85692"),
+                "monthly_income": self.csv_values.get("ER85629"),
+                "historical_monthly_expenditure": self.csv_values.get("ER85768"),
+                "household_size": self.csv_values.get("ER82017"),
+                "last_month_consumption": self._last_month_consumption,
+            }
+            prompt = CONSUMPTION_PROFILE_PROMPT.format(
+                persona=json.dumps(self.get_persona_prompt_view(), ensure_ascii=False),
+                household_state=json.dumps(household_state, ensure_ascii=False),
+                macro_indicators=json.dumps(macro_indicators or {}, ensure_ascii=False),
+            )
+            try:
+                raw = await self._llm_chat(
+                    system="Return strict JSON only.",
+                    user=prompt,
+                    temperature=0.2,
+                    timeout=60.0,
+                )
+                parsed = self._json_loads_loose(raw)
+                if isinstance(parsed, Mapping) and parsed:
+                    profile = self._normalize_consumption_profile_params(
+                        parsed,
+                        fallback=fallback,
+                        source="llm",
+                    )
+            except Exception as exc:
+                logger.warning(f"[消费画像] {self.household_id} LLM画像生成失败，使用启发式画像: {exc}")
+
+        profile["profile_month"] = current_month
+        self._consumption_profile_params = dict(profile)
+        self._consumption_profile_last_month = int(current_month or 0)
+        return dict(profile)
+
     # -------------------------------------------------------------------------
     # Consumption decision (NEW workflow): step1-4
     # -------------------------------------------------------------------------
@@ -1675,12 +1870,23 @@ class Household:
         available_balance: Optional[float] = None,
         expected_income: Optional[float] = None,
         available_budget: Optional[float] = None,
+        anchor_category_plans: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> CategoryNeedsOutput:
         """
         Step1 (default LLM):
         For each category name, allocate a budget and provide multiple need descriptions.
         """
         cats = categories or self.consumption_categories
+        empirical_category_anchors = [
+            {
+                "category": str(plan.get("category") or ""),
+                "budget_amount": float(plan.get("budget_amount") or 0.0),
+                "need_descriptions": list(plan.get("need_descriptions") or []),
+                "need_tier": str(plan.get("need_tier") or ""),
+            }
+            for plan in (anchor_category_plans or [])
+            if isinstance(plan, Mapping)
+        ]
 
         llm_start = time.perf_counter()
         prompt = CONSUMPTION_NEEDS_BY_CATEGORY_PROMPT.format(
@@ -1691,6 +1897,7 @@ class Household:
             available_balance=json.dumps(available_balance, ensure_ascii=False),
             expected_income=json.dumps(expected_income, ensure_ascii=False),
             available_budget=json.dumps(available_budget, ensure_ascii=False),
+            empirical_category_anchors=json.dumps(empirical_category_anchors, ensure_ascii=False),
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         llm_elapsed = time.perf_counter() - llm_start
@@ -1746,6 +1953,9 @@ class Household:
         expected_income: Optional[float] = None,
         available_budget: Optional[float] = None,
         macro_indicators: Optional[Dict[str, Any]] = None,
+        anchor_budget: Optional[float] = None,
+        anchor_budgets: Optional[Mapping[str, Any]] = None,
+        empirical_diagnostics: Optional[Mapping[str, Any]] = None,
     ) -> MajorBudgetOutput:
         """
         Step0 (default LLM):
@@ -1768,6 +1978,12 @@ class Household:
 - unemployment_rate: {macro.get("unemployment_rate", 0.0):.2%}
 - interest_rate: {macro.get("interest_rate", 0.0):.2%} (monthly)
 - price_index: {macro.get("price_index", 100.0):.1f} (base=100)"""
+        empirical_constraints = {
+            "anchor_total_budget": float(anchor_budget or 0.0),
+            "anchor_major_budgets": dict(anchor_budgets or {}),
+            "diagnostics": dict(empirical_diagnostics or {}),
+            "hard_rule": "The downstream validator will use these empirical anchors as the binding budget envelope.",
+        }
 
         # 获取上月消费和历史支出
         last_consumption = float(self._last_month_consumption or 0.0)
@@ -1785,10 +2001,11 @@ class Household:
             last_month_consumption=f"${last_consumption:,.2f}" if last_consumption > 0 else "N/A (first month)",
             historical_expenditure=f"${historical_exp:,.2f}" if historical_exp > 0 else "N/A",
             macro_indicators=macro_text,
+            empirical_constraints=json.dumps(empirical_constraints, ensure_ascii=False),
         )
         raw = await self._llm_chat(system="Return strict JSON only.", user=prompt, temperature=0.2)
         parsed = self._json_loads_loose(raw)
-        total_budget = float(parsed.get("total_budget") or 0.0)
+        total_budget = float(parsed.get("total_budget") or anchor_budget or 0.0)
         budgets = dict(parsed.get("budgets") or {})
 
         # Ensure required keys exist and normalize sums to total_budget
@@ -1800,7 +2017,7 @@ class Household:
             "utilities",
             "insurance",
         ]
-        norm: Dict[str, float] = {k: float(budgets.get(k) or 0.0) for k in keys}
+        norm: Dict[str, float] = {k: float(budgets.get(k) or (anchor_budgets or {}).get(k) or 0.0) for k in keys}
         s = sum(max(0.0, v) for v in norm.values())
         if total_budget >= 0:
             if s <= 0:
@@ -1828,6 +2045,7 @@ class Household:
         category_plans: List[CategoryPlan],
         top_k: int = 10,
         product_market=None,
+        merge_need_queries: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Sync helper for step2 vector search."""
         out: Dict[str, Dict[str, Any]] = {}
@@ -1846,8 +2064,12 @@ class Household:
         for cp in category_plans:
             cat = cp.category
             need_descs = list(cp.need_descriptions or [])
+            if merge_need_queries and need_descs:
+                need_descs = ["; ".join(str(desc) for desc in need_descs if str(desc).strip())]
             for desc in need_descs:
                 query = f"{cat}: {desc}"
+                if not os.getenv("MODEL_PATH"):
+                    query = f"{query} household:{self.household_id}"
                 if is_actor:
                     future = search_method.remote(query, top_k=int(top_k))
                     all_futures.append((cat, desc, future))
@@ -1923,6 +2145,7 @@ class Household:
         category_plans: List[CategoryPlan],
         top_k: int = 10,
         product_market=None,
+        merge_need_queries: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Step2:
@@ -1934,6 +2157,7 @@ class Household:
             category_plans=category_plans,
             top_k=top_k,
             product_market=product_market,
+            merge_need_queries=merge_need_queries,
         )
 
     async def consumption_step3_purchase_llm(
@@ -1994,7 +2218,7 @@ class Household:
                 simplified_candidates.append({
                     "product_id": c.get("product_id"),
                     "name": name,
-                    "price": c.get("price"),
+                    "price": c.get("current_price") or c.get("price"),
                 })
 
             categories_data.append({
@@ -2213,6 +2437,169 @@ class Household:
             "is_fallback": True,
         }
 
+    def _build_rule_consumption_state(
+        self,
+        *,
+        available_balance: Optional[float],
+        expected_income: Optional[float],
+        available_budget: Optional[float],
+        macro_indicators: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        csv_values = self.csv_values or {}
+        return {
+            "available_balance": available_balance,
+            "available_budget": available_budget,
+            "expected_income": expected_income,
+            "ER85629": csv_values.get("ER85629"),
+            "ER85692": csv_values.get("ER85692"),
+            "ER85768": csv_values.get("ER85768"),
+            "ER82017": csv_values.get("ER82017"),
+            "historical_monthly_expenditure": csv_values.get("ER85768"),
+            "last_month_consumption": self._last_month_consumption,
+            "macro_indicators": dict(macro_indicators or {}),
+            "persona": self.persona if isinstance(self.persona, dict) else {},
+        }
+
+    @staticmethod
+    def _candidate_bundles_from_input(
+        candidate_products_by_category: Optional[Any],
+        category_plans: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(candidate_products_by_category, Mapping):
+            return {}
+        plan_by_category = {str(p.get("category")): p for p in category_plans or []}
+        bundles: Dict[str, Dict[str, Any]] = {}
+        for category, payload in candidate_products_by_category.items():
+            plan = plan_by_category.get(str(category), {})
+            if isinstance(payload, Mapping) and "candidates" in payload:
+                candidates = list(payload.get("candidates") or [])
+            elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+                candidates = list(payload)
+            else:
+                candidates = []
+            bundles[str(category)] = {
+                "category": str(category),
+                "budget_amount": float(plan.get("budget_amount") or 0.0),
+                "need_descriptions": list(plan.get("need_descriptions") or []),
+                "candidates": candidates,
+            }
+        return bundles
+
+    def _rule_consumption_categories(self, candidate_products_by_category: Optional[Any]) -> List[str]:
+        categories = list(self.consumption_categories)
+        if isinstance(candidate_products_by_category, Mapping):
+            for category in candidate_products_by_category.keys():
+                cat = str(category)
+                if cat and cat not in categories:
+                    categories.append(cat)
+        return categories
+
+    async def consume_rule_based(
+        self,
+        *,
+        top_k: int = 10,
+        product_market=None,
+        available_balance: Optional[float] = None,
+        expected_income: Optional[float] = None,
+        available_budget: Optional[float] = None,
+        macro_indicators: Optional[Dict[str, Any]] = None,
+        candidate_products_by_category: Optional[Any] = None,
+        persona_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        LLM-free consumption path.
+        Returns the same high-level step structure as consume_v2, with policy
+        diagnostics and product preferences included for downstream execution.
+        """
+        avail_balance = None if available_balance is None else float(available_balance)
+        exp_income = None if expected_income is None else float(expected_income)
+        avail_budget = available_budget
+        if avail_budget is None:
+            if avail_balance is not None:
+                avail_budget = float(avail_balance)
+            else:
+                avail_budget = self._as_float(self.csv_values.get("ER85692"))
+        avail_budget = max(0.0, float(avail_budget or 0.0))
+
+        state = self._build_rule_consumption_state(
+            available_balance=avail_balance,
+            expected_income=exp_income,
+            available_budget=avail_budget,
+            macro_indicators=macro_indicators,
+        )
+        policy_categories = self._rule_consumption_categories(candidate_products_by_category)
+        policy = build_rule_based_consumption_plan(
+            household_state=state,
+            available_budget=avail_budget,
+            expected_income=exp_income,
+            candidate_products_by_category=candidate_products_by_category,
+            persona_params=persona_params,
+            categories=policy_categories,
+        )
+        step2_bundles = self._candidate_bundles_from_input(
+            candidate_products_by_category,
+            policy.category_plans,
+        )
+
+        market = product_market or self.product_market
+        if candidate_products_by_category is None and market is not None:
+            category_plan_objs = [
+                CategoryPlan(
+                    category=str(plan.get("category")),
+                    budget_amount=float(plan.get("budget_amount") or 0.0),
+                    need_descriptions=list(plan.get("need_descriptions") or []),
+                )
+                for plan in policy.category_plans
+            ]
+            step2_bundles = await self.consumption_step2_vector_match(
+                category_plans=category_plan_objs,
+                top_k=top_k,
+                product_market=market,
+                merge_need_queries=True,
+            )
+            policy = build_rule_based_consumption_plan(
+                household_state=state,
+                available_budget=avail_budget,
+                expected_income=exp_income,
+                candidate_products_by_category=step2_bundles,
+                persona_params=persona_params,
+                categories=policy_categories,
+            )
+
+        consumption_progress.step0_complete()
+        consumption_progress.step1_complete()
+        consumption_progress.step2_complete()
+        consumption_progress.step3_complete()
+        consumption_progress.all_complete()
+
+        policy_dict = policy.to_dict()
+        retail_budget = float(policy.major_budgets.get("Retail merchandise") or 0.0)
+        return {
+            "step0": {
+                "total_budget": policy.total_budget,
+                "budgets": policy.major_budgets,
+                "note": "rule_based_policy",
+                "available_balance": avail_balance,
+                "expected_income": exp_income,
+                "available_budget": avail_budget,
+                "target_cash_buffer": policy.target_cash_buffer,
+                "reserved_cash": policy.reserved_cash,
+            },
+            "step1": {
+                "total_budget": retail_budget,
+                "category_plans": policy.category_plans,
+                "note": "rule_based_policy",
+            },
+            "step2": {"category_bundles": step2_bundles},
+            "step3": {
+                "purchases": policy.purchases,
+                "product_preferences": policy.product_preferences,
+                "note": "rule_based_policy",
+            },
+            "policy_diagnostics": policy_dict.get("diagnostics", {}),
+            "is_rule_based": True,
+        }
+
     async def consume_v2(
         self,
         *,
@@ -2222,6 +2609,12 @@ class Household:
         expected_income: Optional[float] = None,
         available_budget: Optional[float] = None,
         macro_indicators: Optional[Dict[str, Any]] = None,
+        use_llm: bool = True,
+        llm_mode: str = "monthly",
+        current_month: Optional[int] = None,
+        profile_refresh_months: int = 12,
+        candidate_products_by_category: Optional[Any] = None,
+        persona_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         New end-to-end consumption flow (step0-4).
@@ -2239,88 +2632,205 @@ class Household:
                 - interest_rate: Monthly interest rate on savings
                 - tax_rate: Effective tax rate
                 - price_index: Current price index (base=100)
+            use_llm: If False, run the deterministic rule-based consumption policy.
+            llm_mode: "monthly" runs the full Step0/Step1/Step3 LLM path;
+                "profile" uses LLM only for a cached preference profile and
+                applies the monthly constrained rule policy; "off" is rules only.
+            current_month: Economic month used for profile refresh decisions.
+            profile_refresh_months: Minimum months between profile LLM refreshes.
+            candidate_products_by_category: Optional precomputed candidate summary for rule mode.
+            persona_params: Optional rule knobs such as price_sensitivity,
+                liquidity_preference, and habit_strength.
         """
+        mode = str(llm_mode or "monthly").strip().lower()
+        if mode in {"false", "none", "rule", "rules", "rule_based"}:
+            mode = "off"
+        if mode in {"full", "llm", "step", "steps"}:
+            mode = "monthly"
+
+        if not use_llm or mode == "off":
+            return await self.consume_rule_based(
+                top_k=top_k,
+                product_market=product_market,
+                available_balance=available_balance,
+                expected_income=expected_income,
+                available_budget=available_budget,
+                macro_indicators=macro_indicators,
+                candidate_products_by_category=candidate_products_by_category,
+                persona_params=persona_params,
+            )
+
+        if mode in {"profile", "profile_rule", "cached_profile", "hybrid"}:
+            profile_params = dict(persona_params or {})
+            generated_profile = await self.get_consumption_profile_params(
+                macro_indicators=macro_indicators,
+                current_month=current_month,
+                refresh_months=profile_refresh_months,
+                use_llm=True,
+            )
+            profile_params.update(generated_profile)
+            result = await self.consume_rule_based(
+                top_k=top_k,
+                product_market=product_market,
+                available_balance=available_balance,
+                expected_income=expected_income,
+                available_budget=available_budget,
+                macro_indicators=macro_indicators,
+                candidate_products_by_category=candidate_products_by_category,
+                persona_params=profile_params,
+            )
+            diagnostics = dict(result.get("policy_diagnostics") or {})
+            diagnostics.update(
+                {
+                    "policy_mode": "llm_profile_constrained",
+                    "consumption_llm_mode": "profile",
+                    "consumption_profile": generated_profile,
+                }
+            )
+            result["policy_diagnostics"] = diagnostics
+            result["is_llm_consumption"] = True
+            result["is_rule_based"] = False
+            result["is_profile_consumption"] = True
+            result["step0"]["note"] = "llm_profile_constrained_policy"
+            result["step1"]["note"] = "llm_profile_constrained_policy"
+            result["step3"]["note"] = "llm_profile_constrained_policy"
+            return result
 
         avail_balance = None if available_balance is None else float(available_balance)
         exp_income = None if expected_income is None else float(expected_income)
         avail_budget = available_budget
         if avail_budget is None:
             if avail_balance is not None:
-                base = float(avail_balance)
-                if exp_income is not None and exp_income > 0.0:
-                    base += float(exp_income)
-                avail_budget = base
+                avail_budget = float(avail_balance)
         if avail_budget is not None:
             avail_budget = max(0.0, float(avail_budget))
+
+        state = self._build_rule_consumption_state(
+            available_balance=avail_balance,
+            expected_income=exp_income,
+            available_budget=avail_budget,
+            macro_indicators=macro_indicators,
+        )
+        policy_categories = self._rule_consumption_categories(candidate_products_by_category)
+        anchor_policy = build_rule_based_consumption_plan(
+            household_state=state,
+            available_budget=avail_budget,
+            expected_income=exp_income,
+            candidate_products_by_category=candidate_products_by_category,
+            persona_params=persona_params,
+            categories=policy_categories,
+        )
+        anchor_major_budgets = dict(anchor_policy.major_budgets)
 
         step0 = await self.consumption_step0_major_budget_allocation(
             available_balance=avail_balance,
             expected_income=exp_income,
             available_budget=avail_budget,
             macro_indicators=macro_indicators,
+            anchor_budget=anchor_policy.total_budget,
+            anchor_budgets=anchor_major_budgets,
+            empirical_diagnostics=anchor_policy.diagnostics,
         )
-        
-        # 基本安全检查：确保不超过可用余额
-        # LLM 已经被提示考虑合理预算，这里只做最基本的约束
-        max_spendable = float(avail_balance or 0.0)
-        if max_spendable > 0 and step0.total_budget > max_spendable:
-            # 超过可用余额，按比例缩减
-            scale = max_spendable / float(step0.total_budget)
-            step0.budgets = {k: float(v) * scale for k, v in (step0.budgets or {}).items()}
-            step0.total_budget = float(max_spendable)
-            step0.note = f"{step0.note or ''} (capped to available balance)"
-        
-        # 最低保障：确保至少有基本生活费（如果储蓄允许）
-        MINIMUM_BUDGET = 1500.0
-        if step0.total_budget < MINIMUM_BUDGET and max_spendable >= MINIMUM_BUDGET:
-            # LLM 给的预算太低，提升到最低标准
-            step0.total_budget = MINIMUM_BUDGET
-            # 按原比例分配，如果没有比例则均分
-            if sum(step0.budgets.values()) > 0:
-                scale = MINIMUM_BUDGET / sum(step0.budgets.values())
-                step0.budgets = {k: float(v) * scale for k, v in step0.budgets.items()}
-            else:
-                per = MINIMUM_BUDGET / 6.0
-                step0.budgets = {k: per for k in step0.budgets.keys()}
-            step0.note = f"{step0.note or ''} (raised to minimum)"
-        
         consumption_progress.step0_complete()
-        
-        retail_budget = float((step0.budgets or {}).get("Retail merchandise") or 0.0)
+
+        constrained_major_budgets = build_constrained_llm_consumption_plan(
+            household_state=state,
+            available_budget=avail_budget,
+            expected_income=exp_income,
+            candidate_products_by_category=candidate_products_by_category,
+            persona_params=persona_params,
+            categories=policy_categories,
+            llm_major_budgets=step0.budgets,
+            llm_category_plans=None,
+            llm_purchases_by_category=None,
+            llm_note=step0.note,
+        )
+        retail_budget = float(constrained_major_budgets.major_budgets.get("Retail merchandise") or 0.0)
         step1 = await self.consumption_step1_needs_by_category(
             total_budget=retail_budget,
+            categories=policy_categories,
             available_balance=avail_balance,
             expected_income=exp_income,
             available_budget=avail_budget,
+            anchor_category_plans=anchor_policy.category_plans,
         )
         consumption_progress.step1_complete()
-        
-        step2 = await self.consumption_step2_vector_match(
-            category_plans=step1.category_plans, top_k=top_k, product_market=product_market
-        )
+
+        if candidate_products_by_category is None:
+            step2 = await self.consumption_step2_vector_match(
+                category_plans=step1.category_plans,
+                top_k=top_k,
+                product_market=product_market,
+                merge_need_queries=True,
+            )
+        else:
+            step2 = self._candidate_bundles_from_input(
+                candidate_products_by_category,
+                [cp.__dict__ for cp in step1.category_plans],
+            )
         consumption_progress.step2_complete()
-        
+
         step3 = await self.consumption_step3_purchase_llm(category_bundles=step2)
         consumption_progress.step3_complete()
-        # _ = self.consumption_step4_validate(step1, step2, step3)
+
+        llm_purchases_by_category: Dict[str, List[Dict[str, Any]]] = {}
+        for purchase in step3.purchases:
+            if hasattr(purchase, "__dict__"):
+                rec = dict(purchase.__dict__)
+            else:
+                rec = dict(purchase)
+            category = str(rec.get("category") or "")
+            if category:
+                llm_purchases_by_category.setdefault(category, []).append(
+                    {
+                        "product_id": rec.get("product_id"),
+                        "budget_share": (
+                            float(rec.get("allocated_budget") or 0.0)
+                            / max(float((step2.get(category) or {}).get("budget_amount") or 0.0), 1e-9)
+                        ),
+                        "reason": rec.get("reason"),
+                    }
+                )
+
+        constrained_policy = build_constrained_llm_consumption_plan(
+            household_state=state,
+            available_budget=avail_budget,
+            expected_income=exp_income,
+            candidate_products_by_category=step2,
+            persona_params=persona_params,
+            categories=policy_categories,
+            llm_major_budgets=step0.budgets,
+            llm_category_plans=[cp.__dict__ for cp in step1.category_plans],
+            llm_purchases_by_category=llm_purchases_by_category,
+            llm_note=" | ".join([step0.note or "", step1.note or "", step3.note or ""]).strip(" |"),
+        )
 
         consumption_progress.all_complete()
         return {
             "step0": {
-                "total_budget": step0.total_budget,
-                "budgets": step0.budgets,
+                "total_budget": constrained_policy.total_budget,
+                "budgets": constrained_policy.major_budgets,
                 "note": step0.note,
                 "available_balance": avail_balance,
                 "expected_income": exp_income,
                 "available_budget": avail_budget,
+                "target_cash_buffer": constrained_policy.target_cash_buffer,
+                "reserved_cash": constrained_policy.reserved_cash,
             },
             "step1": {
-                "total_budget": step1.total_budget,
-                "category_plans": [cp.__dict__ for cp in step1.category_plans],
+                "total_budget": float(constrained_policy.major_budgets.get("Retail merchandise") or 0.0),
+                "category_plans": constrained_policy.category_plans,
                 "note": step1.note,
             },
             "step2": {"category_bundles": step2},
-            "step3": {"purchases": [p.__dict__ for p in step3.purchases], "note": step3.note},
+            "step3": {
+                "purchases": constrained_policy.purchases,
+                "product_preferences": constrained_policy.product_preferences,
+                "note": step3.note,
+            },
+            "policy_diagnostics": constrained_policy.diagnostics,
+            "is_llm_consumption": True,
+            "is_rule_based": False,
         }
 
     # -------------------------------------------------------------------------
@@ -2383,7 +2893,12 @@ class Household:
                 continue
             if int(getattr(job, "positions_available", 0) or 0) <= 0:
                 continue
-            matches.append(JobMatch(job=job, loss=0.0))
+            loss_floor = getattr(job, "matching_loss_floor", None)
+            try:
+                loss = max(0.0, float(loss_floor)) if loss_floor is not None else 0.0
+            except (TypeError, ValueError):
+                loss = 0.0
+            matches.append(JobMatch(job=job, loss=loss))
         return matches[: max(1, int(top_k))]
 
     async def decide_job_applications(

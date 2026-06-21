@@ -39,6 +39,46 @@ class LaborMarket:
     def _worker_key(self, household_id: str, lh_type: str) -> Tuple[str, str]:
         return (household_id, lh_type)
 
+    def _is_government_firm(self, firm_id: Optional[str]) -> bool:
+        return str(firm_id or "").startswith("gov_")
+
+    def _is_public_employment_job(self, job: Optional[Job]) -> bool:
+        if job is None:
+            return False
+        if not self._is_government_firm(getattr(job, "firm_id", None)):
+            return False
+        job_id = str(getattr(job, "job_id", "") or "")
+        return job_id.startswith("pub_") or bool(getattr(job, "is_public_employment", False))
+
+    def _is_private_job(self, job: Optional[Job]) -> bool:
+        return job is not None and not self._is_government_firm(getattr(job, "firm_id", None))
+
+    def _is_public_employment_offer(self, offer: Optional[Dict[str, Any]]) -> bool:
+        if not offer:
+            return False
+        job = self._get_job_by_id(str(offer.get("job_id") or ""))
+        if job is not None:
+            return self._is_public_employment_job(job)
+        job_id = str(offer.get("job_id") or "")
+        return job_id.startswith("pub_") and self._is_government_firm(offer.get("firm_id"))
+
+    def _current_job_for_worker(self, household_id: str, lh_type: str) -> Optional[Job]:
+        for matched_job in self.matched_jobs:
+            if matched_job.household_id == household_id and matched_job.lh_type == lh_type:
+                return matched_job.job
+        return None
+
+    def _is_public_worker_available_for_job(
+        self,
+        household_id: str,
+        lh_type: str,
+        job: Optional[Job],
+    ) -> bool:
+        if not self._is_private_job(job):
+            return False
+        current_job = self._current_job_for_worker(household_id, lh_type)
+        return self._is_public_employment_job(current_job)
+
     def _register_labor_hour(self, labor_hour: LaborHour) -> None:
         key = self._worker_key(labor_hour.agent_id, labor_hour.lh_type)
         if key in self.labor_index:
@@ -70,14 +110,21 @@ class LaborMarket:
 
     def get_labor_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
         snapshot: Dict[str, Dict[str, Any]] = {}
+        matched_by_worker: Dict[Tuple[str, str], MatchedJob] = {
+            self._worker_key(mj.household_id, mj.lh_type): mj for mj in self.matched_jobs
+        }
         for labor_hour in self.labor_hours:
             household_id = labor_hour.agent_id
             entry = snapshot.setdefault(household_id, {})
+            matched_job = matched_by_worker.get(self._worker_key(household_id, labor_hour.lh_type))
+            job = matched_job.job if matched_job else None
             entry[labor_hour.lh_type] = {
                 "employed": (not labor_hour.is_valid) and (labor_hour.firm_id is not None),
                 "firm_id": labor_hour.firm_id,
                 "job_SOC": labor_hour.job_SOC,
                 "job_title": labor_hour.job_title,
+                "job_id": getattr(job, "job_id", None) if job is not None else None,
+                "public_employment": self._is_public_employment_job(job),
             }
         return snapshot
 
@@ -99,18 +146,47 @@ class LaborMarket:
             )
         return matched
 
-    def _is_worker_available(self, household_id: str, lh_type: str) -> bool:
+    def _is_worker_available(
+        self,
+        household_id: str,
+        lh_type: str,
+        job: Optional[Job] = None,
+    ) -> bool:
         key = self._worker_key(household_id, lh_type)
         if key in self.matched_workers:
-            return False
+            return self._is_public_worker_available_for_job(household_id, lh_type, job)
         labor_hour = self.labor_index.get(key)
         if labor_hour is None:
             return True
         if not labor_hour.is_valid:
-            return False
+            return self._is_public_worker_available_for_job(household_id, lh_type, job)
         if labor_hour.firm_id is not None:
-            return False
+            return self._is_public_worker_available_for_job(household_id, lh_type, job)
         return True
+
+    def _release_current_public_job(
+        self,
+        household_id: str,
+        lh_type: str,
+        reason: str = "private_job_transition",
+    ) -> bool:
+        current_job = self._current_job_for_worker(household_id, lh_type)
+        if not self._is_public_employment_job(current_job):
+            return False
+
+        for matched_job in list(self.matched_jobs):
+            if matched_job.household_id != household_id or matched_job.lh_type != lh_type:
+                continue
+            if not self._is_public_employment_job(matched_job.job):
+                continue
+            self.matched_jobs.remove(matched_job)
+            self.matched_workers.discard(self._worker_key(household_id, lh_type))
+            self.logger.info(
+                f"[公共就业转岗] {household_id}({lh_type}) leaves "
+                f"{matched_job.firm_id} for private job, reason={reason}"
+            )
+            return True
+        return False
 
     def _update_labor_status(self, household_id: str, lh_type: str, job: Job) -> None:
         key = self._worker_key(household_id, lh_type)
@@ -169,6 +245,8 @@ class LaborMarket:
         """
         for j in self.job_openings:
             if j.firm_id == firm_id and j.SOC == job.SOC:
+                if self._is_public_employment_job(j) != self._is_public_employment_job(job):
+                    continue
                 j.positions_available += max(1, int(job.positions_available or 1))
                 j.is_valid = True
                 return
@@ -215,6 +293,24 @@ class LaborMarket:
                 break
         return reduced
 
+    def close_firm_positions(self, firm_id: str, reason: str = "firm_inactive") -> int:
+        """
+        Close all unmatched open positions for a firm.
+        """
+        closed = 0
+        for job in self.job_openings:
+            if job.firm_id != firm_id:
+                continue
+            positions = max(0, int(job.positions_available or 0))
+            if positions <= 0 and not job.is_valid:
+                continue
+            closed += positions
+            job.positions_available = 0
+            job.is_valid = False
+        if closed > 0:
+            self.logger.info(f"[岗位关闭] {firm_id}: closed={closed}, reason={reason}")
+        return closed
+
     def align_job(self, household_id: str, job: Job, lh_type: str) -> Optional[Job]:
         """
         Aligns a job with a household, reducing the available positions.
@@ -227,6 +323,10 @@ class LaborMarket:
         Returns:
             Job object if alignment successful, None otherwise
         """
+        if not self._is_worker_available(household_id, lh_type, job):
+            return None
+        if self._is_public_worker_available_for_job(household_id, lh_type, job):
+            self._release_current_public_job(household_id, lh_type)
         for j in self.job_openings:
             if j.SOC == job.SOC and j.firm_id == job.firm_id and j.positions_available > 0:
                 j.positions_available -= 1  # Decrease the number of available positions
@@ -274,13 +374,16 @@ class LaborMarket:
         private_matched = total_matched - gov_matched
         private_fill_rate = private_matched / private_positions if private_positions > 0 else 0.0
         
+        total_applications = sum(len(apps) for apps in self.job_applications.values())
         return {
             "total_jobs": len(self.job_openings),
             "total_job_positions": total_job_positions,
             "total_matched_jobs": total_matched,
             "total_labor_hours": total_labor_hours,
-            "total_job_applications": len(self.job_applications),
-            "total_backup_candidates": len(self.backup_candidates),
+            "total_job_applications": total_applications,
+            "jobs_with_applications": len(self.job_applications),
+            "total_backup_candidates": sum(len(candidates) for candidates in self.backup_candidates.values()),
+            "jobs_with_backup_candidates": len(self.backup_candidates),
             "employment_rate": employment_rate,
             "unemployment_rate": unemployment_rate,
             "average_wage": average_wage,
@@ -292,6 +395,9 @@ class LaborMarket:
             "gov_matched_jobs": gov_matched,
             "gov_job_positions": gov_openings + gov_matched,
         }
+
+    def get_labor_stats(self) -> Dict[str, float]:
+        return self.summary()
     
     def get_market_tightness(self) -> float:
         """
@@ -358,7 +464,7 @@ class LaborMarket:
             for job in self.job_openings:
                 if job.is_valid and job.positions_available > 0:
                     # 没有技能数据时给一个中等损失值，让有技能的劳动力优先匹配
-                    fallback_jobs.append((job, 5000.0))
+                    fallback_jobs.append((job, self._apply_matching_loss_floor(job, 5000.0)))
             return fallback_jobs
 
         job_losses: List[Tuple[Job, float]] = []
@@ -372,12 +478,15 @@ class LaborMarket:
             abilities_empty = not isinstance(job.required_abilities, dict) or len(job.required_abilities) == 0
             
             if skills_empty and abilities_empty:
-                job_losses.append((job, 500.0))  # 非常低的损失，优先匹配无要求岗位
+                job_losses.append((job, self._apply_matching_loss_floor(job, 500.0)))
                 continue
 
             required_profile = [job.required_skills, job.required_abilities]
             worker_profile = [labor_hour.skill_profile, labor_hour.ability_profile]
-            loss = self._compute_matching_loss(worker_profile, required_profile)
+            loss = self._apply_matching_loss_floor(
+                job,
+                self._compute_matching_loss(worker_profile, required_profile),
+            )
             if loss < loss_threshold:
                 job_losses.append((job, loss))
 
@@ -442,11 +551,20 @@ class LaborMarket:
                 total_loss += loss
         return total_loss
 
+    def _apply_matching_loss_floor(self, job: Job, loss: float) -> float:
+        floor = getattr(job, "matching_loss_floor", None)
+        if floor is None:
+            return float(loss)
+        try:
+            return max(float(loss), float(floor))
+        except (TypeError, ValueError):
+            return float(loss)
+
     def submit_application(self, application: JobApplication, labor_hour: Optional[LaborHour] = None) -> bool:
         job = self._get_job_by_id(application.job_id)
         if job is None or not job.is_valid or job.positions_available <= 0:
             return False
-        if not self._is_worker_available(application.household_id, application.lh_type):
+        if not self._is_worker_available(application.household_id, application.lh_type, job):
             return False
         key = (application.job_id, application.household_id, application.lh_type)
         if key in self.application_index:
@@ -467,12 +585,18 @@ class LaborMarket:
         if max_apply <= 0:
             return []
         if not labor_hour.is_valid or labor_hour.firm_id is not None:
-            return []
+            current_job = self._current_job_for_worker(labor_hour.agent_id, labor_hour.lh_type)
+            if not self._is_public_employment_job(current_job):
+                return []
+        current_job = self._current_job_for_worker(labor_hour.agent_id, labor_hour.lh_type)
         if not self._is_worker_available(labor_hour.agent_id, labor_hour.lh_type):
-            return []
+            if not self._is_public_employment_job(current_job):
+                return []
         ranked = self.rank_jobs_for_labor(labor_hour, loss_threshold=loss_threshold)
         applications: List[JobApplication] = []
         for job, _loss in ranked[:max_apply]:
+            if self._is_public_employment_job(current_job) and not self._is_private_job(job):
+                continue
             application = JobApplication.create(
                 job_id=job.job_id,
                 household_id=labor_hour.agent_id,
@@ -502,10 +626,13 @@ class LaborMarket:
         candidates: List[Dict[str, Any]] = []
         required_profile = [job.required_skills or {}, job.required_abilities or {}]
         for app in applications:
-            if not self._is_worker_available(app.household_id, app.lh_type):
+            if not self._is_worker_available(app.household_id, app.lh_type, job):
                 continue
             worker_profile = [app.worker_skills, app.worker_abilities]
-            loss = self._compute_matching_loss(worker_profile, required_profile)
+            loss = self._apply_matching_loss_floor(
+                job,
+                self._compute_matching_loss(worker_profile, required_profile),
+            )
             if loss == float('inf'):
                 continue
             score = loss
@@ -554,7 +681,7 @@ class LaborMarket:
     ) -> Optional[str]:
         household_id = candidate["household_id"]
         lh_type = candidate["lh_type"]
-        if not self._is_worker_available(household_id, lh_type):
+        if not self._is_worker_available(household_id, lh_type, job):
             return None
         if self._has_offer(job.job_id, household_id, lh_type):
             return None
@@ -571,6 +698,8 @@ class LaborMarket:
             "wage_per_hour": job.wage_per_hour,
             "loss": candidate.get("loss"),
             "expected_wage": candidate.get("expected_wage"),
+            "demand_priority": float(getattr(job, "demand_priority", 0.0) or 0.0),
+            "demand_wage_bonus": float(getattr(job, "demand_wage_bonus", 0.0) or 0.0),
             "month": month,
             "rank": rank,
             "status": "pending",
@@ -668,13 +797,15 @@ class LaborMarket:
             return False
         household_id = offer["household_id"]
         lh_type = offer["lh_type"]
-        if not self._is_worker_available(household_id, lh_type):
-            offer["status"] = "rejected"
-            return False
         job = self._get_job_by_id(offer["job_id"])
         if job is None or not job.is_valid or job.positions_available <= 0:
             offer["status"] = "rejected"
             return False
+        if not self._is_worker_available(household_id, lh_type, job):
+            offer["status"] = "rejected"
+            return False
+        if self._is_public_worker_available_for_job(household_id, lh_type, job):
+            self._release_current_public_job(household_id, lh_type)
 
         job.positions_available -= 1
         if job.positions_available <= 0:
@@ -759,8 +890,26 @@ class LaborMarket:
         offers = [self.offers[offer_id] for offer_id in offer_ids if offer_id in self.offers]
         if not offers:
             return None
+        private_or_regular_offers = [
+            offer for offer in offers
+            if not self._is_public_employment_offer(offer)
+        ]
+        if private_or_regular_offers:
+            offers = private_or_regular_offers
         if acceptance_policy == "highest_wage":
             offers.sort(key=lambda x: (-x.get("wage_per_hour", 0.0), x.get("loss", 0.0)))
+        elif acceptance_policy in {"demand_adjusted_wage", "demand_priority_wage"}:
+            offers.sort(
+                key=lambda x: (
+                    -(
+                        float(x.get("wage_per_hour", 0.0) or 0.0)
+                        + float(x.get("demand_priority", 0.0) or 0.0)
+                        * float(x.get("demand_wage_bonus", 0.0) or 0.0)
+                    ),
+                    x.get("loss", 0.0),
+                    -float(x.get("wage_per_hour", 0.0) or 0.0),
+                )
+            )
         else:
             offers.sort(key=lambda x: (x.get("loss", 0.0), -x.get("wage_per_hour", 0.0)))
         return offers[0]["offer_id"]
@@ -799,6 +948,19 @@ class LaborMarket:
         hours = hours_per_week if hours_per_week is not None else self.default_hours_per_week
         weeks = weeks_per_month if weeks_per_month is not None else self.default_weeks_per_month
         return wage_per_hour * hours * weeks
+
+    def _monthly_hours_for_job(self, job: Job) -> float:
+        """
+        Return monthly work hours for a job.
+
+        Job.hours_per_period is the canonical monthly-hours field. Older
+        records without it keep the historical 40 hours/week * 4 weeks/month
+        default.
+        """
+        hours_per_period = getattr(job, "hours_per_period", None)
+        if hours_per_period is None:
+            return float(self.default_hours_per_week) * float(self.default_weeks_per_month)
+        return float(hours_per_period or 0.0)
     
     def calculate_wage_for_matched_job(self, matched_job: MatchedJob) -> Dict:
         """
@@ -821,12 +983,8 @@ class LaborMarket:
             }
         """
         job = matched_job.job
-        hours_per_period = job.hours_per_period if job.hours_per_period else self.default_hours_per_week
-        
-        monthly_wage = self.calculate_monthly_wage(
-            wage_per_hour=matched_job.average_wage,
-            hours_per_week=hours_per_period
-        )
+        hours_per_period = self._monthly_hours_for_job(job)
+        monthly_wage = matched_job.average_wage * hours_per_period
         
         return {
             'household_id': matched_job.household_id,
@@ -942,27 +1100,12 @@ class LaborMarket:
                 'errors': List[str]
             }
         """
-        wage_details, firm_totals = self.calculate_all_wages()
-        
+        wage_details, _ = self.calculate_all_wages()
+        paid_wage_details = []
         total_paid = 0.0
         errors = []
-        
-        # 第一步：记录工资历史（本地操作，无阻塞）
-        for wage_info in wage_details:
-            try:
-                wage_record = Wage.create(
-                    agent_id=wage_info['household_id'],
-                    amount=wage_info['monthly_gross_wage'],
-                    month=month
-                )
-                self.wage_history.append(wage_record)
-                total_paid += wage_info['monthly_gross_wage']
-            except Exception as e:
-                error_msg = f"Failed to record wage for {wage_info['household_id']}: {e}"
-                self.logger.error(error_msg)
-                errors.append(error_msg)
-        
-        # 第二步：批量发送工资处理请求到 EconomicCenter（并行执行）
+
+        # 批量发送工资处理请求到 EconomicCenter（并行执行）
         if self.economic_center is not None and wage_details:
             # 收集所有远程调用的 futures
             futures = []
@@ -975,7 +1118,7 @@ class LaborMarket:
                     household_id=wage_info['household_id'],
                     firm_id=wage_info['firm_id'],
                     hours_per_period=wage_info['hours_per_period'],
-                    periods_per_month=self.default_weeks_per_month
+                    periods_per_month=1.0
                 )
                 futures.append(future)
                 wage_info_list.append(wage_info)
@@ -989,8 +1132,34 @@ class LaborMarket:
                         error_msg = f"Failed to process wage for {wage_info_list[i]['household_id']}: {result}"
                         self.logger.error(error_msg)
                         errors.append(error_msg)
+                    elif result:
+                        paid_wage_details.append(wage_info_list[i])
+                    else:
+                        self.logger.warning(
+                            f"Skipped unpaid wage for {wage_info_list[i]['household_id']} "
+                            f"from {wage_info_list[i]['firm_id']}"
+                        )
             except Exception as e:
                 error_msg = f"Batch wage processing failed: {e}"
+                self.logger.error(error_msg)
+                errors.append(error_msg)
+        else:
+            paid_wage_details = list(wage_details)
+
+        firm_totals: Dict[str, float] = {}
+        for wage_info in paid_wage_details:
+            try:
+                wage_record = Wage.create(
+                    agent_id=wage_info['household_id'],
+                    amount=wage_info['monthly_gross_wage'],
+                    month=month
+                )
+                self.wage_history.append(wage_record)
+                total_paid += wage_info['monthly_gross_wage']
+                firm_id = wage_info['firm_id']
+                firm_totals[firm_id] = firm_totals.get(firm_id, 0.0) + wage_info['monthly_gross_wage']
+            except Exception as e:
+                error_msg = f"Failed to record wage for {wage_info['household_id']}: {e}"
                 self.logger.error(error_msg)
                 errors.append(error_msg)
         
@@ -1002,7 +1171,7 @@ class LaborMarket:
         return {
             'month': month,
             'total_wages_paid': total_paid,
-            'total_employees': len(wage_details),
+            'total_employees': len(paid_wage_details),
             'wages_by_firm': firm_totals,
             'success': len(errors) == 0,
             'errors': errors
@@ -1133,13 +1302,14 @@ class LaborMarket:
         strategy: str = "highest_wage",
     ) -> Dict[str, Any]:
         """
-        裁员至工资帽附近（但不低于工资帽，保证产能）
+        裁员至工资帽以内。
 
-        工资帽是产能下限，裁员后工资支出不能低于工资帽。
+        工资帽是工资支出上限。由于员工不可分割，裁员后的工资支出
+        可以低于工资帽；不能为了不低于工资帽而保留明显超预算员工。
 
         Args:
             firm_id: 企业ID
-            target_wage_cap: 目标工资帽（产能下限）
+            target_wage_cap: 目标工资帽（工资支出上限）
             reason: 裁员原因
             month: 当前月份
             strategy: 裁员策略
@@ -1157,6 +1327,7 @@ class LaborMarket:
                 "reason": str,
             }
         """
+        target_wage_cap = max(0.0, float(target_wage_cap or 0.0))
         wage_info = self.get_firm_wage_bill(firm_id)
         current_wage = wage_info["total_wage"]
 
@@ -1170,8 +1341,6 @@ class LaborMarket:
                 "reason": "no_excess",
             }
 
-        # 可裁员空间 = 超出工资帽的部分
-        layoff_budget = current_wage - target_wage_cap
         employees = list(wage_info["employees"])
 
         # 按策略排序
@@ -1188,11 +1357,9 @@ class LaborMarket:
         saved = 0.0
 
         for emp in employees:
+            if current_wage - saved <= target_wage_cap:
+                break
             emp_wage = emp["monthly_wage"]
-
-            # 关键约束：如果裁掉这个人会导致工资支出 < 工资帽，则跳过
-            if saved + emp_wage > layoff_budget:
-                continue  # 跳过这个人，尝试下一个（可能工资更低）
 
             result = self.terminate_employment(
                 firm_id=firm_id,

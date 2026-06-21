@@ -1,7 +1,13 @@
-from qdrant_client import QdrantClient
-from dotenv import load_dotenv
-load_dotenv()
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+
+load_dotenv()
+
+
+DEFAULT_QDRANT_PATH = Path(__file__).resolve().parents[2] / "qdrant_database"
 
 def load_client():
     """
@@ -15,7 +21,7 @@ def load_client():
     注意：实际查询并发由 ProductMarket._qdrant_semaphore 控制，
     这里只负责超时配置。超时默认 60s（原来 30s 在高并发下不够用）。
     """
-    qdrant_mode = os.getenv("QDRANT_MODE")
+    qdrant_mode = os.getenv("QDRANT_MODE", "local")
     
     # 超时配置（秒）：高并发场景下需要更大的超时
     # 因为请求会在信号量处排队，实际等待时间可能较长
@@ -23,7 +29,7 @@ def load_client():
     
     if qdrant_mode == "local":
         qdrant_client = QdrantClient(
-            path=os.getenv("QDRANT_PATH")
+            path=os.getenv("QDRANT_PATH", str(DEFAULT_QDRANT_PATH))
         )
     elif qdrant_mode == "cloud":
         qdrant_client = QdrantClient(

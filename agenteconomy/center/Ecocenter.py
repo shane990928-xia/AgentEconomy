@@ -40,7 +40,7 @@ load_dotenv()
 # Economic Center Class
 # =============================================================================
 
-@ray.remote(num_cpus=8)
+@ray.remote(num_cpus=1)
 class EconomicCenter:
 
     # =========================================================================
@@ -65,6 +65,7 @@ class EconomicCenter:
         self.income_tax_rate = tax_policy.income_tax_rate       # List[TaxBracket] - 累进税阶梯
         self.vat_rate = tax_policy.vat_rate                     # float - 消费税率
         self.corporate_tax_rate = tax_policy.corporate_tax_rate # float - 企业所得税率
+        self.fica_tax_rate = float(getattr(tax_policy, "fica_tax_rate", 0.0) or 0.0)  # float - FICA/工资税率（员工侧代扣，0=停用）
 
         # =========================================================================
         # 2️⃣ 行业利润率配置 (从IO表V003加载)
@@ -130,11 +131,22 @@ class EconomicCenter:
         self.firm_monthly_depreciation: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
         self.firm_monthly_capital_investment: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
         self.firm_capital_stock_history: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_credit_limit: Dict[str, float] = defaultdict(float)
+        self.firm_debt_balance: Dict[str, float] = defaultdict(float)
+        self.firm_credit_draws: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_credit_interest: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_credit_repayments: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.firm_credit_distress_months: Dict[str, int] = defaultdict(int)
+        self.firm_credit_defaulted: Dict[str, bool] = defaultdict(bool)
 
         # =========================================================================
         # 1️⃣1️⃣ 企业实例列表 (Firm Instance List)
         # =========================================================================
         self.firm: List['Firm'] = []
+
+        # firm_id -> 行业代码/名称。在 setup 阶段由 Simulator 注册，使 GDP/部门流
+        # 核算可按行业归集增加值与销售，否则 _get_firm_industry 全部返回 'Unknown'。
+        self.firm_industry_map: Dict[str, str] = {}
 
         # =========================================================================
         # 📋 初始化日志
@@ -173,7 +185,22 @@ class EconomicCenter:
             self.firm_id.append("economic_center")
         elif agent_type == 'bank':
             self.bank_id.append("economic_center")
-             
+
+    def register_firm_industries(self, mapping: Dict[str, str]) -> int:
+        """注册 firm_id -> 行业映射，供 GDP/部门流核算按行业归集增加值。
+
+        可重复调用（合并写入）。空行业值被忽略，返回成功写入的条数。
+        """
+        if not isinstance(mapping, dict):
+            return 0
+        count = 0
+        for fid, industry in mapping.items():
+            ind = str(industry or "").strip()
+            if ind:
+                self.firm_industry_map[str(fid)] = ind
+                count += 1
+        return count
+
     @staticmethod
     def _monthly_rate_from_annual(annual_rate: float) -> float:
         """
@@ -228,12 +255,225 @@ class EconomicCenter:
                 self.firm_capital_stock[firm_id] = max(0.0, cap)
             if overwrite_cash:
                 self.ledger[firm_id].amount = float(cash)
+            self._ensure_firm_credit_limit(firm_id)
 
             firms_updated += 1
             cap_total += max(0.0, cap)
             cash_total += cash
 
         return {"firms_updated": int(firms_updated), "capital_total": float(cap_total), "cash_total": float(cash_total)}
+
+    def _ensure_firm_credit_limit(self, firm_id: str) -> float:
+        cid = str(firm_id or "")
+        if not cid:
+            return 0.0
+        if self.firm_credit_limit.get(cid, 0.0) > 0.0:
+            return float(self.firm_credit_limit[cid])
+        cash = float(self.ledger.get(cid, Ledger(amount=0.0)).amount or 0.0)
+        capital = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+        self.firm_credit_limit[cid] = max(50000.0, max(0.0, cash) + 0.25 * capital)
+        return float(self.firm_credit_limit[cid])
+
+    def _draw_firm_credit_if_needed(
+        self,
+        firm_id: str,
+        required_amount: float,
+        month: int,
+        reason: str,
+    ) -> float:
+        cid = str(firm_id or "")
+        if not cid or cid not in self.firm_id:
+            return 0.0
+        if self.firm_credit_defaulted.get(cid, False):
+            self.logger.warning(f"企业 {cid} 已违约，拒绝新增信用提款: reason={reason}")
+            return 0.0
+        if cid not in self.ledger:
+            self.ledger[cid] = Ledger.create(cid, 0.0)
+        balance = float(self.ledger[cid].amount or 0.0)
+        required = float(required_amount or 0.0)
+        shortfall = max(0.0, required - balance)
+        if shortfall <= 0.01:
+            return 0.0
+
+        credit_limit = self._ensure_firm_credit_limit(cid)
+        outstanding = float(self.firm_debt_balance.get(cid, 0.0) or 0.0)
+        available_credit = max(0.0, credit_limit - outstanding)
+        draw_amount = min(shortfall, available_credit)
+        if draw_amount <= 0.0:
+            self.logger.warning(
+                f"企业 {cid} 信用额度不足: shortfall={shortfall:.2f}, "
+                f"limit={credit_limit:.2f}, debt={outstanding:.2f}"
+            )
+            return 0.0
+
+        self.firm_debt_balance[cid] += draw_amount
+        self.firm_credit_draws[cid][int(month or 0)] += draw_amount
+        self.ledger[cid].amount += draw_amount
+        # 双分录：银行放贷=向企业派生存款，银行账户现金流出（转负，由 firm_debt_balance 资产对冲）
+        self._ensure_ledger_entry("bank_credit_system")
+        self.ledger["bank_credit_system"].amount -= draw_amount
+        self._record_transaction(
+            sender_id="bank_credit_system",
+            receiver_id=cid,
+            amount=draw_amount,
+            tx_type="credit_draw",
+            month=month,
+            metadata={
+                "reason": reason,
+                "credit_limit": credit_limit,
+                "debt_balance": self.firm_debt_balance[cid],
+                "required_amount": required,
+                "cash_before_draw": balance,
+            },
+        )
+        return draw_amount
+
+    def _ensure_firm_payment_funding(
+        self,
+        firm_id: str,
+        amount: float,
+        month: int,
+        reason: str,
+        epsilon: float = 0.01,
+    ) -> bool:
+        cid = str(firm_id or "")
+        if not cid:
+            return False
+        if cid not in self.ledger:
+            self.ledger[cid] = Ledger.create(cid, 0.0)
+        if cid not in self.firm_id:
+            return float(self.ledger[cid].amount or 0.0) + epsilon >= float(amount or 0.0)
+        if self.firm_credit_defaulted.get(cid, False):
+            self.logger.warning(f"企业 {cid} 已违约，拒绝付款: reason={reason}, amount={float(amount or 0.0):.2f}")
+            return False
+
+        required = max(0.0, float(amount or 0.0))
+        balance = float(self.ledger[cid].amount or 0.0)
+        if balance + epsilon >= required:
+            return True
+
+        self._draw_firm_credit_if_needed(cid, required, month, reason)
+        funded_balance = float(self.ledger[cid].amount or 0.0)
+        if funded_balance + epsilon >= required:
+            return True
+
+        self.logger.warning(
+            f"企业 {cid} 付款失败: reason={reason}, required={required:.2f}, "
+            f"balance={funded_balance:.2f}, debt={float(self.firm_debt_balance.get(cid, 0.0) or 0.0):.2f}, "
+            f"limit={float(self.firm_credit_limit.get(cid, 0.0) or 0.0):.2f}"
+        )
+        return False
+
+    def settle_firm_credit_month(
+        self,
+        month: int,
+        annual_interest_rate: float = 0.08,
+        repayment_cash_buffer: float = 1000.0,
+        default_distress_months: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        月末企业信用结算：计息、现金充足时自动还款、标记持续信用压力。
+
+        这不是完整银行资产负债表；它只是把企业透支改成显式债务生命周期。
+        """
+        try:
+            m = int(month or 0)
+        except Exception:
+            m = 0
+        if m <= 0:
+            return {"interest_total": 0.0, "repayment_total": 0.0, "defaulted_count": 0, "firms": {}}
+
+        monthly_rate = self._monthly_rate_from_annual(float(annual_interest_rate or 0.0))
+        cash_buffer = max(0.0, float(repayment_cash_buffer or 0.0))
+        distress_limit = max(1, int(default_distress_months or 1))
+
+        interest_total = 0.0
+        repayment_total = 0.0
+        defaulted_count = 0
+        firms: Dict[str, Dict[str, float | bool | int]] = {}
+
+        for firm_id in list(self.firm_id or []):
+            debt0 = float(self.firm_debt_balance.get(firm_id, 0.0) or 0.0)
+            if debt0 <= 0.0:
+                self.firm_credit_distress_months[firm_id] = 0
+                continue
+
+            interest = debt0 * monthly_rate
+            if interest > 0.0:
+                self.firm_debt_balance[firm_id] += interest
+                self.firm_credit_interest[firm_id][m] += interest
+                interest_total += interest
+                self._record_transaction(
+                    sender_id=firm_id,
+                    receiver_id="bank_credit_system",
+                    amount=interest,
+                    tx_type="financial",
+                    month=m,
+                    metadata={
+                        "subtype": "credit_interest_accrual",
+                        "debt_before_interest": debt0,
+                        "annual_interest_rate": float(annual_interest_rate or 0.0),
+                    },
+                )
+
+            if firm_id not in self.ledger:
+                self.ledger[firm_id] = Ledger.create(firm_id, 0.0)
+            cash = float(self.ledger[firm_id].amount or 0.0)
+            available_for_repayment = max(0.0, cash - cash_buffer)
+            debt_before_repayment = float(self.firm_debt_balance.get(firm_id, 0.0) or 0.0)
+            repayment = min(available_for_repayment, debt_before_repayment)
+            if repayment > 0.0:
+                self.ledger[firm_id].amount -= repayment
+                # 双分录：企业还款=银行收回现金（冲销此前派生的存款）
+                self._ensure_ledger_entry("bank_credit_system")
+                self.ledger["bank_credit_system"].amount += repayment
+                self.firm_debt_balance[firm_id] = max(0.0, debt_before_repayment - repayment)
+                self.firm_credit_repayments[firm_id][m] += repayment
+                repayment_total += repayment
+                self._record_transaction(
+                    sender_id=firm_id,
+                    receiver_id="bank_credit_system",
+                    amount=repayment,
+                    tx_type="financial",
+                    month=m,
+                    metadata={
+                        "subtype": "credit_repayment",
+                        "debt_before_repayment": debt_before_repayment,
+                        "cash_buffer": cash_buffer,
+                    },
+                )
+
+            remaining_debt = float(self.firm_debt_balance.get(firm_id, 0.0) or 0.0)
+            credit_limit = self._ensure_firm_credit_limit(firm_id)
+            if remaining_debt > 0.0:
+                self.firm_credit_distress_months[firm_id] += 1
+            else:
+                self.firm_credit_distress_months[firm_id] = 0
+
+            if (
+                remaining_debt > credit_limit
+                or self.firm_credit_distress_months[firm_id] >= distress_limit
+            ):
+                self.firm_credit_defaulted[firm_id] = True
+            if self.firm_credit_defaulted.get(firm_id, False):
+                defaulted_count += 1
+
+            firms[firm_id] = {
+                "debt_start": debt0,
+                "interest": interest,
+                "repayment": repayment,
+                "debt_end": remaining_debt,
+                "credit_limit": credit_limit,
+                "distress_months": self.firm_credit_distress_months[firm_id],
+                "defaulted": bool(self.firm_credit_defaulted.get(firm_id, False)),
+            }
+
+        return {
+            "interest_total": float(interest_total),
+            "repayment_total": float(repayment_total),
+            "defaulted_count": int(defaulted_count),
+            "firms": firms,
+        }
 
     def query_firm_assets(self, firm_id: str) -> Dict[str, float]:
         cid = str(firm_id or "")
@@ -395,7 +635,14 @@ class EconomicCenter:
         # ===== Unmet Demand Tracking =====
             rec = (self.unmet_demand_by_month.get(m, {}) or {}).get(key)
             if rec is None:
-                rec = {"attempts": 0.0, "qty_requested": 0.0, "qty_short": 0.0}
+                rec = {
+                    "attempts": 0.0,
+                    "qty_requested": 0.0,
+                    "qty_short": 0.0,
+                    "product_id": str(product_id),
+                    "seller_id": str(seller_id),
+                    "product_name": str(product_name or ""),
+                }
         # ===== Unmet Demand Tracking =====
                 self.unmet_demand_by_month[m][key] = rec
             rec["attempts"] = float(rec.get("attempts", 0.0) or 0.0) + 1.0
@@ -980,10 +1227,14 @@ class EconomicCenter:
             raise ValueError(
                 f"Insufficient balance for {buyer_id}: ${balance:.2f} < ${cost:.2f}"
             )
+        elif is_company and not self._ensure_firm_payment_funding(
+            buyer_id, cost, month, "intermediate_goods_purchase", epsilon=EPSILON
+        ):
+            return None
         elif is_company and balance + EPSILON < cost:
             self.logger.info(
-                f"💳 Company {buyer_id} intermediate goods purchase with negative balance: "
-                f"${balance:.2f} → ${balance - cost:.2f}"
+                f"💳 Company {buyer_id} intermediate goods purchase funded by credit if needed: "
+                f"${balance:.2f} → ${float(self.ledger[buyer_id].amount or 0.0) - cost:.2f}"
             )
 
         self.ledger[buyer_id].amount -= total_cost
@@ -993,6 +1244,10 @@ class EconomicCenter:
             self.record_firm_expense(buyer_id, total_cost)
             self.record_firm_monthly_expense(buyer_id, month, total_cost)
             self.firm_monthly_data[buyer_id][month]["production_cost"] += total_cost
+
+        if receiver_id in self.firm_id:
+            self.record_firm_income(receiver_id, total_cost)
+            self.record_firm_monthly_income(receiver_id, month, total_cost)
 
         tx = self._record_transaction(
             sender_id=buyer_id,
@@ -1040,10 +1295,14 @@ class EconomicCenter:
             raise ValueError(
                 f"Insufficient balance for {buyer_id}: ${balance:.2f} < ${cost:.2f}"
             )
+        elif is_company and not self._ensure_firm_payment_funding(
+            buyer_id, cost, month, "resource_purchase", epsilon=EPSILON
+        ):
+            return None
         elif is_company and balance + EPSILON < cost:
             self.logger.info(
-                f"💳 Company {buyer_id} resource purchase with negative balance: "
-                f"${balance:.2f} → ${balance - cost:.2f}"
+                f"💳 Company {buyer_id} resource purchase funded by credit if needed: "
+                f"${balance:.2f} → ${float(self.ledger[buyer_id].amount or 0.0) - cost:.2f}"
             )
 
         self.ledger[buyer_id].amount -= total_cost
@@ -1125,6 +1384,7 @@ class EconomicCenter:
         product_id: Optional[str] = None,
         product_name: Optional[str] = None,
         unit_price: Optional[float] = None,
+        base_unit_price: Optional[float] = None,
     ) -> Optional[str]:
         """
         处理购买交易（纯转账，商品管理由商品市场负责）
@@ -1177,6 +1437,17 @@ class EconomicCenter:
         self.ledger["gov_main_simulation"].amount += tax_amount
 
         # 创建购买交易记录
+        qty = float(quantity or 0.0)
+        if unit_price is None:
+            unit_price = base_price / max(qty, 1.0)
+        unit_price_value = float(unit_price or 0.0)
+        base_unit_price_value = (
+            float(base_unit_price)
+            if base_unit_price is not None and float(base_unit_price or 0.0) > 0.0
+            else unit_price_value
+        )
+        base_amount = base_unit_price_value * qty
+        retail_margin = max(0.0, base_price - base_amount)
         purchase_tx = self._record_transaction(
             sender_id=buyer_id,
             receiver_id=seller_id,
@@ -1186,8 +1457,11 @@ class EconomicCenter:
             metadata={
                 "product_id": product_id,
                 "product_name": product_name,
-                "quantity": float(quantity or 0.0),
-                "unit_price": float(unit_price or 0.0) if unit_price else base_price / max(quantity, 1),
+                "quantity": qty,
+                "unit_price": unit_price_value,
+                "base_unit_price": base_unit_price_value,
+                "base_amount": base_amount,
+                "retail_margin": retail_margin,
             },
         )
 
@@ -1232,7 +1506,12 @@ class EconomicCenter:
         # 检查零售商余额
         if retailer_id not in self.ledger:
             self.ledger[retailer_id] = Ledger.create(retailer_id, 0.0)
-        if self.ledger[retailer_id].amount < wholesale_amount:
+        if not self._ensure_firm_payment_funding(
+            retailer_id,
+            wholesale_amount,
+            month,
+            "wholesale_purchase",
+        ):
             self.logger.warning(
                 f"进货失败: 零售商 {retailer_id} 余额不足 "
                 f"(需要 {wholesale_amount:.2f}, 余额 {self.ledger[retailer_id].amount:.2f})"
@@ -1285,7 +1564,7 @@ class EconomicCenter:
         firm_id: str,
         hours_per_period: float = 40.0,
         periods_per_month: float = 4.0,
-    ) -> str:
+    ) -> Optional[str]:
         """
         发放工资（含税收拆分）
 
@@ -1306,11 +1585,21 @@ class EconomicCenter:
         hours = max(0.0, hours)
         ppm = max(0.0, ppm)
         gross_wage = float(wage_hour or 0.0) * hours * ppm
+        if gross_wage <= 0.0:
+            return None
+
+        if firm_id:
+            self._ensure_ledger_entry(firm_id)
+            if not self._ensure_firm_payment_funding(firm_id, gross_wage, month, "wage_payment"):
+                return None
         
         # 计算个人所得税
         income_tax = self.calculate_progressive_income_tax(gross_wage)
 
-        net_wage = gross_wage - income_tax  # 税后工资（仅扣个税）
+        # FICA/工资税（员工侧代扣，源泉扣缴）；fica_tax_rate=0 时为无操作
+        fica_tax = max(0.0, gross_wage * float(self.fica_tax_rate or 0.0))
+
+        net_wage = gross_wage - income_tax - fica_tax  # 税后工资（扣个税与 FICA）
         if net_wage < 0:
             net_wage = 0.0
         
@@ -1325,6 +1614,7 @@ class EconomicCenter:
                 "gross_wage": gross_wage,
                 "net_wage": net_wage,
                 "income_tax": income_tax,
+                "fica_tax": fica_tax,
                 "wage_hour": wage_hour,
                 "hours_per_period": hours,
                 "periods_per_month": ppm,
@@ -1344,20 +1634,26 @@ class EconomicCenter:
             },
         )
 
+        # FICA/工资税交易记录（源泉扣缴，家庭→政府）；rate=0 时不产生
+        if fica_tax > 0.0:
+            self._record_transaction(
+                sender_id=household_id,
+                receiver_id="gov_main_simulation",
+                amount=fica_tax,
+                tx_type='fica_tax',
+                month=month,
+                metadata={
+                    "gross_wage": gross_wage,
+                    "fica_rate": float(self.fica_tax_rate or 0.0),
+                },
+            )
+
         # 更新账本
         self.ledger[household_id].amount += net_wage  # 家庭收到税后工资
-        self.ledger["gov_main_simulation"].amount += income_tax  # 政府收到个人所得税
+        self.ledger["gov_main_simulation"].amount += income_tax + fica_tax  # 政府收到个税与 FICA
         
         # 企业支出工资
         if firm_id:
-            if firm_id not in self.ledger:
-                self.ledger[firm_id] = Ledger.create(firm_id, 0.0)
-            # 检查余额，防止过度透支
-            if self.ledger[firm_id].amount < gross_wage:
-                self.logger.warning(
-                    f"工资透支: 企业 {firm_id} 余额不足 "
-                    f"(需要 {gross_wage:.2f}, 余额 {self.ledger[firm_id].amount:.2f})"
-                )
             self.ledger[firm_id].amount -= gross_wage
             # 记录企业支出（经济中心层面）
             self.record_firm_expense(firm_id, gross_wage)
@@ -1902,10 +2198,17 @@ class EconomicCenter:
         """
         添加利息交易记录
         """
+        amt = float(amount or 0.0)
+        if sender_id not in self.ledger:
+            self.ledger[sender_id] = Ledger.create(sender_id, 0.0)
+        if receiver_id not in self.ledger:
+            self.ledger[receiver_id] = Ledger.create(receiver_id, 0.0)
+        self.ledger[sender_id].amount -= amt
+        self.ledger[receiver_id].amount += amt
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
-            amount=amount,
+            amount=amt,
             tx_type='interest',
             month=month,
         )
@@ -1914,16 +2217,23 @@ class EconomicCenter:
         """
         添加再分配交易记录
         """
+        amt = float(amount or 0.0)
+        if sender_id not in self.ledger:
+            self.ledger[sender_id] = Ledger.create(sender_id, 0.0)
+        if receiver_id not in self.ledger:
+            self.ledger[receiver_id] = Ledger.create(receiver_id, 0.0)
+        self.ledger[sender_id].amount -= amt
+        self.ledger[receiver_id].amount += amt
         tx = self._record_transaction(
             sender_id=sender_id,
             receiver_id=receiver_id,
-            amount=amount,
+            amount=amt,
             tx_type='redistribution',
             month=month,
         )
         return tx.id
 
-    def add_tx_service(self, month: int, sender_id: str, receiver_id: str, amount: float) -> str:
+    def add_tx_service(self, month: int, sender_id: str, receiver_id: str, amount: float) -> Optional[str]:
         """
         添加服务类型交易记录，直接更新账本并记录到交易历史
         用于政府服务、基础服务等不需要商品库存的交易
@@ -1948,10 +2258,13 @@ class EconomicCenter:
         if not is_company and balance + EPSILON < amt:
             # 家庭余额不足，不允许交易
             raise ValueError(f"Insufficient balance for household {sender_id}: ${balance:.2f} < ${amt:.2f}")
+        elif is_company and not self._ensure_firm_payment_funding(
+            sender_id, amt, month, "service_transaction", epsilon=EPSILON
+        ):
+            return None
         elif is_company and balance + EPSILON < amt:
-            # 企业余额不足，允许负债交易，记录日志
-            self.logger.info(f"💳 Company {sender_id} transaction with negative balance: "
-                      f"${balance:.2f} → ${balance - amt:.2f}")
+            self.logger.info(f"💳 Company {sender_id} service transaction funded by credit if needed: "
+                      f"${balance:.2f} → ${float(self.ledger[sender_id].amount or 0.0) - amt:.2f}")
         
         # 直接更新账本
         self.ledger[sender_id].amount -= amount
@@ -2699,6 +3012,8 @@ class EconomicCenter:
         # C: 家庭消费（含税）
         household_consumption = 0.0
         household_consumption_ex_tax = 0.0
+        household_goods_consumption_ex_tax = 0.0
+        household_goods_base_value = 0.0
         
         # G: 政府支出
         government_procurement = 0.0  # 政府采购商品
@@ -2710,14 +3025,18 @@ class EconomicCenter:
         fica_tax_collected = 0.0
         corporate_tax_collected = 0.0
         
-        # 工资总额
+        # 工资总额。labor_payment 的交易金额是税后工资，收入法与劳动份额使用 gross_wage。
         total_wages = 0.0
         private_wages = 0.0
+        net_wages = 0.0
         
         # 行业分解
         industry_sales: Dict[str, float] = defaultdict(float)
         industry_production: Dict[str, float] = defaultdict(float)
         industry_intermediate: Dict[str, float] = defaultdict(float)
+        final_service_output_by_industry: Dict[str, float] = defaultdict(float)
+        intermediate_service_output_by_industry: Dict[str, float] = defaultdict(float)
+        retail_distribution_output_by_industry: Dict[str, float] = defaultdict(float)
         
         for tx in transactions:
             tx_type = str(getattr(tx, "type", "") or "")
@@ -2729,9 +3048,20 @@ class EconomicCenter:
             # 家庭消费
             if tx_type == "purchase" and sender_id in self.household_id:
                 household_consumption += amount
-                # 从 metadata 获取不含税金额
-                ex_tax = float(metadata.get("amount_ex_tax", amount / (1 + self.vat_rate)) or 0.0)
+                # process_purchase 的 purchase.amount 已经是不含税销售额；
+                # consume_tax 单独记录 VAT。旧导入数据可显式传 amount_ex_tax 覆盖。
+                ex_tax = float(metadata.get("amount_ex_tax", amount) or 0.0)
                 household_consumption_ex_tax += ex_tax
+                household_goods_consumption_ex_tax += ex_tax
+                base_amount = float(metadata.get("base_amount", ex_tax) or 0.0)
+                base_amount = max(0.0, min(base_amount, ex_tax))
+                household_goods_base_value += base_amount
+                retail_margin = float(metadata.get("retail_margin", ex_tax - base_amount) or 0.0)
+                if retail_margin > 0.0:
+                    seller_industry = self._get_firm_industry(receiver_id)
+                    if not seller_industry or seller_industry == "Unknown":
+                        seller_industry = str(metadata.get("retailer_industry", "retail_distribution") or "retail_distribution")
+                    retail_distribution_output_by_industry[seller_industry] += retail_margin
                 # 按行业分解
                 industry = str(metadata.get("industry", "Unknown") or "Unknown")
                 industry_sales[industry] += ex_tax
@@ -2744,12 +3074,14 @@ class EconomicCenter:
             
             # 工资支付
             elif tx_type == "labor_payment":
-                total_wages += amount
+                gross_wage = float(metadata.get("gross_wage", amount) or amount)
+                total_wages += gross_wage
+                net_wages += amount
                 # 区分政府工资和私人工资
                 if sender_id in self.government_id or sender_id.startswith("gov"):
-                    government_wages += amount
+                    government_wages += gross_wage
                 else:
-                    private_wages += amount
+                    private_wages += gross_wage
             
             # 税收
             elif tx_type == "consume_tax":
@@ -2769,16 +3101,35 @@ class EconomicCenter:
                     household_consumption += amount
                     household_consumption_ex_tax += amount  # 服务消费不含 VAT
                     industry_sales[industry] += amount
+                    # 抽象服务没有 SKU 库存流；最终服务销售本身就是当期服务产出。
+                    # 服务企业隐含成本当前只是税基校准项，不是已清算的中间投入交易。
+                    final_service_output_by_industry[industry] += amount
                 else:
-                    # 企业购买原材料 → 中间投入
-                    industry_intermediate[industry] += amount
+                    # 企业购买抽象服务 → 买方中间投入，同时也是服务部门国内产出。
+                    # 买方中间投入的总额已在 production_stats.firm_production_cost 中体现。
+                    industry_sales[industry] += amount
+                    intermediate_service_output_by_industry[industry] += amount
+            
+            # 兼容旧服务交易类型：家庭直接购买服务也应计入最终消费和服务产出。
+            elif tx_type == "service" and sender_id in self.household_id:
+                industry = str(
+                    metadata.get("industry_code")
+                    or metadata.get("industry")
+                    or (receiver_id[4:] if receiver_id.startswith("svc_") else "Unknown")
+                    or "Unknown"
+                )
+                household_consumption += amount
+                household_consumption_ex_tax += amount
+                industry_sales[industry] += amount
+                final_service_output_by_industry[industry] += amount
         
         # =====================================================================
         # 2️⃣ 计算支出法 GDP: C + G + I
         # =====================================================================
         
-        # 总消费 C（含税，反映实际支付）
-        consumption_total = household_consumption
+        # 总消费 C（含税，反映家庭实际支付的购买者价格）。
+        # purchase 交易本身是不含 VAT 的，consume_tax 单独记录，因此这里补入 VAT。
+        consumption_total = household_consumption + vat_collected
         
         # 政府支出 G = 政府最终消费支出
         # SNA 口径：G = 政府采购商品/服务 + 政府部门增加值（雇员报酬）
@@ -2789,19 +3140,22 @@ class EconomicCenter:
         #   C 衡量的是家庭的私人消费支出
         government_expenditure = government_procurement + government_wages
         
-        # 投资 I（存货投资）
-        # 注意：本模型中企业按需生产（shortage-driven），大量商品从库存卖出，
-        # 导致 output << sales。用 output - sales 会严重低估 GDP。
-        # 正确做法：存货投资 = 期末库存价值 - 期初库存价值
-        # 但模型中没有跟踪期初/期末库存价值，因此：
-        # 方案：在封闭经济、无固定资本投资的模型中，
-        #       GDP ≈ C + G（最终消费支出），I 仅作为参考指标。
-        total_output = float(ps.get("total_output_value", 0.0) or 0.0)
+        # 投资 I（存货投资）。
+        # 商品从期初库存卖出时，C/G 记录了销售，但这些商品不是本期产出；
+        # 因此用 goods_output - goods_final_sales_ex_tax 作为存货变动抵消库存销售。
+        # 服务无库存，服务销售本身就是当期产出，不进入存货投资。
+        goods_output = float(ps.get("total_output_value", 0.0) or 0.0)
+        final_service_output_total = float(sum(final_service_output_by_industry.values()))
+        intermediate_service_output_total = float(sum(intermediate_service_output_by_industry.values()))
+        retail_distribution_output_total = float(sum(retail_distribution_output_by_industry.values()))
+        goods_final_sales_base_value = household_goods_base_value + government_procurement
+        goods_final_sales_ex_tax = household_goods_consumption_ex_tax + government_procurement
         total_sales_ex_tax = household_consumption_ex_tax + government_procurement
-        inventory_investment_memo = total_output - total_sales_ex_tax  # 仅供参考
+        inventory_investment = goods_output - goods_final_sales_base_value
+        inventory_investment_memo = inventory_investment
         
-        # 支出法 GDP = C + G（封闭经济，无固定资本投资，存货变动不可靠时）
-        gdp_expenditure = consumption_total + government_expenditure
+        # 支出法 GDP = C + G + I（封闭经济，无固定资本投资）
+        gdp_expenditure = consumption_total + government_expenditure + inventory_investment
         
         # =====================================================================
         # 3️⃣ 计算生产法 GDP: Σ(增加值) + 产品税
@@ -2815,6 +3169,7 @@ class EconomicCenter:
         industry_value_added: Dict[str, float] = defaultdict(float)
         total_value_added = 0.0
         total_intermediate = 0.0
+        total_output = 0.0
         
         # 使用生产统计中的数据
         for firm_id, output_value in firm_production_value.items():
@@ -2827,6 +3182,7 @@ class EconomicCenter:
             industry_value_added[industry] += value_added
             industry_production[industry] += output
             
+            total_output += output
             total_value_added += value_added
             total_intermediate += cost
         
@@ -2835,7 +3191,37 @@ class EconomicCenter:
             total_output = float(ps.get("total_output_value", 0.0) or 0.0)
             total_intermediate = float(ps.get("total_production_cost", 0.0) or 0.0)
             total_value_added = total_output - total_intermediate
-        
+
+        # 抽象资源市场里的服务没有实物库存，也不会出现在 SKU 生产统计中。
+        # 家庭服务是最终消费；企业服务采购是中间投入，但同时也是服务部门产出。
+        service_output_by_industry: Dict[str, float] = defaultdict(float)
+        for industry, output in final_service_output_by_industry.items():
+            service_output_by_industry[industry] += float(output or 0.0)
+        for industry, output in intermediate_service_output_by_industry.items():
+            service_output_by_industry[industry] += float(output or 0.0)
+        for industry, output in retail_distribution_output_by_industry.items():
+            service_output_by_industry[industry] += float(output or 0.0)
+
+        for industry, service_output in service_output_by_industry.items():
+            output = float(service_output or 0.0)
+            if output <= 0:
+                continue
+            industry_production[industry] += output
+            industry_value_added[industry] += output
+            total_output += output
+            total_value_added += output
+
+        # 政府部门增加值（成本法）：政府以雇员报酬计量其公共服务产出。
+        # 支出法 G 已含 government_wages（line 3141），但生产法/收入法的
+        # total_value_added 不含政府（政府非生产循环里的企业），导致
+        # exp_vs_prod 出现约等于 government_wages 的缺口。此处补记政府增加值，
+        # 使三方核算闭合（生产法与收入法同步增加，prod_vs_income 不变）。
+        if government_wages > 0:
+            industry_value_added["government"] += government_wages
+            industry_production["government"] += government_wages
+            total_output += government_wages
+            total_value_added += government_wages
+
         # 生产法 GDP = 增加值 + 产品税（VAT）
         gdp_production = total_value_added + vat_collected
         
@@ -2843,14 +3229,13 @@ class EconomicCenter:
         # 4️⃣ 计算收入法 GDP: 劳动者报酬 + 生产税 + 营业盈余
         # =====================================================================
         
-        # 劳动者报酬 = 私人部门工资（净额）
-        # 注意：labor_tax 和 fica_tax 是从工资中扣除的（非雇主额外缴纳），
-        # 且包含政府雇员的税，无法区分。因此 compensation 只用私人部门净工资。
-        # 政府工资不计入（避免与 C 双重计算）。
-        compensation_of_employees = private_wages
+        # 劳动者报酬 = 所有雇员税前工资。政府工资已经作为 G 的成本进入
+        # 支出法 GDP；这里用于收入分配和收入法核算，不改变支出法主口径。
+        compensation_of_employees = total_wages
         
-        # 生产税净额 = VAT + 企业所得税（简化，不考虑补贴）
-        taxes_on_production = vat_collected + corporate_tax_collected
+        # 生产税净额。企业所得税是营业盈余的分配项；营业盈余在这里是税前口径，
+        # 因此不能把企业所得税再加进 GDP，否则收入法会重复计算。
+        taxes_on_production = vat_collected
         
         # 营业盈余 = 增加值 - 劳动者报酬
         operating_surplus = total_value_added - compensation_of_employees
@@ -2940,9 +3325,13 @@ class EconomicCenter:
             "expenditure_components": {
                 "consumption": {
                     "total": consumption_total,
-                    "household_consumption_with_tax": household_consumption,
+                    "household_consumption_with_tax": consumption_total,
                     "household_consumption_ex_tax": household_consumption_ex_tax,
-                    "vat_paid_by_household": household_consumption - household_consumption_ex_tax,
+                    "household_goods_ex_tax": household_goods_consumption_ex_tax,
+                    "household_goods_base_value": household_goods_base_value,
+                    "household_services_ex_tax": household_consumption_ex_tax - household_goods_consumption_ex_tax,
+                    "retail_distribution_margin": retail_distribution_output_total,
+                    "vat_paid_by_household": vat_collected,
                 },
                 "government": {
                     "total": government_expenditure,
@@ -2950,7 +3339,15 @@ class EconomicCenter:
                     "wages_memo": government_wages,  # 备忘：政府工资（不计入 G，已通过 C 回流）
                 },
                 "investment": {
-                    "inventory_investment_memo": inventory_investment_memo,  # 参考值（output - sales，不计入 GDP）
+                    "inventory_investment": inventory_investment,
+                    "inventory_investment_memo": inventory_investment_memo,
+                    "goods_inventory_investment": inventory_investment,
+                    "goods_output": goods_output,
+                    "goods_final_sales_base_value": goods_final_sales_base_value,
+                    "goods_final_sales_ex_tax": goods_final_sales_ex_tax,
+                    "final_service_output": final_service_output_total,
+                    "intermediate_service_output": intermediate_service_output_total,
+                    "retail_distribution_output": retail_distribution_output_total,
                     "total_output": total_output,
                     "total_sales_ex_tax": total_sales_ex_tax,
                 },
@@ -2978,7 +3375,8 @@ class EconomicCenter:
             "income_components": {
                 "compensation_of_employees": {
                     "total": compensation_of_employees,
-                    "wages_net": total_wages,
+                    "wages_gross": total_wages,
+                    "wages_net": net_wages,
                     "labor_tax": labor_tax_collected,
                     "fica_tax": fica_tax_collected,
                     "private_wages": private_wages,
@@ -2987,7 +3385,7 @@ class EconomicCenter:
                 "taxes_on_production": {
                     "total": taxes_on_production,
                     "vat": vat_collected,
-                    "corporate_tax": corporate_tax_collected,
+                    "corporate_tax_memo": corporate_tax_collected,
                 },
                 "operating_surplus": operating_surplus,
             },
@@ -3022,13 +3420,17 @@ class EconomicCenter:
     
     def _get_firm_industry(self, firm_id: str) -> str:
         """获取企业所属行业"""
-        # 尝试从企业实例获取
+        fid = str(firm_id)
+        # 优先使用 setup 阶段注册的行业映射（register_firm_industries）
+        ind = self.firm_industry_map.get(fid)
+        if ind:
+            return ind
+        # 回退：尝试从企业实例获取（self.firm 通常为空，保留以兼容）
         if hasattr(self, "firm") and self.firm:
             for firm in self.firm:
-                fid = getattr(firm, "firm_id", None) or getattr(firm, "id", None)
-                if str(fid) == str(firm_id):
+                f = getattr(firm, "firm_id", None) or getattr(firm, "id", None)
+                if str(f) == fid:
                     return str(getattr(firm, "industry", "Unknown") or "Unknown")
-        # 从 firm_monthly_data 的元数据获取（如果有存储）
         return "Unknown"
     
     def _calculate_price_index(self, month: int) -> float:
@@ -3142,6 +3544,48 @@ class EconomicCenter:
             agent_id: float(ledger.amount)
             for agent_id, ledger in self.ledger.items()
         }
+
+    def get_all_firm_debt_balances(self) -> Dict[str, float]:
+        """
+        获取企业信用/贷款余额快照。
+        """
+        return {
+            firm_id: float(balance or 0.0)
+            for firm_id, balance in self.firm_debt_balance.items()
+            if float(balance or 0.0) > 0.0
+        }
+
+    def get_all_firm_credit_limits(self) -> Dict[str, float]:
+        """
+        获取企业信用额度快照，确保已注册企业都有可查询额度。
+        """
+        result: Dict[str, float] = {}
+        for firm_id in list(self.firm_id or []):
+            limit = self._ensure_firm_credit_limit(str(firm_id))
+            if float(limit or 0.0) > 0.0:
+                result[str(firm_id)] = float(limit)
+        return result
+
+    def get_all_firm_credit_defaulted(self) -> Dict[str, bool]:
+        """
+        获取企业违约状态快照。
+        """
+        return {
+            str(firm_id): bool(defaulted)
+            for firm_id, defaulted in self.firm_credit_defaulted.items()
+            if bool(defaulted)
+        }
+
+    def get_firm_credit_state_snapshot(self) -> Dict[str, Any]:
+        """
+        获取企业信用生命周期快照（用于 checkpoint）。
+        """
+        return {
+            "credit_limit": {str(k): float(v or 0.0) for k, v in self.firm_credit_limit.items()},
+            "debt_balance": {str(k): float(v or 0.0) for k, v in self.firm_debt_balance.items()},
+            "distress_months": {str(k): int(v or 0) for k, v in self.firm_credit_distress_months.items()},
+            "defaulted": {str(k): bool(v) for k, v in self.firm_credit_defaulted.items()},
+        }
     
     def get_all_household_ids(self) -> List[str]:
         """
@@ -3206,3 +3650,27 @@ class EconomicCenter:
             restored += 1
         self.logger.info(f"Restored firm monthly data for {restored} firms from checkpoint")
         return restored
+
+    def restore_firm_credit_state(self, data: Dict[str, Any]) -> int:
+        """
+        从 checkpoint 恢复企业信用生命周期状态。
+        """
+        if not isinstance(data, dict):
+            return 0
+
+        restored_ids = set()
+        for firm_id, value in (data.get("credit_limit", {}) or {}).items():
+            self.firm_credit_limit[str(firm_id)] = max(0.0, float(value or 0.0))
+            restored_ids.add(str(firm_id))
+        for firm_id, value in (data.get("debt_balance", {}) or {}).items():
+            self.firm_debt_balance[str(firm_id)] = max(0.0, float(value or 0.0))
+            restored_ids.add(str(firm_id))
+        for firm_id, value in (data.get("distress_months", {}) or {}).items():
+            self.firm_credit_distress_months[str(firm_id)] = max(0, int(value or 0))
+            restored_ids.add(str(firm_id))
+        for firm_id, value in (data.get("defaulted", {}) or {}).items():
+            self.firm_credit_defaulted[str(firm_id)] = bool(value)
+            restored_ids.add(str(firm_id))
+
+        self.logger.info(f"Restored firm credit state for {len(restored_ids)} firms from checkpoint")
+        return len(restored_ids)

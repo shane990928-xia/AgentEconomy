@@ -3,12 +3,43 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import os
+import threading
 
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower() or "cpu"
+if device == "cuda" and not torch.cuda.is_available():
+    device = "cpu"
 
-tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
-model = AutoModel.from_pretrained(os.getenv("MODEL_PATH")).to(device)
+_tokenizer = None
+_model = None
+_model_lock = threading.RLock()
+
+
+def _get_embedding_model():
+    global _tokenizer, _model
+    if _tokenizer is not None and _model is not None:
+        return _tokenizer, _model
+
+    with _model_lock:
+        if _tokenizer is not None and _model is not None:
+            return _tokenizer, _model
+
+        model_path = os.getenv("MODEL_PATH")
+        if not model_path:
+            raise RuntimeError(
+                "MODEL_PATH is required for product vector search embeddings. "
+                "Set MODEL_PATH to a local embedding model path before calling embedding()."
+            )
+
+        try:
+            _tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+            _model = AutoModel.from_pretrained(model_path, local_files_only=True).to(device)
+            _model.eval()
+        except Exception:
+            _tokenizer = None
+            _model = None
+            raise
+        return _tokenizer, _model
 
 def embedding(text: str):
     """
@@ -20,21 +51,30 @@ def embedding(text: str):
     Returns:
         np.ndarray: The normalized embedding vector.
     """
-    inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    # Mean pooling
-    pooled_output = mean_pooling(outputs, inputs['attention_mask']).squeeze(0)
-    pooled_output = torch.nan_to_num(pooled_output.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    global _tokenizer, _model
+    try:
+        with _model_lock:
+            tokenizer, model = _get_embedding_model()
+            inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = model(**inputs)
+            
+            # Mean pooling
+            pooled_output = mean_pooling(outputs, inputs['attention_mask']).squeeze(0)
+            pooled_output = torch.nan_to_num(pooled_output.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Clip extreme values before normalization to prevent overflow
-    pooled_output = torch.clamp(pooled_output, min=-1e6, max=1e6)
+            # Clip extreme values before normalization to prevent overflow
+            pooled_output = torch.clamp(pooled_output, min=-1e6, max=1e6)
 
-    # Normalize the output
-    normalized_embedding = F.normalize(pooled_output, p=2, dim=0)
-    vec = normalized_embedding.detach().cpu().numpy().astype(np.float32, copy=False)
+            # Normalize the output
+            normalized_embedding = F.normalize(pooled_output, p=2, dim=0)
+            vec = normalized_embedding.detach().cpu().numpy().astype(np.float32, copy=False)
+    except Exception:
+        with _model_lock:
+            _tokenizer = None
+            _model = None
+        raise
     
     # Additional safety: handle any remaining non-finite values
     if not np.isfinite(vec).all():

@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from agenteconomy.data.industry_cate_map import industry_cate_map
 from agenteconomy.agent.firm import ManufactureFirm, RetailFirm, ServiceFirm, Firm
@@ -41,6 +41,37 @@ def create_households(
         household_kwargs=household_kwargs,
     )
     out = list(households.values())
+
+    # Household dollar-scale: shrink PSID income/wealth/expenditure so the household
+    # sector is consistent with the (BLS-wage) firm scale — i.e. household income is
+    # comparable to wage-earning capacity, so employment drives income. Applied before
+    # initialize_in_system so the scaled ER85692 seeds the ledger cash.
+    hh_scale = float(os.getenv("AGENTECO_HOUSEHOLD_SCALE", "1.0") or 1.0)
+    if hh_scale != 1.0:
+        _dollar_fields = (
+            "ER85629", "ER85692", "ER85701", "ER85747", "ER85768",
+            "expenditure_insurance", "expenditure_retail_merchandise",
+            "expenditure_transportation", "expenditure_utilities",
+        )
+        for household in out:
+            cv = getattr(household, "csv_values", None)
+            if not isinstance(cv, dict):
+                continue
+            for f in _dollar_fields:
+                v = cv.get(f)
+                if v is None:
+                    continue
+                try:
+                    cv[f] = float(v) * hh_scale
+                except (TypeError, ValueError):
+                    continue
+            for f in ("ER85629", "ER85692"):
+                if hasattr(household, f):
+                    try:
+                        setattr(household, f, float(cv.get(f) or 0.0))
+                    except (TypeError, ValueError):
+                        pass
+
     if economic_center is not None or labor_market is not None or product_market is not None:
         for household in out:
             household.initialize_in_system(
@@ -224,6 +255,7 @@ def create_firms(
     labor_market: Optional['LaborMarket'] = None,
     product_market: Optional['ProductMarket'] = None,
     abstract_resource_market: Optional['AbstractResourceMarket'] = None,
+    limit: Optional[int] = None,
 ) -> List[Firm]:
     """
     根据 industry_cate_map 创建所有行业的企业
@@ -238,10 +270,40 @@ def create_firms(
         List[Firm]: 包含制造商、零售商、服务商的企业列表
     """
     firms = []
+    limit_count = None if limit is None else max(0, int(limit))
+
+    def _take_items(items: Sequence[Tuple[str, str]], count: Optional[int]) -> List[Tuple[str, str]]:
+        if count is None:
+            return list(items)
+        return list(items)[:max(0, int(count))]
+
+    cat1_items = list(industry_cate_map.get("category_1_manufacturers", {}).get("industries", {}).items())
+    cat2_items = list(industry_cate_map.get("category_2_retailers", {}).get("industries", {}).items())
+    cat3_items: List[Tuple[str, str, str]] = []
+    cat3 = industry_cate_map.get("category_3_cost_drivers", {})
+    GOVERNMENT_SUBGROUP = "government_sectors"  # 政府行业子组，跳过不创建企业
+    for subgroup_name, subgroup_info in cat3.get("subgroups", {}).items():
+        if subgroup_name == GOVERNMENT_SUBGROUP:
+            continue
+        for industry_code, industry_name in subgroup_info.get("industries", {}).items():
+            cat3_items.append((subgroup_name, industry_code, industry_name))
+
+    if limit_count is not None:
+        if limit_count <= 0:
+            return []
+        full_count = len(cat1_items) + len(cat2_items) + len(cat3_items)
+        if limit_count < full_count:
+            retail_count = min(len(cat2_items), limit_count)
+            remaining = max(0, limit_count - retail_count)
+            service_count = min(len(cat3_items), max(1, round(limit_count * 0.20))) if remaining >= 2 else 0
+            service_count = min(service_count, remaining)
+            mfg_count = max(0, remaining - service_count)
+            cat1_items = _take_items(cat1_items, mfg_count)
+            cat2_items = _take_items(cat2_items, retail_count)
+            cat3_items = list(cat3_items)[:service_count]
     
     # Category 1: 制造商
-    cat1 = industry_cate_map.get("category_1_manufacturers", {})
-    for industry_code, industry_name in cat1.get("industries", {}).items():
+    for industry_code, industry_name in cat1_items:
         firm = ManufactureFirm(
             firm_id=f"mfg_{industry_code}",
             name=industry_name,
@@ -255,8 +317,7 @@ def create_firms(
         firms.append(firm)
     
     # Category 2: 零售商
-    cat2 = industry_cate_map.get("category_2_retailers", {})
-    for industry_code, industry_name in cat2.get("industries", {}).items():
+    for industry_code, industry_name in cat2_items:
         firm = RetailFirm(
             firm_id=f"ret_{industry_code}",
             name=industry_name,
@@ -271,32 +332,24 @@ def create_firms(
     
     # Category 3: 服务商（有 subgroups）
     # 注意：government_sectors 不创建为独立企业，其费用由 Government Agent 收取
-    cat3 = industry_cate_map.get("category_3_cost_drivers", {})
-    GOVERNMENT_SUBGROUP = "government_sectors"  # 政府行业子组，跳过不创建企业
-    
-    for subgroup_name, subgroup_info in cat3.get("subgroups", {}).items():
-        # 跳过政府行业，这些由 Government Agent 处理
-        if subgroup_name == GOVERNMENT_SUBGROUP:
-            continue
-            
-        for industry_code, industry_name in subgroup_info.get("industries", {}).items():
-            firm_id = f"svc_{industry_code}"
-            firm = ServiceFirm(
-                firm_id=firm_id,
-                name=industry_name,
-                industry=industry_code,
-                industry_type=f"category_3_{subgroup_name}",
-                economic_center=economic_center,
-                labor_market=labor_market,
-                product_market=product_market,
-                abstract_resource_market=abstract_resource_market,
-            )
-            firms.append(firm)
-            
-            # 注册到 AbstractResourceMarket，建立 industry_code → firm_id 映射
-            # 这样当有人采购该行业资源时，资金会流向真实的 ServiceFirm
-            if abstract_resource_market is not None:
-                abstract_resource_market.register_firm(industry_code, firm_id)
+    for subgroup_name, industry_code, industry_name in cat3_items:
+        firm_id = f"svc_{industry_code}"
+        firm = ServiceFirm(
+            firm_id=firm_id,
+            name=industry_name,
+            industry=industry_code,
+            industry_type=f"category_3_{subgroup_name}",
+            economic_center=economic_center,
+            labor_market=labor_market,
+            product_market=product_market,
+            abstract_resource_market=abstract_resource_market,
+        )
+        firms.append(firm)
+        
+        # 注册到 AbstractResourceMarket，建立 industry_code → firm_id 映射
+        # 这样当有人采购该行业资源时，资金会流向真实的 ServiceFirm
+        if abstract_resource_market is not None:
+            abstract_resource_market.register_firm(industry_code, firm_id)
     
     return firms
 

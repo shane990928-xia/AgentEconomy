@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentEconomy Runtime</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">AE</div>
+          <div>
+            <h1>AgentEconomy Runtime</h1>
+            <p id="runPath">等待记录</p>
+          </div>
+        </div>
+        <div class="toolbar">
+          <select id="runSelect" aria-label="选择运行记录"></select>
+          <button id="refreshBtn" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section class="status-band">
+        <div class="stage-status">
+          <span id="liveDot" class="live-dot"></span>
+          <div>
+            <p class="label">当前阶段</p>
+            <h2 id="activeStage">无活动阶段</h2>
+          </div>
+        </div>
+        <div class="status-meta">
+          <div>
+            <span class="label">月份</span>
+            <strong id="activeMonth">--</strong>
+          </div>
+          <div>
+            <span class="label">更新时间</span>
+            <strong id="updatedAt">--</strong>
+          </div>
+          <div>
+            <span class="label">记账状态</span>
+            <strong id="accountingState">--</strong>
+          </div>
+        </div>
+      </section>
+
+      <main class="workspace">
+        <section class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <p class="label">回放</p>
+              <h3 id="replayTitle">月度记录</h3>
+            </div>
+            <div class="replay-controls">
+              <button id="prevBtn" type="button">上一月</button>
+              <button id="playBtn" type="button">播放</button>
+              <button id="nextBtn" type="button">下一月</button>
+              <select id="speedSelect" aria-label="回放速度">
+                <option value="1800">0.5x</option>
+                <option value="1000" selected>1x</option>
+                <option value="450">2x</option>
+              </select>
+            </div>
+          </div>
+          <input id="monthRange" class="month-range" type="range" min="0" max="0" value="0">
+          <div id="metricGrid" class="metric-grid"></div>
+        </section>
+
+        <section class="panel stage-panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">决策阶段</p>
+              <h3>阶段流</h3>
+            </div>
+            <span id="eventCount" class="count-pill">0</span>
+          </div>
+          <div id="stageTimeline" class="stage-timeline"></div>
+          <div id="stageRows" class="stage-rows"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">序列</p>
+              <h3>宏观路径</h3>
+            </div>
+            <span id="chartFocus" class="count-pill">GDP</span>
+          </div>
+          <canvas id="seriesChart" height="220"></canvas>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">企业</p>
+              <h3>工资销售闭合</h3>
+            </div>
+            <span id="profitState" class="count-pill">--</span>
+          </div>
+          <div id="profitGrid" class="detail-grid"></div>
+          <div id="gapList" class="gap-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">金融</p>
+              <h3>信贷与约束</h3>
+            </div>
+          </div>
+          <div id="creditGrid" class="detail-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">清算</p>
+              <h3>记账不变量</h3>
+            </div>
+          </div>
+          <div id="accountingGrid" class="detail-grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

@@ -61,6 +61,12 @@ class TaxPolicy(BaseModel):
         le=1.0,
         description="Value-added tax rate (消费税)"
     )
+    fica_tax_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="FICA/工资税率，员工侧源泉扣缴（0=停用，保持旧行为）"
+    )
 
 
 # =============================================================================
@@ -164,6 +170,7 @@ class LaborHour(BaseModel):
     job_title: Optional[str] = Field(None, description="The title of the job")
     job_SOC: Optional[str] = Field(None, description="The SOC code of the job")
     firm_id: Optional[str] = Field(None, description="The firm ID that posted the job")
+    wage_per_hour: Optional[float] = Field(None, description="Matched hourly wage")
     
     @model_validator(mode='after')
     def compute_daily_hours(self) -> 'LaborHour':
@@ -491,6 +498,18 @@ class Job(BaseModel):
     is_valid: bool = Field(default=True, description="Whether the job is currently available")
     positions_available: int = Field(default=1, description="Number of positions available")
     hours_per_period: Optional[float] = Field(None, description="Hours per work period")
+    matching_loss_floor: Optional[float] = Field(
+        None,
+        description="Optional minimum matching loss for fallback or buffer-stock jobs",
+    )
+    demand_priority: float = Field(
+        default=0.0,
+        description="Current-period firm demand priority used by configurable labor offer policies",
+    )
+    demand_wage_bonus: float = Field(
+        default=0.0,
+        description="Hourly-wage-equivalent bonus applied by demand-adjusted offer selection",
+    )
 
     @classmethod
     def create(
@@ -503,7 +522,10 @@ class Job(BaseModel):
         hours_per_period: Optional[float] = None,
         required_skills: Optional[Dict[str, Dict[str, float]]] = None,
         required_abilities: Optional[Dict[str, Dict[str, float]]] = None,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        matching_loss_floor: Optional[float] = None,
+        demand_priority: float = 0.0,
+        demand_wage_bonus: float = 0.0
     ) -> 'Job':
         """
         Create a new job posting.
@@ -518,6 +540,9 @@ class Job(BaseModel):
             required_skills: Required skill levels
             required_abilities: Required ability levels
             job_id: Unique ID (auto-generated if None)
+            matching_loss_floor: Minimum matching loss for fallback jobs
+            demand_priority: Current-period firm demand priority
+            demand_wage_bonus: Wage-equivalent demand priority bonus
             
         Returns:
             New Job instance
@@ -531,7 +556,10 @@ class Job(BaseModel):
             description=description,
             hours_per_period=hours_per_period,
             required_skills=required_skills or {},
-            required_abilities=required_abilities or {}
+            required_abilities=required_abilities or {},
+            matching_loss_floor=matching_loss_floor,
+            demand_priority=float(demand_priority or 0.0),
+            demand_wage_bonus=float(demand_wage_bonus or 0.0),
         )
 
 
@@ -718,6 +746,7 @@ class Transaction(BaseModel):
         'tax_collection',     # General tax collection
         'financial',          # Financial transaction
         'wholesale',          # Wholesale transaction (retailer -> manufacturer)
+        'credit_draw',        # Firm credit facility draw
     ] = Field(default='purchase', description="Type of transaction")
     
     # === Lifecycle Tracking ===

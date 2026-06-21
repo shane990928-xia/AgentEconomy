@@ -245,6 +245,20 @@ class CheckpointManager:
         except Exception as e:
             logger.warning(f"Failed to get firm monthly data snapshot: {e}")
             return {}
+
+    def _get_firm_credit_state_snapshot(self, economic_center) -> Dict[str, Any]:
+        """获取企业信用状态快照"""
+        if economic_center is None:
+            return {}
+        try:
+            if self._is_ray_actor(economic_center):
+                data = ray.get(economic_center.get_firm_credit_state_snapshot.remote())
+            else:
+                data = economic_center.get_firm_credit_state_snapshot()
+            return data or {}
+        except Exception as e:
+            logger.warning(f"Failed to get firm credit state snapshot: {e}")
+            return {}
     
     def _get_product_market_snapshot(self, product_market) -> Dict[str, Any]:
         """获取 ProductMarket 快照"""
@@ -357,6 +371,9 @@ class CheckpointManager:
             # EconomicCenter 企业月度数据（用于企业所得税计算）
             "firm_monthly_data": self._get_firm_monthly_data_snapshot(simulator.economic_center),
 
+            # EconomicCenter 企业信用状态（用于恢复融资约束和违约状态）
+            "firm_credit_state": self._get_firm_credit_state_snapshot(simulator.economic_center),
+
             # ProductMarket (产品库存和价格)
             "product_market": self._get_product_market_snapshot(simulator.product_market),
             
@@ -374,6 +391,17 @@ class CheckpointManager:
                 "_last_balance_by_household": dict(simulator._last_balance_by_household or {}),
                 "_last_expected_income_by_household": dict(simulator._last_expected_income_by_household or {}),
                 "_last_sales_by_product": dict(simulator._last_sales_by_product or {}),
+                "_last_planned_demand_by_product": dict(getattr(simulator, "_last_planned_demand_by_product", {}) or {}),
+                "_last_unmet_demand_by_product": dict(getattr(simulator, "_last_unmet_demand_by_product", {}) or {}),
+                "_last_production_gap_value_by_firm": dict(
+                    getattr(simulator, "_last_production_gap_value_by_firm", {}) or {}
+                ),
+                "_last_production_value_by_firm": dict(
+                    getattr(simulator, "_last_production_value_by_firm", {}) or {}
+                ),
+                "_last_service_value_by_industry": dict(
+                    getattr(simulator, "_last_service_value_by_industry", {}) or {}
+                ),
                 "_fixed_consumption_basket": dict(getattr(simulator, "_fixed_consumption_basket", None) or {}),
             },
         }
@@ -465,6 +493,7 @@ class CheckpointManager:
         # 并行恢复各个组件状态（使用批量 ray.get）
         ledger_data = checkpoint_data.get("ledger", {})
         firm_monthly_data = checkpoint_data.get("firm_monthly_data", {})
+        firm_credit_state = checkpoint_data.get("firm_credit_state", {})
         product_market_data = checkpoint_data.get("product_market", {})
         labor_market_data = checkpoint_data.get("labor_market", {})
         
@@ -480,6 +509,9 @@ class CheckpointManager:
             if firm_monthly_data:
                 restore_futures.append(simulator.economic_center.restore_firm_monthly_data.remote(firm_monthly_data))
                 restore_names.append(f"firm monthly data ({len(firm_monthly_data)} firms)")
+            if firm_credit_state:
+                restore_futures.append(simulator.economic_center.restore_firm_credit_state.remote(firm_credit_state))
+                restore_names.append("firm credit state")
         
         # ProductMarket 恢复
         if simulator.product_market and self._is_ray_actor(simulator.product_market):
@@ -517,6 +549,8 @@ class CheckpointManager:
                 simulator.economic_center.restore_balances(ledger_data)
             if firm_monthly_data:
                 simulator.economic_center.restore_firm_monthly_data(firm_monthly_data)
+            if firm_credit_state:
+                simulator.economic_center.restore_firm_credit_state(firm_credit_state)
         
         if simulator.product_market and not self._is_ray_actor(simulator.product_market):
             if product_market_data.get("products"):
@@ -546,6 +580,17 @@ class CheckpointManager:
         simulator._last_balance_by_household = dict(sim_state.get("_last_balance_by_household") or {})
         simulator._last_expected_income_by_household = dict(sim_state.get("_last_expected_income_by_household") or {})
         simulator._last_sales_by_product = dict(sim_state.get("_last_sales_by_product") or {})
+        simulator._last_planned_demand_by_product = dict(sim_state.get("_last_planned_demand_by_product") or {})
+        simulator._last_unmet_demand_by_product = dict(sim_state.get("_last_unmet_demand_by_product") or {})
+        simulator._last_production_gap_value_by_firm = dict(
+            sim_state.get("_last_production_gap_value_by_firm") or {}
+        )
+        simulator._last_production_value_by_firm = dict(
+            sim_state.get("_last_production_value_by_firm") or {}
+        )
+        simulator._last_service_value_by_industry = dict(
+            sim_state.get("_last_service_value_by_industry") or {}
+        )
         # 恢复固定消费篮子
         basket = sim_state.get("_fixed_consumption_basket")
         if basket:

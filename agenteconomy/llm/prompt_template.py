@@ -17,6 +17,39 @@ def build_firm_post_job_prompt(firm):
 # Consumption: step0 (major budget allocation)
 # =============================================================================
 
+CONSUMPTION_PROFILE_PROMPT = """\
+You are assigning stable household consumption behavior parameters for a
+long-running macroeconomic agent-based simulation.
+
+Inputs:
+- persona (selected fields): {persona}
+- household_state: {household_state}
+- macro_indicators: {macro_indicators}
+
+Task:
+Infer a stable consumption profile. Do not choose products, do not set taxes,
+do not clear markets, and do not override accounting or liquidity constraints.
+The simulator will use these parameters as preference inputs to a constrained
+monthly consumption function.
+
+Parameter meanings:
+- price_sensitivity: 0.0=quality/fit focused, 1.0=strongly price focused.
+- liquidity_preference: 0.0=willing to spend down cash, 1.0=strong cash buffer.
+- habit_strength: 0.0=adjusts quickly, 1.0=strongly follows past spending.
+- essential_bias: -1.0=more discretionary, 1.0=more essential/basic needs.
+
+Output STRICT JSON ONLY with this schema:
+{{
+  "price_sensitivity": 0.0,
+  "liquidity_preference": 0.0,
+  "habit_strength": 0.0,
+  "essential_bias": 0.0,
+  "strategy_type": "brief stable strategy label",
+  "explanation": "one short sentence"
+}}
+"""
+
+
 CONSUMPTION_MAJOR_BUDGET_PROMPT = """\
 You are allocating a household's monthly consumption budget. Make a realistic and economically rational decision.
 
@@ -33,13 +66,15 @@ You are allocating a household's monthly consumption budget. Make a realistic an
 ## Macroeconomic Environment
 {macro_indicators}
 
+## Empirical Budget Anchor
+{empirical_constraints}
+
 ## Budget Allocation Principles (IMPORTANT)
-1. **Income-based spending**: If employed, spend 70-90% of monthly income.
-2. **Savings buffer**: Keep at least 3-6 months of expenses in savings for emergencies.
-3. **Consumption smoothing**: Avoid dramatic changes in spending. If last_month_consumption > 0, this month should be within ±20% of it.
-4. **Unemployment response**: If no income but have savings, maintain ~60-80% of historical spending level (draw from savings).
-5. **Minimum needs**: Even with no income, allocate at least $1,500 for basic necessities if savings allow.
-6. **Maximum constraint**: Never spend more than available_balance (savings) in a single month.
+1. Treat the empirical anchor as the binding budget envelope. Do not invent a larger monthly budget.
+2. You may express household preferences by shifting category shares, but keep shares close to the anchor.
+3. Income, wealth, household size, and historical expenditure are already embedded in the anchor.
+4. Preserve a cash buffer and avoid spending more than available_balance.
+5. Use the persona and macro environment for narrative and small preference adjustments only.
 
 ## Task
 Decide total_budget and allocate it into these categories:
@@ -82,6 +117,7 @@ Inputs:
 - available_balance: {available_balance}
 - expected_income: {expected_income}
 - available_budget: {available_budget}
+- empirical_category_anchors: {empirical_category_anchors}
 
 Task:
 For EACH category (by its category name), do both:
@@ -89,7 +125,7 @@ For EACH category (by its category name), do both:
 2) Provide a list of need_descriptions (strings) that are comprehensive and specific enough to reflect the household's full needs in that category.
 
 Rules:
-- Budgets MUST sum exactly to total_budget (allow a small floating error <= 0.01).
+- Budgets MUST sum exactly to total_budget (allow a small floating error <= 0.01), and should stay close to empirical_category_anchors.
 - total_budget MUST be <= available_budget.
 - Each category must have at least 1 need description.
 - Use English only.

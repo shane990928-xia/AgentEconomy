@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import logging
+from agenteconomy.market.pricing_policy import PricingPolicy, PricingPolicyInput
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,10 @@ class AbstractResourceMarket:
         
         # 行业代码 → 企业ID 映射（用于将资金路由到真实的 ServiceFirm）
         self.industry_to_firm: Dict[str, str] = {}
+
+        # 最近一次定价策略审计分解（按 industry_code）
+        self.pricing_policy = PricingPolicy()
+        self.price_policy_audit: Dict[str, Dict[str, Any]] = {}
         
         # 行业代码到单位类型的映射
         self.industry_unit_mapping = {
@@ -393,9 +398,6 @@ class AbstractResourceMarket:
         quantity = budget / unit_price  # 预算÷价格 = 数量
         total_cost = budget  # 实际花费就是预算
         
-        # 累积需求（用于后续价格调整）
-        resource.total_demand += quantity
-        
         # 获取资金接收方
         receiver_id = self.get_receiver_id(industry_code)
         is_government_fee = industry_code in GOVERNMENT_INDUSTRY_CODES
@@ -414,76 +416,110 @@ class AbstractResourceMarket:
             "is_government_fee": is_government_fee,
             "purchase_type": "by_budget"  # 标记为预算购买
         }
-        self.transactions.append(transaction)
         
         # 通过 EconomicCenter 记录交易并执行转账
         if self.economic_center is not None:
             try:
                 import ray
-                ray.get(self.economic_center.record_resource_purchase.remote(
-                    month=period,
-                    buyer_id=buyer_id,
-                    industry_code=industry_code,
-                    quantity=quantity,
-                    unit_price=unit_price,
-                    total_cost=total_cost,
-                    unit=resource.unit.value,
-                    base_price=resource.base_price,
-                    receiver_id=receiver_id
-                ))
+                method = getattr(self.economic_center, "record_resource_purchase")
+                if 'ActorHandle' in str(type(self.economic_center)):
+                    tx_id = ray.get(method.remote(
+                        month=period,
+                        buyer_id=buyer_id,
+                        industry_code=industry_code,
+                        quantity=quantity,
+                        unit_price=unit_price,
+                        total_cost=total_cost,
+                        unit=resource.unit.value,
+                        base_price=resource.base_price,
+                        receiver_id=receiver_id
+                    ))
+                else:
+                    tx_id = method(
+                        month=period,
+                        buyer_id=buyer_id,
+                        industry_code=industry_code,
+                        quantity=quantity,
+                        unit_price=unit_price,
+                        total_cost=total_cost,
+                        unit=resource.unit.value,
+                        base_price=resource.base_price,
+                        receiver_id=receiver_id
+                    )
+                if not tx_id:
+                    logger.warning(
+                        f"家庭服务消费未成交: {buyer_id} → {receiver_id} "
+                        f"预算${budget:.2f} ({industry_code})"
+                    )
+                    return None
+                transaction["tx_id"] = tx_id
                 logger.info(
                     f"家庭服务消费: {buyer_id} → {receiver_id} "
                     f"预算${budget:.2f} → {quantity:.2f}单位 ({industry_code})"
                 )
             except Exception as e:
                 logger.error(f"EconomicCenter 记录交易失败: {e}")
+                return None
+
+        # 只在成交成功或无账本运行模式下累积需求和本地交易。
+        resource.total_demand += quantity
+        self.transactions.append(transaction)
         
         return transaction
     
-    def adjust_prices(self, period: int):
+    def adjust_prices(
+        self,
+        period: int,
+        demand_sensitivity: float = 0.20,
+        max_change: float = 0.05,
+        mean_reversion_strength: float = 0.02,
+        stickiness: float = 0.0
+    ):
         """
         根据供需调整所有资源的价格
         
         在每期结束时调用。
-        涨跌对称 + 均值回归，防止价格单调漂移。
+        使用可审计定价策略；均值回归是可配置弱锚。
         """
         for industry_code, resource in self.resources.items():
             # 计算供需比
             if resource.supply_capacity > 0:
                 demand_supply_ratio = resource.total_demand / resource.supply_capacity
             else:
-                demand_supply_ratio = 0
+                demand_supply_ratio = 1.0
             
             old_price = resource.current_price
-            
-            # 价格调整逻辑（对称调整，幅度缩小）
-            if demand_supply_ratio > 1.1:  # 供不应求
-                adjustment = 1.02  # 涨价2%
-            elif demand_supply_ratio > 1.02:
-                adjustment = 1.01  # 涨价1%
-            elif demand_supply_ratio == 0:  # 完全无需求
-                adjustment = 0.95  # 降价5%
-            elif demand_supply_ratio < 0.85:  # 供过于求
-                adjustment = 0.97  # 降价3%
-            elif demand_supply_ratio < 0.95:
-                adjustment = 0.99  # 降价1%
-            else:
-                adjustment = 1.0  # 维持
-            
-            # 应用供需调整
-            new_price = resource.current_price * adjustment
-            
-            # 均值回归：向基准价回归（每期 5%）
-            mean_reversion = 0.08
-            new_price = new_price * (1 - mean_reversion) + resource.base_price * mean_reversion
-            
-            # 价格上下限（不能偏离基准价太远，±30%）
-            min_price = resource.base_price * 0.7
-            max_price = resource.base_price * 1.3
-            new_price = max(min_price, min(max_price, new_price))
+
+            policy_ratio = max(demand_supply_ratio, 0.01)
+            result = self.pricing_policy.apply(PricingPolicyInput(
+                current_price=old_price,
+                unit_cost=None,
+                demand_supply_ratio=policy_ratio,
+                markup=0.0,
+                stickiness=stickiness,
+                max_change=max_change,
+                min_price=0.000001,
+                cost_weight=0.0,
+                inventory_sensitivity=0.0,
+                demand_sensitivity=demand_sensitivity,
+                benchmark_weight=0.0,
+                mean_reversion_target=resource.base_price,
+                mean_reversion_strength=mean_reversion_strength,
+            ))
+            result.components["observed_demand_supply_ratio"] = demand_supply_ratio
+            result.components["total_demand"] = resource.total_demand
+            result.components["supply_capacity"] = resource.supply_capacity
+            new_price = result.new_price
             
             resource.current_price = new_price
             resource.price_history.append(new_price)
+            self.price_policy_audit[industry_code] = {
+                "period": period,
+                "resource": resource.name,
+                "old_price": old_price,
+                "new_price": new_price,
+                "components": dict(result.components),
+            }
             
             # 重置需求统计
             old_demand = resource.total_demand
@@ -497,6 +533,17 @@ class AbstractResourceMarket:
                 f"需求/供给={demand_supply_ratio:.2f}, "
                 f"总需求={old_demand:.2f}{resource.unit.value}"
             )
+
+    def get_price_policy_audit(self, industry_code: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取最近一次资源定价策略审计分解。
+
+        Args:
+            industry_code: 指定行业代码；为空则返回全部最近记录
+        """
+        if industry_code is not None:
+            return dict(self.price_policy_audit.get(industry_code, {}))
+        return {code: dict(record) for code, record in self.price_policy_audit.items()}
     
     def get_resource_info(self, industry_code: str) -> ResourceInfo:
         """获取资源信息"""
@@ -678,5 +725,3 @@ if __name__ == "__main__":
         print(f"  基准价: ${info['base_price']:.4f}")
         print(f"  当期价: ${info['current_price']:.4f} ({info['price_ratio']:.2%})")
         print(f"  需求: {info['total_demand']:.2f} ({info['utilization']:.2%}利用率)")
-
-
