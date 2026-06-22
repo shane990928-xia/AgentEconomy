@@ -19,6 +19,8 @@ simulation:
   endogenous_wages: true
   wage_adjustment_speed: 0.3
   wage_target_unemployment: 0.08
+  household_dollar_scale: 0.25
+  wage_scale_init: 0.3
   labor_demand_smoothing: 1.0
   firm_job_posting_use_llm: false
   active_production_planning: true

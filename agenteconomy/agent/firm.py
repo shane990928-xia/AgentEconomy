@@ -1424,6 +1424,19 @@ class ManufactureFirm(Firm):
             # 9. 根据实际成本更新价格
             if update_inventory and self.product_market is not None and total_quantity > 0:
                 avg_unit_cost = cost_breakdown['total_cost'] / total_quantity
+                # 成本推动渠道(Phillips)：把当前工资水平并入单位成本基准。劳动市场紧张时
+                # 内生工资上升 → 单位成本上升 → 价格上升 → 通胀，从而产生通胀-失业负相关。
+                try:
+                    _wscale = float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0)
+                except (TypeError, ValueError):
+                    _wscale = 1.0
+                # 劳动成本份额约 0.55(IO 补偿均值)；按工资相对基准(0.3 起调)的偏离放大单位成本。
+                _labor_share = 0.55
+                _wage_ref = 0.3
+                if _wage_ref > 0:
+                    avg_unit_cost = avg_unit_cost * (
+                        (1.0 - _labor_share) + _labor_share * (_wscale / _wage_ref)
+                    )
                 # 批量更新该行业所有产品的价格
                 ray.get(self.product_market.batch_update_prices_by_industry.remote(
                     manufacturer_code=self.industry,

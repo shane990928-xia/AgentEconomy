@@ -58,7 +58,15 @@ class Simulator:
             config: SimulationConfig instance loaded from YAML
         """
         self.config: SimulationConfig = config
-        
+
+        # 把家庭/工资缩放从环境变量提升为 config 驱动（可复现）；在任何 agent 创建前设置。
+        _hds = float(getattr(config, "household_dollar_scale", 1.0) or 1.0)
+        _wsi = float(getattr(config, "wage_scale_init", 1.0) or 1.0)
+        if _hds != 1.0:
+            os.environ["AGENTECO_HOUSEHOLD_SCALE"] = str(_hds)
+        if _wsi != 1.0:
+            os.environ["AGENTECO_WAGE_SCALE"] = str(_wsi)
+
         # Basic entities and markets
         self.economic_center: Optional[EconomicCenter] = None
         self.labor_market: Optional[LaborMarket] = None

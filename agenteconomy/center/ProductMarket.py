@@ -1212,7 +1212,7 @@ class ProductMarket:
     def adjust_raw_material_prices(
         self,
         industry_code: str,
-        base_adjustment: float = 0.03,
+        base_adjustment: float = 0.08,
         max_adjustment: float = 0.10,
         mean_reversion_strength: float = 0.0
     ) -> int:
@@ -1331,8 +1331,8 @@ class ProductMarket:
     def adjust_prices_by_supply_demand(
         self,
         manufacturer_code: str,
-        base_adjustment: float = 0.015,
-        max_adjustment: float = 0.04,
+        base_adjustment: float = 0.06,
+        max_adjustment: float = 0.10,
         mean_reversion_strength: float = 0.02,
         benchmark_weight: float = 0.0,
         inventory_sensitivity: float = 0.03,

@@ -101,6 +101,8 @@ class SimulationConfig:
     wage_adjustment_speed: float = 0.3   # 工资调整速度 kappa
     wage_target_unemployment: float = 0.08  # 工资调整目标失业率
     labor_demand_smoothing: float = 1.0  # 企业劳动需求信号 EMA(alpha<1 平滑,抑制周期-2 蛛网震荡;1=不平滑)
+    household_dollar_scale: float = 1.0  # 家庭部门美元缩放(收入/财富/支出),与工资尺度一致(1=不缩放)
+    wage_scale_init: float = 1.0  # 初始工资缩放(内生工资从此起调);=AGENTECO_WAGE_SCALE 的 config 化
     firm_job_posting_use_llm: bool = False
     labor_match_top_k: int = 8
     labor_match_offer_backups: int = 3
@@ -288,6 +290,8 @@ class SimulationConfig:
             wage_adjustment_speed=float(sim_data.get('wage_adjustment_speed', 0.3)),
             wage_target_unemployment=float(sim_data.get('wage_target_unemployment', 0.08)),
             labor_demand_smoothing=float(sim_data.get('labor_demand_smoothing', 1.0)),
+            household_dollar_scale=float(sim_data.get('household_dollar_scale', 1.0)),
+            wage_scale_init=float(sim_data.get('wage_scale_init', 1.0)),
             firm_job_posting_use_llm=bool(sim_data.get('firm_job_posting_use_llm', False)),
             labor_match_top_k=int(sim_data.get('labor_match_top_k', 8)),
             labor_match_offer_backups=int(sim_data.get('labor_match_offer_backups', 3)),
