@@ -550,14 +550,16 @@ class SimulatorAccountingInvariantTests(unittest.TestCase):
         self.assertEqual(sim._last_planned_demand_by_product, {"sku_1": 10.0})
         self.assertEqual(sim._last_unmet_demand_by_product, {"sku_1": 4.0, "sku_2": 3.0})
 
-    def test_production_demand_signal_prefers_last_planned_demand_over_low_sales(self):
+    def test_production_demand_signal_ignores_last_planned_demand(self):
+        # 需求信号只取真实来源(当前需求/实际销售/未满足缺口)，不再纳入上月计划需求，
+        # 以打破"计划高→产出高→计划仍高"的产量失控棘轮。
         sim = Simulator(SimulationConfig(num_households=1))
         sim._last_planned_demand_by_product = {"sku_1": 10.0}
         sim._last_sales_by_product = {"sku_1": 2.0}
 
         result = sim._build_production_demand_signal({"sku_1": 1.0})
 
-        self.assertEqual(result, {"sku_1": 10.0})
+        self.assertEqual(result, {"sku_1": 2.0})
 
     def test_product_demand_merge_sums_valid_sources(self):
         sim = Simulator(SimulationConfig(num_households=1))

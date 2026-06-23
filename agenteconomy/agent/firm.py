@@ -505,7 +505,10 @@ class Firm:
 
         industry_type = str(getattr(self, "industry_type", "") or "")
         is_retailer = industry_type == "retail" or str(self.firm_id).startswith("ret_")
-        if is_retailer and source in {"last_month_income", "current_cash"}:
+        # 零售商的劳动基数应是渠道增加值(毛利)，而非全额销售/需求(GMV)。
+        # GMV 里大部分是上游进货成本，按 GMV×comp_ratio 定工资会让工资超过毛利→必然亏损破产。
+        # 故对 current_demand / last_month_income / current_cash 等以销售额计的来源都折算为毛利基数。
+        if is_retailer and source in {"current_demand", "last_month_income", "current_cash", "production_history"}:
             share = max(0.0, min(1.0, float(retail_labor_value_share or 0.0)))
             if share > 0.0:
                 base_value *= share
@@ -1442,7 +1445,7 @@ class ManufactureFirm(Firm):
                     manufacturer_code=self.industry,
                     avg_unit_cost=avg_unit_cost,
                     manufacturer_margin=0.15,  # 制造商利润率15%
-                    retail_margin=0.25         # 零售商利润率25%
+                    retail_margin=0.45         # 零售商加价45%：覆盖零售商工资+管理费用，避免负毛利破产
                 ))
             
             # 10. 记录生产历史

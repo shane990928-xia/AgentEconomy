@@ -47,7 +47,7 @@ class FakeProductMarket:
             "available_after": snapshot["available_stock"],
         }
 
-    def receive_retailer_inventory(self, retailer_id, product_id, quantity):
+    def receive_retailer_inventory(self, retailer_id, product_id, quantity, unit_cost=None):
         self.retailer_inventory_receipts.append((retailer_id, product_id, quantity))
         key = (retailer_id, product_id)
         self.seller_stock[key] = float(self.seller_stock.get(key, 0.0) or 0.0) + float(quantity or 0.0)

@@ -103,7 +103,8 @@ class EconomicCenterCreditTests(unittest.TestCase):
         self.assertAlmostEqual(center.firm_debt_balance["ret_452"], 80.0)
         self.assertAlmostEqual(center.ledger["ret_452"].amount, 0.0)
         self.assertAlmostEqual(center.ledger["mfg_322"].amount, 105.0)
-        self.assertAlmostEqual(center.firm_monthly_data["ret_452"][2]["expenses"], 100.0)
+        # 进销存会计：进货是购入存货(资产)，不计当期费用；COGS 在销售时(process_purchase)结转。
+        self.assertAlmostEqual(center.firm_monthly_data["ret_452"][2].get("expenses", 0.0), 0.0)
         self.assertAlmostEqual(center.firm_monthly_data["mfg_322"][2]["income"], 100.0)
         credit_txs = [tx for tx in center.tx_history if tx.type == "credit_draw"]
         self.assertEqual(len(credit_txs), 1)

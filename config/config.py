@@ -105,6 +105,7 @@ class SimulationConfig:
     wage_scale_init: float = 1.0  # 初始工资缩放(内生工资从此起调);=AGENTECO_WAGE_SCALE 的 config 化
     firm_job_posting_use_llm: bool = False
     labor_match_top_k: int = 8
+    retailer_procurement_safety_factor: float = 1.0
     labor_match_offer_backups: int = 3
     labor_match_demand_priority_weight: float = 5000.0
     labor_offer_acceptance_policy: str = "best_loss"
@@ -154,6 +155,7 @@ class SimulationConfig:
     production_apply_capacity_constraints: bool = True
     production_labor_productivity: float = 2.5
     production_value_calibrated_labor_productivity: bool = True
+    production_value_calibrated_productivity_cap: float = 20.0
     production_capital_productivity: float = 1.0
     production_unit_cash_cost: Optional[float] = None
     production_unit_cash_cost_share: float = 0.6
@@ -294,6 +296,7 @@ class SimulationConfig:
             wage_scale_init=float(sim_data.get('wage_scale_init', 1.0)),
             firm_job_posting_use_llm=bool(sim_data.get('firm_job_posting_use_llm', False)),
             labor_match_top_k=int(sim_data.get('labor_match_top_k', 8)),
+            retailer_procurement_safety_factor=float(sim_data.get('retailer_procurement_safety_factor', 1.0)),
             labor_match_offer_backups=int(sim_data.get('labor_match_offer_backups', 3)),
             labor_match_demand_priority_weight=float(sim_data.get('labor_match_demand_priority_weight', 5000.0)),
             labor_offer_acceptance_policy=str(sim_data.get('labor_offer_acceptance_policy', 'best_loss')),

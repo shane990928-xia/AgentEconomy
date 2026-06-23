@@ -1471,7 +1471,16 @@ class EconomicCenter:
         self.ledger[seller_id].amount += base_price
         self.record_firm_income(seller_id, base_price)
         self.record_firm_monthly_income(seller_id, month, base_price)
-        
+
+        # 进销存会计 COGS 结转：卖方是零售商时，按实际售出量结转已售商品的进货成本为费用。
+        # 配合 process_wholesale 不在进货时计费用 → 零售商 P&L = 销售毛利 - 工资 - 其它，
+        # 滞销库存留作存货资产而非当期亏损，避免零售商被滞销拖垮破产。
+        if base_unit_price is not None and float(base_unit_price or 0.0) > 0.0 and qty > 0.0:
+            cogs = float(base_unit_price) * qty
+            if cogs > 0.0:
+                self.record_firm_expense(seller_id, cogs)
+                self.record_firm_monthly_expense(seller_id, month, cogs)
+
         return purchase_tx.id
 
     def process_wholesale(
@@ -1521,11 +1530,9 @@ class EconomicCenter:
         # 零售商支付批发价
         self.ledger[retailer_id].amount -= wholesale_amount
 
-        # 记录零售商的进货成本（影响企业所得税税基）
-        # 没有这一步，taxable_profit = 销售收入 - 工资，进货成本被遗漏
-        # 导致零售商利润虚高 → 企业所得税虚高 → 现金枯竭 → 进货失败
-        self.record_firm_expense(retailer_id, wholesale_amount)
-        self.record_firm_monthly_expense(retailer_id, month, wholesale_amount)
+        # 进销存会计：进货是"购入存货"(资产)，不是当期费用。已售商品的成本(COGS)
+        # 在销售时(process_purchase)按实际售出量结转为费用。若在此处全额计费用，
+        # 滞销库存会让零售商账面巨亏→破产。COGS 结转保证 taxable_profit = 销售毛利 - 工资。
 
         # 创建批发交易记录
         wholesale_tx = self._record_transaction(

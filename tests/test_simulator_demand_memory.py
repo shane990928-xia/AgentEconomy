@@ -112,6 +112,7 @@ class SimulatorDemandMemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_production_demand_signal_includes_current_and_history(self):
         sim = Simulator(SimulationConfig(num_households=1))
+        # 上月计划需求不再纳入信号(打破产量棘轮)；信号 = max(当前需求, 实际销售, 未满足缺口)。
         sim._last_planned_demand_by_product = {
             "sku_history": 4.0,
             "sku_overlap": 2.0,
@@ -132,9 +133,10 @@ class SimulatorDemandMemoryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(signal["sku_current"], 7.0)
-        self.assertEqual(signal["sku_history"], 4.0)
+        self.assertNotIn("sku_history", signal)  # 仅来自 planned → 不再进信号
         self.assertEqual(signal["sku_sales"], 3.0)
         self.assertEqual(signal["sku_unmet"], 5.0)
+        # sku_overlap: max(current=6, unmet=9) = 9（planned=2 被忽略）
         self.assertEqual(signal["sku_overlap"], 9.0)
 
 

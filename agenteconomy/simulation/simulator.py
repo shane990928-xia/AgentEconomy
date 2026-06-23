@@ -2711,9 +2711,13 @@ class Simulator:
         for snapshot in product_snapshots or []:
             if not snapshot:
                 continue
+            # 用基准批发价(base_manufacturer_price)做价格锚，而非当前价格。
+            # 否则通缩期当前价格下跌→校准生产率(=目标产值/(价格×工时))暴涨→产量暴增→
+            # 供过于求→价格更低→生产率更高，形成产量失控棘轮(实测生产率从2.5飙到1900+，
+            # 月产为真实需求的10倍，存货虚增，GDP 支出法 I 失真)。基准价稳定，打破该反馈。
             price = float(
-                snapshot.get("manufacturer_price")
-                or snapshot.get("base_manufacturer_price")
+                snapshot.get("base_manufacturer_price")
+                or snapshot.get("manufacturer_price")
                 or snapshot.get("retail_price")
                 or 0.0
             )
@@ -2751,7 +2755,11 @@ class Simulator:
         compensation_ratio = max(0.01, float(getattr(firm, "compensation_ratio", 0.2) or 0.2))
         target_output_value = total_wage / compensation_ratio
         calibrated_units_per_hour = target_output_value / (avg_price * total_hours)
-        return max(base_productivity, calibrated_units_per_hour)
+        # 生产率上限：校准值不超过基准生产率的固定倍数，防止极端价格/工资比导致产量失控。
+        productivity_cap = base_productivity * float(
+            getattr(self.config, "production_value_calibrated_productivity_cap", 20.0) or 20.0
+        )
+        return max(base_productivity, min(calibrated_units_per_hour, productivity_cap))
 
     def _estimate_unit_cash_cost_for_targets(
         self,
@@ -2831,6 +2839,12 @@ class Simulator:
             进货统计 {total_qty, total_value, by_retailer, by_manufacturer}
         """
         # 按零售商汇总进货需求: {retailer_code: {product_id: qty}}
+        # 零售商进货保守系数：家庭计划需求(desired_qty)>实际成交量(受预算/价格约束)，
+        # 满额按计划进货会让卖不掉的库存累积成亏损→零售商破产→商品市场崩溃。
+        # 按保守系数(<1)进货，留滞销缓冲，使进货贴近真实动销。
+        procurement_safety = max(
+            0.1, min(1.0, float(getattr(self.config, "retailer_procurement_safety_factor", 1.0) or 1.0))
+        )
         procurement_by_retailer: Dict[str, Dict[str, int]] = defaultdict(dict)
         if demand_by_retailer_product:
             for retailer_code, products in (demand_by_retailer_product or {}).items():
@@ -2839,7 +2853,7 @@ class Simulator:
                 if not isinstance(products, dict):
                     continue
                 for product_id, demand_qty in products.items():
-                    qty = int(float(demand_qty or 0.0))
+                    qty = int(float(demand_qty or 0.0) * procurement_safety)
                     if qty <= 0:
                         continue
                     snapshot = self._get_product_snapshot_cached(str(product_id), snapshot_cache)
@@ -2860,7 +2874,7 @@ class Simulator:
                 if not retailer_code or retailer_code not in self.retailers_by_industry:
                     continue
                 
-                procurement_by_retailer[str(retailer_code)][str(product_id)] = int(float(demand_qty or 0.0))
+                procurement_by_retailer[str(retailer_code)][str(product_id)] = int(float(demand_qty or 0.0) * procurement_safety)
 
         procurement_by_retailer = self._allocate_retailer_procurement_by_stock(
             procurement_by_retailer,
@@ -2954,6 +2968,7 @@ class Simulator:
                             retailer.firm_id,
                             product_id,
                             actual_qty,
+                            wholesale_price,
                         )
                         retailer_qty += actual_qty
                         retailer_value += amount
@@ -2979,6 +2994,7 @@ class Simulator:
                             retailer.firm_id,
                             product_id,
                             actual_qty,
+                            wholesale_price,
                         )
                         retailer_qty += actual_qty
                         retailer_value += amount
@@ -4451,6 +4467,10 @@ class Simulator:
                 "total_job_positions": int(labor_summary.get("total_job_positions", 0) or 0),
                 "total_matched_jobs": int(labor_summary.get("total_matched_jobs", 0) or 0),
                 "job_fill_rate": float(labor_summary.get("job_fill_rate", 0.0) or 0.0),
+                "vacancy_rate": (lambda pos, mat: (pos - mat) / pos if pos > 0 else 0.0)(
+                    int(labor_summary.get("total_job_positions", 0) or 0),
+                    int(labor_summary.get("total_matched_jobs", 0) or 0),
+                ),
                 "total_wage_gross": gross_wage_total,
                 "total_wage_net": net_wage_total,
                 "average_wage": average_wage,
@@ -4509,6 +4529,7 @@ class Simulator:
                 "investment_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("investment_rate", 0.0) or 0.0),
                 "government_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("government_rate", 0.0) or 0.0),
                 "labor_share": float((gdp_comprehensive or {}).get("ratios", {}).get("labor_share", 0.0) or 0.0),
+                "wage_scale": float(getattr(self, "_wage_level", 1.0) or 1.0),
             },
             "details": {
                 "labor_market_raw": labor_summary,
@@ -4878,9 +4899,12 @@ class Simulator:
 
     def _build_production_demand_signal(self, current_demand_by_product: Dict[str, float]) -> Dict[str, float]:
         demand_signal: Dict[str, float] = {}
+        # 需求信号只取"真实"来源：本月家庭需求、历史实际销售、未满足缺口。
+        # 不再纳入 _last_planned_demand_by_product(上月计划需求)——计划需求含上月的
+        # target-inventory 加成，若用 max 累积会形成棘轮：计划高→产出高→记为计划→下月
+        # 仍高，产出脱离真实需求(实测制造商月产为真实需求的4倍，存货虚增、GDP 支出法 I 虚高)。
         sources = (
             current_demand_by_product or {},
-            self._last_planned_demand_by_product or {},
             self._last_sales_by_product or {},
             self._last_unmet_demand_by_product or {},
         )

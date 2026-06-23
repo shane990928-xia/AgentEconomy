@@ -167,6 +167,11 @@ class ProductMarket:
         
         # 零售商库存追踪 (retailer_id -> {product_id -> stock})
         self.retailer_inventory: Dict[str, Dict[str, float]] = {}
+        # 零售商库存的加权平均进货单位成本 (retailer_id -> {product_id -> unit_cost})
+        # 用于销售时按 COGS(已售商品进货成本)结转费用，实现进销存会计：
+        # 进货→存货(资产，不计当期费用)，销售→收入+COGS(已售部分成本计费用)。
+        # 否则进货全额计当期费用，滞销库存会让零售商账面巨亏→破产。
+        self.retailer_inventory_unit_cost: Dict[str, Dict[str, float]] = {}
         
         # 供需追踪（按行业）：用于价格调整
         # {manufacturer_code: {"demand": float, "supply": float}}
@@ -643,14 +648,27 @@ class ProductMarket:
             "available_after": product.available_stock,
         }
 
-    def receive_retailer_inventory(self, retailer_id: str, product_id: str, quantity: float) -> Dict[str, Any]:
-        """Increase retailer-owned sellable inventory after a successful wholesale purchase."""
+    def receive_retailer_inventory(self, retailer_id: str, product_id: str, quantity: float, unit_cost: Optional[float] = None) -> Dict[str, Any]:
+        """Increase retailer-owned sellable inventory after a successful wholesale purchase.
+
+        Tracks a weighted-average procurement unit cost per (retailer, SKU) so that
+        sales can expense COGS (cost of goods actually sold) instead of expensing the
+        full procurement up front — this is what keeps unsold inventory from showing
+        as a loss and bankrupting retailers.
+        """
         qty = self._coerce_quantity(quantity)
         if qty <= 0.0 or not retailer_id or not product_id:
             return {"success": False, "retailer_id": retailer_id, "product_id": product_id, "quantity": 0.0}
         bucket = self._seller_inventory_bucket(retailer_id)
         before = float(bucket.get(product_id, 0.0) or 0.0)
         bucket[product_id] = before + qty
+        # 维护加权平均进货单位成本
+        if unit_cost is not None and float(unit_cost) > 0.0:
+            cost_bucket = self.retailer_inventory_unit_cost.setdefault(str(retailer_id), {})
+            prev_cost = float(cost_bucket.get(product_id, 0.0) or 0.0)
+            new_qty = before + qty
+            if new_qty > 0.0:
+                cost_bucket[product_id] = (prev_cost * before + float(unit_cost) * qty) / new_qty
         return {
             "success": True,
             "retailer_id": str(retailer_id),
@@ -659,6 +677,12 @@ class ProductMarket:
             "available_before": before,
             "available_after": bucket[product_id],
         }
+
+    def get_retailer_inventory_unit_cost(self, retailer_id: str, product_id: str) -> float:
+        """Return the weighted-average procurement unit cost for a retailer's SKU (0 if unknown)."""
+        return float(
+            (self.retailer_inventory_unit_cost.get(str(retailer_id), {}) or {}).get(product_id, 0.0) or 0.0
+        )
 
     def restore_retailer_inventory(self, retailer_id: str, product_id: str, quantity: float) -> Dict[str, Any]:
         """Rollback helper for failed retail-sale financial settlement."""
@@ -1013,7 +1037,8 @@ class ProductMarket:
         manufacturer_margin: float = 0.15,
         retail_margin: float = 0.25,
         smoothing_factor: float = 0.15,
-        max_change_ratio: float = 0.05
+        max_change_ratio: float = 0.05,
+        mean_reversion_strength: float = 0.05,
     ) -> int:
         """
         批量更新某制造业行业所有产品的价格
@@ -1074,7 +1099,8 @@ class ProductMarket:
                 inventory_sensitivity=0.0,
                 demand_sensitivity=0.0,
                 benchmark_weight=0.0,
-                mean_reversion_strength=0.0,
+                mean_reversion_target=base_mfg if base_mfg > 0 else None,
+                mean_reversion_strength=mean_reversion_strength,
             ))
             retail_result = self.pricing_policy.apply(PricingPolicyInput(
                 current_price=old_retail,
@@ -1086,7 +1112,8 @@ class ProductMarket:
                 inventory_sensitivity=0.0,
                 demand_sensitivity=0.0,
                 benchmark_weight=0.0,
-                mean_reversion_strength=0.0,
+                mean_reversion_target=product.base_retail_price if product.base_retail_price > 0 else None,
+                mean_reversion_strength=mean_reversion_strength,
             ))
             
             # 更新价格
@@ -1418,7 +1445,16 @@ class ProductMarket:
             retail_result.components["legacy_supply_demand_ratio"] = ratio
 
             product.manufacturer_price = max(0.01, mfg_result.new_price)
-            product.retail_price = max(0.01, retail_result.new_price)
+            # 零售价下限 = max(当前批发价, 基准批发价) ×(1+最小零售加价)。
+            # 关键：COGS 按 base_manufacturer_price 结转，故下限必须以基准批发价为锚，
+            # 否则供需把当前批发价压低时零售价跌破 COGS → 零售商亏本卖 → 破产 → 商品市场崩。
+            _min_retail_markup = 0.20
+            _cogs_anchor = max(
+                float(product.manufacturer_price),
+                float(getattr(product, "base_manufacturer_price", 0.0) or 0.0),
+            )
+            _retail_floor = _cogs_anchor * (1.0 + _min_retail_markup)
+            product.retail_price = max(0.01, _retail_floor, retail_result.new_price)
             self._record_price_policy_audit(product.product_id, "manufacturer", mfg_result, "supply_demand")
             self._record_price_policy_audit(product.product_id, "retail", retail_result, "supply_demand")
             price_changes.append(float(mfg_result.components.get("change_ratio", 0.0) or 0.0))
