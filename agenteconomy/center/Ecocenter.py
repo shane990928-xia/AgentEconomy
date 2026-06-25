@@ -3158,7 +3158,20 @@ class EconomicCenter:
         goods_final_sales_base_value = household_goods_base_value + government_procurement
         goods_final_sales_ex_tax = household_goods_consumption_ex_tax + government_procurement
         total_sales_ex_tax = household_consumption_ex_tax + government_procurement
-        inventory_investment = goods_output - goods_final_sales_base_value
+        # 商品中间消耗：制造商之间采购的实物 SKU 被下游用作中间投入而消耗掉，
+        # 既不是最终销售也不是期末存货，却包含在 goods_output 里。若不扣除，
+        # 它会被当成存货投资虚增支出法 GDP，正好等于生产侧的商品中间消耗
+        # （生产侧 value_added = output - cost 已把它减掉），从而拉开 exp_vs_prod。
+        # total_production_cost 是全部商品中间投入；intermediate_service_output 是
+        # 企业采购的抽象服务（无实物库存流，已单列），两者之差即商品中间消耗。
+        goods_intermediate_consumption = max(
+            0.0,
+            float(ps.get("total_production_cost", 0.0) or 0.0)
+            - intermediate_service_output_total,
+        )
+        inventory_investment = (
+            goods_output - goods_final_sales_base_value - goods_intermediate_consumption
+        )
         inventory_investment_memo = inventory_investment
         
         # 支出法 GDP = C + G + I（封闭经济，无固定资本投资）
