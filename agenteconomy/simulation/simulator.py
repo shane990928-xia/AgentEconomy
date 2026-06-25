@@ -4072,6 +4072,13 @@ class Simulator:
                         getattr(self.config, "firm_allow_cash_based_startup_hiring", False)
                     ),
                     use_llm=bool(getattr(self.config, "firm_job_posting_use_llm", False)),
+                    wage_bidding_enabled=bool(
+                        getattr(self.config, "firm_wage_bidding_enabled", False)
+                    ),
+                    wage_bid_up=float(getattr(self.config, "firm_wage_bid_up", 0.04) or 0.0),
+                    wage_bid_down=float(getattr(self.config, "firm_wage_bid_down", 0.02) or 0.0),
+                    wage_premium_min=float(getattr(self.config, "firm_wage_premium_min", 0.5) or 0.0),
+                    wage_premium_max=float(getattr(self.config, "firm_wage_premium_max", 2.5) or 1.0),
                 )
             )
             task_firms.append(firm)

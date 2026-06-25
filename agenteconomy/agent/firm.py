@@ -365,6 +365,10 @@ class Firm:
         self.employee_count: int = 0 # Number of employees
         self.employee_list: List[LaborHour] = [] # List of employees
 
+        # 工资竞价(B):企业自身的出价工资溢价(相对 BLS×全局标量)。劳动紧张(空缺填不满)
+        # 时上调以吸引工人,满员时回落。提供 wage→cost→price 的真实菲利普斯传导。
+        self.wage_premium: float = 1.0
+
         # Firm financials
         self.capital_stock: float = 0.0 # Capital stock
         self.cash: float = 0.0 # Cash
@@ -645,7 +649,7 @@ class Firm:
             info = job_data.get(soc)
             if not info:
                 continue
-            hourly_wage = float(info.get("wage", 0.0) or 0.0) * float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0)
+            hourly_wage = float(info.get("wage", 0.0) or 0.0) * float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0) * float(getattr(self, "wage_premium", 1.0) or 1.0)
             if hourly_wage <= 0.0:
                 continue
             min_job_cost = hourly_wage * min_part_time_hours
@@ -777,6 +781,45 @@ class Firm:
         return self.employee_count, self.employee_list
 
     # Labor market operations
+    def _update_wage_premium(
+        self,
+        bid_up: float = 0.04,
+        bid_down: float = 0.02,
+        premium_min: float = 0.5,
+        premium_max: float = 2.5,
+    ) -> float:
+        """
+        工资竞价(B):按企业自身的空缺填补情况内生调整出价工资溢价。
+
+        机制(无 reduced-form 捷径):
+        - 读取本企业当前仍未填补的空缺(get_firm_job_snapshot,即上轮 post→match 后
+          还剩下的开放岗位)。
+        - 有未填补空缺 → 招不到人 → 劳动紧张 → 上调溢价吸引工人(bid_up)。
+        - 无未填补空缺 → 已招满 → 溢价向 1.0 回落(bid_down),避免单调上行。
+        这样劳动市场紧张直接体现为企业加薪 → 真实劳动成本上升 → 单位成本上升 →
+        价格上升,菲利普斯曲线从供需传导中涌现,而非由公式硬编码。
+        """
+        try:
+            snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
+        except Exception:
+            snapshot = None
+        open_positions = 0
+        if isinstance(snapshot, dict):
+            for positions in snapshot.values():
+                try:
+                    open_positions += int(positions or 0)
+                except (TypeError, ValueError):
+                    continue
+        premium = float(getattr(self, "wage_premium", 1.0) or 1.0)
+        if open_positions > 0:
+            premium *= (1.0 + max(0.0, float(bid_up)))
+        else:
+            # 满员:向中性 1.0 线性回落(对 >1 和 <1 都收敛)
+            premium += (1.0 - premium) * max(0.0, min(1.0, float(bid_down)))
+        premium = max(float(premium_min), min(float(premium_max), premium))
+        self.wage_premium = premium
+        return premium
+
     async def post_jobs(
         self,
         period: Optional[int] = None,
@@ -787,20 +830,33 @@ class Firm:
         allow_cash_based_startup_hiring: bool = False,
         retail_labor_value_share: float = 0.25,
         use_llm: bool = False,
+        wage_bidding_enabled: bool = False,
+        wage_bid_up: float = 0.04,
+        wage_bid_down: float = 0.02,
+        wage_premium_min: float = 0.5,
+        wage_premium_max: float = 2.5,
     ):
         """
         Post jobs to the labor market
-        
+
         支持双向调整：
         - desired > existing: 发布增量职位
         - desired < existing: 缩减空缺职位（不影响已雇佣的员工）
-        
+
         Args:
             period: 当前期间
             current_demand_value: 本月的需求/生产价值（用于计算劳动预算）
             use_llm: If True, allow the legacy LLM fallback when no data-driven
                 job plan can be produced.
+            wage_bidding_enabled: 若开启,先按上轮空缺填补情况内生调整 self.wage_premium。
         """
+        if wage_bidding_enabled:
+            self._update_wage_premium(
+                bid_up=wage_bid_up,
+                bid_down=wage_bid_down,
+                premium_min=wage_premium_min,
+                premium_max=wage_premium_max,
+            )
         jobs = self._decide_job_postings_from_data(
             period=period,
             current_demand_value=current_demand_value,
@@ -1428,18 +1484,21 @@ class ManufactureFirm(Firm):
             if update_inventory and self.product_market is not None and total_quantity > 0:
                 avg_unit_cost = cost_breakdown['total_cost'] / total_quantity
                 # 成本推动渠道(Phillips)：把当前工资水平并入单位成本基准。劳动市场紧张时
-                # 内生工资上升 → 单位成本上升 → 价格上升 → 通胀，从而产生通胀-失业负相关。
-                try:
-                    _wscale = float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0)
-                except (TypeError, ValueError):
-                    _wscale = 1.0
-                # 劳动成本份额约 0.55(IO 补偿均值)；按工资相对基准(0.3 起调)的偏离放大单位成本。
-                _labor_share = 0.55
-                _wage_ref = 0.3
-                if _wage_ref > 0:
-                    avg_unit_cost = avg_unit_cost * (
-                        (1.0 - _labor_share) + _labor_share * (_wscale / _wage_ref)
-                    )
+                # 内生工资上升 → 单位成本上升 → 价格上升 → 通胀。
+                # NOTE: 这是一条 reduced-form 捷径(直接把全局工资标量乘进成本)，用 env gate
+                # AGENTECO_COSTPUSH 控制，便于消融实验区分"涌现"vs"硬编码"。默认开(=1)。
+                if os.getenv("AGENTECO_COSTPUSH", "1") == "1":
+                    try:
+                        _wscale = float(os.getenv("AGENTECO_WAGE_SCALE", "1.0") or 1.0)
+                    except (TypeError, ValueError):
+                        _wscale = 1.0
+                    # 劳动成本份额约 0.55(IO 补偿均值)；按工资相对基准(0.3 起调)的偏离放大单位成本。
+                    _labor_share = 0.55
+                    _wage_ref = 0.3
+                    if _wage_ref > 0:
+                        avg_unit_cost = avg_unit_cost * (
+                            (1.0 - _labor_share) + _labor_share * (_wscale / _wage_ref)
+                        )
                 # 批量更新该行业所有产品的价格
                 ray.get(self.product_market.batch_update_prices_by_industry.remote(
                     manufacturer_code=self.industry,

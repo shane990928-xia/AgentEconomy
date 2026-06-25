@@ -110,6 +110,13 @@ class SimulationConfig:
     labor_match_demand_priority_weight: float = 5000.0
     labor_offer_acceptance_policy: str = "best_loss"
     labor_offer_demand_wage_bonus: float = 0.0
+    # 企业工资竞价(B):企业按自身空缺填补率内生调整出价工资,劳动紧张→加薪→真实
+    # 劳动成本上升→价格上升→菲利普斯涌现(取代 reduced-form 内生工资公式+成本推动捷径)。
+    firm_wage_bidding_enabled: bool = False
+    firm_wage_bid_up: float = 0.04          # 有未填补空缺时,工资溢价上调步长
+    firm_wage_bid_down: float = 0.02         # 满员时,溢价向 1.0 回落步长
+    firm_wage_premium_min: float = 0.5
+    firm_wage_premium_max: float = 2.5
     firm_min_part_time_hours_per_month: float = 20.0
     firm_max_startup_part_time_hours_per_month: float = 160.0
     firm_min_job_budget_coverage: float = 1.0
@@ -301,6 +308,11 @@ class SimulationConfig:
             labor_match_demand_priority_weight=float(sim_data.get('labor_match_demand_priority_weight', 5000.0)),
             labor_offer_acceptance_policy=str(sim_data.get('labor_offer_acceptance_policy', 'best_loss')),
             labor_offer_demand_wage_bonus=float(sim_data.get('labor_offer_demand_wage_bonus', 0.0)),
+            firm_wage_bidding_enabled=bool(sim_data.get('firm_wage_bidding_enabled', False)),
+            firm_wage_bid_up=float(sim_data.get('firm_wage_bid_up', 0.04)),
+            firm_wage_bid_down=float(sim_data.get('firm_wage_bid_down', 0.02)),
+            firm_wage_premium_min=float(sim_data.get('firm_wage_premium_min', 0.5)),
+            firm_wage_premium_max=float(sim_data.get('firm_wage_premium_max', 2.5)),
             firm_min_part_time_hours_per_month=float(sim_data.get('firm_min_part_time_hours_per_month', 20.0)),
             firm_max_startup_part_time_hours_per_month=float(sim_data.get('firm_max_startup_part_time_hours_per_month', 160.0)),
             firm_min_job_budget_coverage=float(sim_data.get('firm_min_job_budget_coverage', 1.0)),
