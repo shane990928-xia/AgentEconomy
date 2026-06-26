@@ -747,6 +747,7 @@ class Transaction(BaseModel):
         'financial',          # Financial transaction
         'wholesale',          # Wholesale transaction (retailer -> manufacturer)
         'credit_draw',        # Firm credit facility draw
+        'capex_purchase',     # Firm fixed-capital investment (capital-goods purchase)
     ] = Field(default='purchase', description="Type of transaction")
     
     # === Lifecycle Tracking ===

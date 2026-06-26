@@ -188,9 +188,10 @@ class Bank:
             return False
     
     async def calculate_and_pay_monthly_interest(
-        self, 
+        self,
         month: int,
-        household_ids: Optional[List[str]] = None
+        household_ids: Optional[List[str]] = None,
+        annual_rate: float = 0.005
     ) -> float:
         """
         Calculate and distribute monthly interest based on household ledger balances.
@@ -211,7 +212,7 @@ class Bank:
             logger.warning("[银行利息] 经济中心未初始化")
             return 0.0
         
-        monthly_interest_rate = 0.005 / 12  # Convert annual rate 0.5% to monthly rate
+        monthly_interest_rate = max(0.0, float(annual_rate or 0.0)) / 12  # 年化利率转月度（默认 0.5%，可由政策利率驱动）
         total_interest_paid = 0.0
         households_paid = 0
         

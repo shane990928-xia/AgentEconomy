@@ -117,6 +117,31 @@ class SimulationConfig:
     firm_wage_bid_down: float = 0.02         # 满员时,溢价向 1.0 回落步长
     firm_wage_premium_min: float = 0.5
     firm_wage_premium_max: float = 2.5
+    # 货币政策(Taylor 规则央行):政策利率内生响应通胀缺口与失业缺口,经
+    # 信贷成本/储蓄/固定投资/消费传导到实体,使利率有真实宏观效应(支撑货币政策冲击 IRF)。
+    # 默认关闭,保持既有结果与测试不变。
+    taylor_rule_enabled: bool = False
+    taylor_target_inflation: float = 0.02   # 年化通胀目标 π*
+    taylor_phi_pi: float = 1.5              # 通胀缺口反应系数 φ_π
+    taylor_phi_u: float = 0.5               # 失业缺口反应系数 φ_u(失业高→降息)
+    taylor_target_unemployment: float = 0.05  # 自然失业率 u*
+    taylor_natural_rate: float = 0.005      # 自然/中性利率 r0(年化)
+    taylor_rate_min: float = 0.0            # 政策利率下限(年化)
+    taylor_rate_max: float = 0.20           # 政策利率上限(年化)
+    taylor_rate_inertia: float = 0.7        # 利率平滑 ρ(i_t=ρ·i_{t-1}+(1-ρ)·i_target)
+    taylor_rate_shock: float = 0.0          # 外生政策利率冲击(年化,用于 IRF 实验)
+    # 利率传导:企业信贷利率=政策利率+利差;家庭储蓄利率=政策利率×传递系数。
+    firm_credit_spread: float = 0.075       # 信贷利差(政策利率之上),默认接近原 0.08
+    savings_rate_passthrough: float = 1.0   # 储蓄利率对政策利率的传递系数
+    # 固定资本投资:企业按产能压力+利率内生投资,购买资本品(实物 SKU)→进入支出法 I。
+    # 真实资本品购买(非平衡表 capex),保证三方核算闭合。默认关闭。
+    fixed_investment_enabled: bool = False
+    investment_propensity: float = 0.05     # 投资倾向(占可投资基数比例)
+    investment_rate_sensitivity: float = 2.0  # 投资对利率偏离的敏感度
+    capital_depreciation_annual_rate: float = 0.08  # 资本年折旧率
+    investment_capacity_trigger: float = 0.8  # 产能利用率超此值才扩张投资
+    # 消费利率敏感性:实际利率上升→MPC 下降(储蓄增加)。默认 0 = 不改变现有行为。
+    consumption_rate_sensitivity: float = 0.0
     firm_min_part_time_hours_per_month: float = 20.0
     firm_max_startup_part_time_hours_per_month: float = 160.0
     firm_min_job_budget_coverage: float = 1.0
@@ -313,6 +338,24 @@ class SimulationConfig:
             firm_wage_bid_down=float(sim_data.get('firm_wage_bid_down', 0.02)),
             firm_wage_premium_min=float(sim_data.get('firm_wage_premium_min', 0.5)),
             firm_wage_premium_max=float(sim_data.get('firm_wage_premium_max', 2.5)),
+            taylor_rule_enabled=bool(sim_data.get('taylor_rule_enabled', False)),
+            taylor_target_inflation=float(sim_data.get('taylor_target_inflation', 0.02)),
+            taylor_phi_pi=float(sim_data.get('taylor_phi_pi', 1.5)),
+            taylor_phi_u=float(sim_data.get('taylor_phi_u', 0.5)),
+            taylor_target_unemployment=float(sim_data.get('taylor_target_unemployment', 0.05)),
+            taylor_natural_rate=float(sim_data.get('taylor_natural_rate', 0.005)),
+            taylor_rate_min=float(sim_data.get('taylor_rate_min', 0.0)),
+            taylor_rate_max=float(sim_data.get('taylor_rate_max', 0.20)),
+            taylor_rate_inertia=float(sim_data.get('taylor_rate_inertia', 0.7)),
+            taylor_rate_shock=float(sim_data.get('taylor_rate_shock', 0.0)),
+            firm_credit_spread=float(sim_data.get('firm_credit_spread', 0.075)),
+            savings_rate_passthrough=float(sim_data.get('savings_rate_passthrough', 1.0)),
+            fixed_investment_enabled=bool(sim_data.get('fixed_investment_enabled', False)),
+            investment_propensity=float(sim_data.get('investment_propensity', 0.05)),
+            investment_rate_sensitivity=float(sim_data.get('investment_rate_sensitivity', 2.0)),
+            capital_depreciation_annual_rate=float(sim_data.get('capital_depreciation_annual_rate', 0.08)),
+            investment_capacity_trigger=float(sim_data.get('investment_capacity_trigger', 0.8)),
+            consumption_rate_sensitivity=float(sim_data.get('consumption_rate_sensitivity', 0.0)),
             firm_min_part_time_hours_per_month=float(sim_data.get('firm_min_part_time_hours_per_month', 20.0)),
             firm_max_startup_part_time_hours_per_month=float(sim_data.get('firm_max_startup_part_time_hours_per_month', 160.0)),
             firm_min_job_budget_coverage=float(sim_data.get('firm_min_job_budget_coverage', 1.0)),

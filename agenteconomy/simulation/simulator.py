@@ -87,6 +87,8 @@ class Simulator:
         self._stage_event_seq = 0
         self._last_price_index: Optional[float] = None  # 基于 100 的价格指数
         self._last_inflation_rate: Optional[float] = None  # 上次计算的通胀率
+        # 货币政策:Taylor 规则政策利率(年化)。None 表示尚未初始化(首次用自然利率播种)。
+        self._policy_rate: Optional[float] = None
         self._last_balance_by_household: Dict[str, float] = {}
         self._last_expected_income_by_household: Dict[str, float] = {}
         self._last_sales_by_product: Dict[str, float] = {}
@@ -1365,11 +1367,58 @@ class Simulator:
         _os.environ["AGENTECO_WAGE_SCALE"] = str(self._wage_level)
         self._last_wage_level = self._wage_level
 
+    def _update_policy_rate(self) -> None:
+        """Taylor 规则央行:按上月通胀缺口与失业缺口内生设定政策利率(年化)。
+
+        i_target = r0 + φ_π·(π − π*) − φ_u·(u − u*) + shock
+        i_t      = ρ·i_{t−1} + (1−ρ)·i_target              (利率平滑)
+        并 clamp 到 [min, max]。失业高于自然率 → 降息(−φ_u 项),通胀高于目标 → 加息。
+        政策利率经信贷成本/储蓄/固定投资/消费传导到实体经济(各传导默认关闭,见 config)。
+
+        在月初调用,读上月落地的通胀(self._last_inflation_rate,月化)与当前劳动市场失业率,
+        设定本月生效的政策利率。镜像 _update_endogenous_wage 的状态机模式。
+        """
+        natural = float(getattr(self.config, "taylor_natural_rate", 0.005) or 0.0)
+        if self._policy_rate is None:
+            self._policy_rate = natural
+        if not bool(getattr(self.config, "taylor_rule_enabled", False)):
+            return
+        # 通胀:_last_inflation_rate 是月度通胀;年化目标转月度做缺口。
+        infl_monthly = float(self._last_inflation_rate or 0.0)
+        target_annual = float(getattr(self.config, "taylor_target_inflation", 0.02) or 0.0)
+        target_monthly = target_annual / 12.0
+        # 失业率:与内生工资同源(劳动市场 summary)。
+        u = None
+        try:
+            summ = self._call_actor(self.labor_market, "summary")
+            if isinstance(summ, dict):
+                u = float(summ.get("unemployment_rate", 0.0) or 0.0)
+        except Exception:
+            u = None
+        if u is None:
+            return
+        phi_pi = float(getattr(self.config, "taylor_phi_pi", 1.5) or 0.0)
+        phi_u = float(getattr(self.config, "taylor_phi_u", 0.5) or 0.0)
+        u_star = float(getattr(self.config, "taylor_target_unemployment", 0.05) or 0.0)
+        shock = float(getattr(self.config, "taylor_rate_shock", 0.0) or 0.0)
+        # 通胀缺口按年化口径反应(月度缺口×12 还原年化),与 φ_π 标准定义一致。
+        infl_gap_annual = (infl_monthly - target_monthly) * 12.0
+        i_target = natural + phi_pi * infl_gap_annual - phi_u * (u - u_star) + shock
+        rho = float(getattr(self.config, "taylor_rate_inertia", 0.7) or 0.0)
+        rho = max(0.0, min(1.0, rho))
+        prev = float(self._policy_rate if self._policy_rate is not None else natural)
+        rate = rho * prev + (1.0 - rho) * i_target
+        rmin = float(getattr(self.config, "taylor_rate_min", 0.0) or 0.0)
+        rmax = float(getattr(self.config, "taylor_rate_max", 0.20) or 0.20)
+        self._policy_rate = max(rmin, min(rmax, rate))
+
     async def _run_month(self, month: int):
         """Run a single month"""
         econ_month = self._econ_month(month, preheat=False)
         # 内生工资：按上月劳动市场松紧调整工资水平 → 自均衡失业 + Phillips（松紧→工资→价格→通胀）
         self._update_endogenous_wage(econ_month)
+        # 货币政策：按上月通胀+失业经 Taylor 规则设定本月政策利率（默认关闭则仅播种自然利率）
+        self._update_policy_rate()
         title = f" 月份 {month} (经济周期 M{econ_month}) "
         padding = (60 - len(title)) // 2
         logger.info(f"\n{'━' * 60}")
@@ -1502,7 +1551,16 @@ class Simulator:
         self._update_last_sales(econ_month, consumption_stats)
         self._update_demand_memory(production_demand_by_product, econ_month)
         self._update_layoff_support_memory(production_stats, service_consumption_stats)
-        
+
+        # ========== 固定资本投资(利率传导的投资渠道)==========
+        with self._time_block("固定资本投资", month=month, preheat=False):
+            capex_stats = self._execute_fixed_investment(econ_month)
+        if capex_stats and capex_stats.get("total", 0.0) > 0.0:
+            logger.info(
+                "[固定投资] 月份=%s 总额=$%.2f 企业数=%s",
+                econ_month, float(capex_stats.get("total", 0.0)), int(capex_stats.get("firms", 0)),
+            )
+
         # ========== 月末结算 ==========
         logger.info(f"\n┌{'─' * 38}┐")
         logger.info(f"│ 📊 月末结算                          │")
@@ -1518,7 +1576,20 @@ class Simulator:
         with self._time_block("企业信贷结算", month=month, preheat=False):
             firm_credit_stats = self._settle_firm_credit(econ_month)
             self._apply_credit_default_labor_closure(econ_month, firm_credit_stats)
-        
+
+        # 资本折旧(仅在固定投资启用时):资本存量按月折旧,计提折旧费用(权责发生制,不动现金)。
+        if bool(getattr(self.config, "fixed_investment_enabled", False)) and self.economic_center is not None:
+            with self._time_block("资本折旧", month=month, preheat=False):
+                try:
+                    self._call_actor(
+                        self.economic_center, "apply_monthly_depreciation",
+                        econ_month,
+                        float(getattr(self.config, "capital_depreciation_annual_rate", 0.08) or 0.0),
+                        True,
+                    )
+                except Exception as exc:
+                    logger.debug(f"[资本折旧] 失败: {exc}")
+
         with self._time_block("税收再分配", month=month, preheat=False):
             redistribution_stats = await self._redistribute_taxes(econ_month)
         self._log_redistribution_stats(redistribution_stats)
@@ -1598,11 +1669,11 @@ class Simulator:
             except Exception as e:
                 logger.debug(f"计算失业率失败: {e}")
 
-        # 3. 利率（从配置获取，转换为月度）
+        # 3. 利率（Taylor 启用时用政策利率驱动的储蓄利率，否则用配置；转换为月度）
         try:
-            annual_interest_rate = float(getattr(self.config, "interest_rate", 0.005) or 0.005)
+            annual_interest_rate = self._effective_savings_rate()
         except (TypeError, ValueError):
-            annual_interest_rate = 0.005
+            annual_interest_rate = float(getattr(self.config, "interest_rate", 0.005) or 0.005)
         monthly_interest_rate = annual_interest_rate / 12.0
 
         # 4. 税率（VAT + 估算的平均所得税率）
@@ -1633,6 +1704,9 @@ class Simulator:
             "interest_rate": round(monthly_interest_rate, 6),
             "tax_rate": round(effective_tax_rate, 4),
             "price_index": round(price_index, 2),
+            # 消费利率敏感性传导：策略据此让 MPC 随实际利率偏离自然利率而下降（默认 0 = 无效果）
+            "consumption_rate_sensitivity": float(getattr(self.config, "consumption_rate_sensitivity", 0.0) or 0.0),
+            "natural_rate_monthly": float(getattr(self.config, "taylor_natural_rate", 0.005) or 0.005) / 12.0,
         }
 
         logger.info(
@@ -4537,6 +4611,7 @@ class Simulator:
                 "government_rate": float((gdp_comprehensive or {}).get("ratios", {}).get("government_rate", 0.0) or 0.0),
                 "labor_share": float((gdp_comprehensive or {}).get("ratios", {}).get("labor_share", 0.0) or 0.0),
                 "wage_scale": float(getattr(self, "_wage_level", 1.0) or 1.0),
+                "policy_rate": float(self._policy_rate) if self._policy_rate is not None else float(getattr(self.config, "taylor_natural_rate", 0.005) or 0.0),
             },
             "details": {
                 "labor_market_raw": labor_summary,
@@ -5159,7 +5234,8 @@ class Simulator:
             
             total_interest = await self.bank.calculate_and_pay_monthly_interest(
                 month=month,
-                household_ids=household_ids
+                household_ids=household_ids,
+                annual_rate=self._effective_savings_rate(),
             )
             
             return {
@@ -5173,6 +5249,153 @@ class Simulator:
             traceback.print_exc()
             return {}
 
+    def _effective_firm_credit_rate(self) -> float:
+        """企业信贷年化利率。Taylor 启用时 = 政策利率 + 信贷利差,否则用静态配置值。"""
+        if bool(getattr(self.config, "taylor_rule_enabled", False)) and self._policy_rate is not None:
+            spread = float(getattr(self.config, "firm_credit_spread", 0.075) or 0.0)
+            return max(0.0, float(self._policy_rate) + spread)
+        return float(getattr(self.config, "firm_credit_annual_interest_rate", 0.08) or 0.08)
+
+    def _effective_savings_rate(self) -> float:
+        """家庭储蓄年化利率。Taylor 启用时 = 政策利率 × 传递系数,否则用静态配置值(默认 0.5%)。"""
+        if bool(getattr(self.config, "taylor_rule_enabled", False)) and self._policy_rate is not None:
+            passthrough = float(getattr(self.config, "savings_rate_passthrough", 1.0) or 0.0)
+            return max(0.0, float(self._policy_rate) * passthrough)
+        return float(getattr(self.config, "interest_rate", 0.005) or 0.005)
+
+    def _execute_fixed_investment(self, month: int) -> Dict[str, Any]:
+        """企业固定资本投资:按产能缺口+利率内生投资,购买资本品(实物 SKU)。
+
+        机制(利率传导的投资渠道):
+        - 投资信号 = 上轮产能缺口美元值(_last_production_gap_value_by_firm):缺口大说明
+          产能不足,企业想扩张 → 投资。
+        - 期望投资 = 缺口 × 投资倾向 × 利率因子,利率因子 = max(0, 1 − 敏感度·(政策利率−自然利率)):
+          加息 → 利率因子下降 → 投资减少(货币政策投资渠道)。
+        - 受现金约束(仅用账本现金,不走信贷)。
+        - 实物执行:从制造业 SKU 直购(capex_purchase 交易),买方现金→卖方收入,
+          卖方产出已在 goods_output,故进入支出法固定资本形成 I 而三方核算自动闭合。
+        - 买入资本计入双资本存量(firm.capital_stock + EconomicCenter.firm_capital_stock)。
+        """
+        stats: Dict[str, Any] = {"total": 0.0, "by_firm": {}, "firms": 0}
+        if not bool(getattr(self.config, "fixed_investment_enabled", False)):
+            return stats
+        if self.economic_center is None or self.product_market is None:
+            return stats
+
+        gap_by_firm = getattr(self, "_last_production_gap_value_by_firm", {}) or {}
+        if not gap_by_firm:
+            return stats
+
+        propensity = float(getattr(self.config, "investment_propensity", 0.05) or 0.0)
+        sensitivity = float(getattr(self.config, "investment_rate_sensitivity", 2.0) or 0.0)
+        natural = float(getattr(self.config, "taylor_natural_rate", 0.005) or 0.0)
+        rate = float(self._policy_rate) if self._policy_rate is not None else natural
+        rate_factor = max(0.0, 1.0 - sensitivity * (rate - natural))
+        if propensity <= 0.0 or rate_factor <= 0.0:
+            return stats
+
+        try:
+            balances = self._call_actor(self.economic_center, "get_all_balances") or {}
+        except Exception:
+            balances = {}
+
+        vat_rate = float(getattr(self.config, "vat_rate", 0.08) or 0.0)
+
+        total_invested = 0.0
+        for firm_id, gap_value in gap_by_firm.items():
+            fid = str(firm_id)
+            firm = self._firm_by_id.get(fid)
+            if firm is None:
+                continue
+            desired = float(gap_value or 0.0) * propensity * rate_factor
+            if desired <= 0.0:
+                continue
+            cash = float(balances.get(fid, 0.0) or 0.0)
+            # 含税购买预算上限:留出 VAT 空间,且不耗尽现金(留 50% 缓冲避免破产)。
+            spendable = max(0.0, cash * 0.5)
+            budget_with_tax = min(desired * (1.0 + vat_rate), spendable)
+            if budget_with_tax <= 1.0:
+                continue
+            base_budget = budget_with_tax / (1.0 + vat_rate)
+            invested = self._buy_capital_goods(fid, base_budget, month)
+            if invested > 0.0:
+                total_invested += invested
+                stats["by_firm"][fid] = invested
+                # 资本存量入账(双存量同步)。现金已在购买中流出,此处只增资本存量,
+                # 不再扣现金(否则双重扣减破坏货币守恒)。
+                try:
+                    self._call_actor(self.economic_center, "record_capital_formation", fid, invested, month)
+                except Exception:
+                    pass
+                try:
+                    firm.capital_stock = float(getattr(firm, "capital_stock", 0.0) or 0.0) + invested
+                except Exception:
+                    pass
+
+        stats["total"] = total_invested
+        stats["firms"] = len(stats["by_firm"])
+        return stats
+
+    def _buy_capital_goods(self, buyer_firm_id: str, base_budget: float, month: int) -> float:
+        """从制造业 SKU 直购资本品,返回实际投入的基价金额(不含税)。"""
+        capital_industries = getattr(self, "_capital_goods_industries", None)
+        if capital_industries is None:
+            # 资本品来自制造业(产出实物 SKU 的行业)。用已索引的制造商行业。
+            capital_industries = list((self.manufacturers_by_industry or {}).keys())
+            self._capital_goods_industries = capital_industries
+        if not capital_industries:
+            return 0.0
+
+        remaining = float(base_budget)
+        invested = 0.0
+        for ind in capital_industries:
+            if remaining <= 1.0:
+                break
+            try:
+                skus = self._call_actor(self.product_market, "get_skus_by_industry", ind, True) or []
+            except Exception:
+                skus = []
+            for sku in skus:
+                if remaining <= 1.0:
+                    break
+                unit_price = float(getattr(sku, "manufacturer_price", 0.0) or 0.0)
+                base_unit_price = float(getattr(sku, "base_manufacturer_price", 0.0) or 0.0) or unit_price
+                if unit_price <= 0.0:
+                    continue
+                product_id = str(getattr(sku, "product_id", "") or "")
+                seller_id = f"mfg_{ind}"
+                avail = float(getattr(sku, "available_stock", 0.0) or 0.0)
+                if avail <= 0.0:
+                    continue
+                qty = min(avail, remaining / unit_price)
+                qty = float(int(qty)) if qty >= 1.0 else 0.0
+                if qty <= 0.0:
+                    continue
+                try:
+                    res = self._call_actor(
+                        self.product_market, "purchase_from_seller_stock",
+                        product_id, seller_id, qty, False,
+                    )
+                except Exception:
+                    continue
+                actual_qty = float((res or {}).get("actual_quantity", 0.0) or 0.0)
+                if actual_qty <= 0.0:
+                    continue
+                amount = actual_qty * unit_price
+                try:
+                    tx_id = self._call_actor(
+                        self.economic_center, "process_purchase",
+                        month, buyer_firm_id, seller_id, amount, actual_qty,
+                        product_id, getattr(sku, "product_name", None),
+                        unit_price, base_unit_price, "capex_purchase",
+                    )
+                except Exception:
+                    tx_id = None
+                if tx_id:
+                    invested += amount
+                    remaining -= amount * (1.0 + 0.0)  # base budget already ex-tax
+        return invested
+
     def _settle_firm_credit(self, month: int) -> Dict[str, Any]:
         """
         企业信用月末结算：计息、自动还款、违约状态标记。
@@ -5184,7 +5407,7 @@ class Simulator:
                 self.economic_center,
                 "settle_firm_credit_month",
                 month,
-                float(getattr(self.config, "firm_credit_annual_interest_rate", 0.08) or 0.08),
+                self._effective_firm_credit_rate(),
                 float(getattr(self.config, "firm_credit_repayment_cash_buffer", 1000.0) or 0.0),
                 int(getattr(self.config, "firm_credit_default_distress_months", 3) or 3),
             )

@@ -276,6 +276,23 @@ def build_rule_based_consumption_plan(
         basic_floor=basic_floor,
         liquidity_preference=persona.liquidity_preference,
     )
+    # 消费利率敏感性:实际利率上升 → MPC 下降(储蓄增加)。仅在 consumption_rate_sensitivity>0
+    # 时生效(默认 0 = 不改变行为)。利率取 macro_indicators 的月度利率,折年化偏离自然利率。
+    rate_sensitivity = _nonnegative_float(
+        macro_indicators.get("consumption_rate_sensitivity")
+        if isinstance(macro_indicators, Mapping) else None,
+        fallback=0.0,
+    )
+    if rate_sensitivity > 0.0:
+        monthly_rate = _nonnegative_float(
+            _first_number(macro_indicators, ("interest_rate",), default=0.0), fallback=0.0
+        )
+        natural_monthly = _nonnegative_float(
+            _first_number(macro_indicators, ("natural_rate_monthly",), default=0.005 / 12.0),
+            fallback=0.005 / 12.0,
+        )
+        rate_gap_annual = (monthly_rate - natural_monthly) * 12.0
+        mpc = _clamp(mpc * (1.0 - rate_sensitivity * rate_gap_annual), 0.30, 0.92)
     income_component = income * mpc
     shortfall_ratio = _clamp((basic_floor - income) / basic_floor if basic_floor > 0 else 0.0, 0.0, 1.0)
     excess_liquidity = max(0.0, available_cash - target_cash_buffer)

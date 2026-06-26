@@ -538,6 +538,27 @@ class EconomicCenter:
 
         return {"invested": float(amt), "capital_stock": float(k1), "cash_balance": float(self.ledger[cid].amount or 0.0)}
 
+    def record_capital_formation(self, firm_id: str, amount: float, month: int) -> float:
+        """记录固定资本形成到资本存量(不动现金)。
+
+        与 invest_in_capital 不同:capex 的现金已通过资本品购买(process_purchase)流出,
+        此处只把购买额计入资本存量 K + 历史,避免双重扣减现金(否则破坏货币守恒)。
+        """
+        cid = str(firm_id or "")
+        try:
+            m = int(month or 0)
+            amt = float(amount or 0.0)
+        except Exception:
+            return 0.0
+        if not cid or m <= 0 or amt <= 0:
+            return 0.0
+        k0 = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+        k1 = max(0.0, k0 + amt)
+        self.firm_capital_stock[cid] = k1
+        self.firm_capital_stock_history[cid][m] = k1
+        self.firm_monthly_capital_investment[cid][m] += amt
+        return amt
+
     def apply_monthly_depreciation(self, month: int, annual_depreciation_rate: float = 0.08, reduce_capital_stock: bool = True) -> Dict[str, float]:
         """
         对所有企业计提月度折旧：
@@ -1375,20 +1396,21 @@ class EconomicCenter:
         return results
     
     def process_purchase(
-        self, 
-        month: int, 
-        buyer_id: str, 
-        seller_id: str, 
+        self,
+        month: int,
+        buyer_id: str,
+        seller_id: str,
         amount: float,
         quantity: float = 1.0,
         product_id: Optional[str] = None,
         product_name: Optional[str] = None,
         unit_price: Optional[float] = None,
         base_unit_price: Optional[float] = None,
+        tx_type: str = 'purchase',
     ) -> Optional[str]:
         """
         处理购买交易（纯转账，商品管理由商品市场负责）
-        
+
         Args:
             month: 当前月份
             buyer_id: 买家ID
@@ -1398,7 +1420,9 @@ class EconomicCenter:
             product_id: 商品ID（可选，用于记录）
             product_name: 商品名称（可选，用于记录）
             unit_price: 单价（可选，用于记录）
-        
+            tx_type: 交易类型（默认 'purchase' 家庭消费；'capex_purchase' 为企业固定资本投资，
+                     走同一结算/会计路径但在 GDP 支出法归入固定资本形成 I 而非消费 C）
+
         Returns:
             交易ID（成功）或 None（失败）
         """
@@ -1452,7 +1476,7 @@ class EconomicCenter:
             sender_id=buyer_id,
             receiver_id=seller_id,
             amount=base_price,
-            tx_type='purchase',
+            tx_type=tx_type,
             month=month,
             metadata={
                 "product_id": product_id,
@@ -3025,6 +3049,13 @@ class EconomicCenter:
         # G: 政府支出
         government_procurement = 0.0  # 政府采购商品
         government_wages = 0.0         # 政府工资支出
+
+        # I: 企业固定资本投资（资本品购买，含税购买者价格）。其基价从存货投资中扣除，
+        # 再作为独立的固定资本形成项进入支出法 I，净额不重复计（卖方产出已在 goods_output）。
+        fixed_capital_formation = 0.0
+        fixed_capital_formation_ex_tax = 0.0
+        fixed_capital_base_value = 0.0
+        fixed_capital_vat = 0.0
         
         # 税收
         vat_collected = 0.0
@@ -3078,6 +3109,26 @@ class EconomicCenter:
                 government_procurement += amount
                 industry = str(metadata.get("industry", "Unknown") or "Unknown")
                 industry_sales[industry] += amount
+
+            # 企业固定资本投资（资本品购买）。走与家庭消费相同的结算路径（含 VAT），
+            # 但在支出法归入固定资本形成 I。基价计入最终销售（从存货投资扣除），
+            # 净额不重复计（卖方产出已在 goods_output）。
+            elif tx_type == "capex_purchase":
+                ex_tax = float(metadata.get("amount_ex_tax", amount) or 0.0)
+                fixed_capital_formation_ex_tax += ex_tax
+                base_amount = float(metadata.get("base_amount", ex_tax) or 0.0)
+                base_amount = max(0.0, min(base_amount, ex_tax))
+                fixed_capital_base_value += base_amount
+                # 渠道加价(售价超基价部分)是卖方的增加值产出,须计入生产侧,
+                # 否则生产法少算该 margin → exp_vs_prod 出现间歇缺口(与家庭消费一致处理)。
+                capex_margin = float(metadata.get("retail_margin", ex_tax - base_amount) or 0.0)
+                if capex_margin > 0.0:
+                    seller_industry = self._get_firm_industry(receiver_id)
+                    if not seller_industry or seller_industry == "Unknown":
+                        seller_industry = str(metadata.get("retailer_industry", "retail_distribution") or "retail_distribution")
+                    retail_distribution_output_by_industry[seller_industry] += capex_margin
+                industry = str(metadata.get("industry", "Unknown") or "Unknown")
+                industry_sales[industry] += ex_tax
             
             # 工资支付
             elif tx_type == "labor_payment":
@@ -3136,7 +3187,9 @@ class EconomicCenter:
         
         # 总消费 C（含税，反映家庭实际支付的购买者价格）。
         # purchase 交易本身是不含 VAT 的，consume_tax 单独记录，因此这里补入 VAT。
-        consumption_total = household_consumption + vat_collected
+        # capex 的 VAT 也在 vat_collected 里，须移出（在固定资本形成 I 中单独计入）。
+        _capex_vat = fixed_capital_formation_ex_tax * float(self.vat_rate or 0.0)
+        consumption_total = household_consumption + (vat_collected - _capex_vat)
         
         # 政府支出 G = 政府最终消费支出
         # SNA 口径：G = 政府采购商品/服务 + 政府部门增加值（雇员报酬）
@@ -3155,9 +3208,9 @@ class EconomicCenter:
         final_service_output_total = float(sum(final_service_output_by_industry.values()))
         intermediate_service_output_total = float(sum(intermediate_service_output_by_industry.values()))
         retail_distribution_output_total = float(sum(retail_distribution_output_by_industry.values()))
-        goods_final_sales_base_value = household_goods_base_value + government_procurement
-        goods_final_sales_ex_tax = household_goods_consumption_ex_tax + government_procurement
-        total_sales_ex_tax = household_consumption_ex_tax + government_procurement
+        goods_final_sales_base_value = household_goods_base_value + government_procurement + fixed_capital_base_value
+        goods_final_sales_ex_tax = household_goods_consumption_ex_tax + government_procurement + fixed_capital_formation_ex_tax
+        total_sales_ex_tax = household_consumption_ex_tax + government_procurement + fixed_capital_formation_ex_tax
         # 商品中间消耗：制造商之间采购的实物 SKU 被下游用作中间投入而消耗掉，
         # 既不是最终销售也不是期末存货，却包含在 goods_output 里。若不扣除，
         # 它会被当成存货投资虚增支出法 GDP，正好等于生产侧的商品中间消耗
@@ -3173,9 +3226,16 @@ class EconomicCenter:
             goods_output - goods_final_sales_base_value - goods_intermediate_consumption
         )
         inventory_investment_memo = inventory_investment
-        
-        # 支出法 GDP = C + G + I（封闭经济，无固定资本投资）
-        gdp_expenditure = consumption_total + government_expenditure + inventory_investment
+
+        # 固定资本形成（购买者价格，含其 VAT 份额）。capex 的 VAT 已并入 vat_collected，
+        # 须从消费侧 VAT 移出以免重复计入 C。基价已计入 goods_final_sales_base_value，
+        # 从存货投资扣除，故净额不重复（卖方产出已在 goods_output）。
+        fixed_capital_vat = fixed_capital_formation_ex_tax * float(self.vat_rate or 0.0)
+        fixed_capital_formation = fixed_capital_formation_ex_tax + fixed_capital_vat
+        total_investment = inventory_investment + fixed_capital_formation
+
+        # 支出法 GDP = C + G + I（I = 存货投资 + 固定资本形成）
+        gdp_expenditure = consumption_total + government_expenditure + total_investment
         
         # =====================================================================
         # 3️⃣ 计算生产法 GDP: Σ(增加值) + 产品税
@@ -3304,7 +3364,7 @@ class EconomicCenter:
         consumption_rate = consumption_total / gdp_expenditure if gdp_expenditure > 0 else 0.0
         
         # 投资率（参考值，不计入 GDP）
-        investment_rate = inventory_investment_memo / gdp_expenditure if gdp_expenditure > 0 else 0.0
+        investment_rate = total_investment / gdp_expenditure if gdp_expenditure > 0 else 0.0
         
         # 政府支出占比
         government_rate = government_expenditure / gdp_expenditure if gdp_expenditure > 0 else 0.0
@@ -3362,6 +3422,9 @@ class EconomicCenter:
                     "inventory_investment": inventory_investment,
                     "inventory_investment_memo": inventory_investment_memo,
                     "goods_inventory_investment": inventory_investment,
+                    "fixed_capital_formation": fixed_capital_formation,
+                    "fixed_capital_formation_ex_tax": fixed_capital_formation_ex_tax,
+                    "total_investment": total_investment,
                     "goods_output": goods_output,
                     "goods_final_sales_base_value": goods_final_sales_base_value,
                     "goods_final_sales_ex_tax": goods_final_sales_ex_tax,
