@@ -1,0 +1,87 @@
+simulation:
+  num_months: 60
+  preheat_months: 3
+  num_households: 50
+  debug_logging: false
+  debug_max_households: 0
+  debug_max_firms: 0
+  local_record_dir: "output/calib"
+  enable_accounting_invariant_checks: true
+  num_firms: 66
+  num_banks: 10
+  num_government: 1
+  consumption_use_llm: false
+  consumption_llm_mode: "off"
+  unemployment_replacement_rate: 0.3
+  demand_shock_std: 0.06
+  demand_shock_rho: 0.7
+  random_seed: 12345
+  endogenous_wages: false
+  wage_adjustment_speed: 0.3
+  wage_target_unemployment: 0.08
+  household_dollar_scale: 1.0
+  wage_scale_init: 0.3
+  labor_demand_smoothing: 1.0
+  firm_job_posting_use_llm: false
+  active_production_planning: true
+  production_apply_capacity_constraints: true
+  production_ema_alpha: 0.5
+  production_labor_productivity: 2.5
+  labor_match_top_k: 24
+  retailer_procurement_safety_factor: 0.85
+  labor_match_offer_backups: 12
+  production_value_calibrated_labor_productivity: true
+  # 工资竞价(B):菲利普斯从 wage→cost→price 真实传导涌现。
+  firm_wage_bidding_enabled: true
+  firm_wage_bid_up: 0.05
+  firm_wage_bid_down: 0.03
+  firm_wage_premium_min: 0.5
+  firm_wage_premium_max: 3.0
+  labor_offer_acceptance_policy: "highest_wage"
+  # ===== 校准根因修复(默认 OFF,此处 ON)=====
+  # 根因1(就业惯性):实测 λ>0 阻断 Okun 传导(平滑滞后水平=labor_demand_smoothing 同病),
+  # 且 u_volatility 反而更差。保留代码默认 OFF,此处关闭。蛛网是月内顺序问题,非平滑可解。
+  employment_adjustment_inertia: 0.0
+  # 根因1-真解(劳动力囤积):周期-2 蛛网根因是 layoff↔rehire churn——企业每月把超预算员工一次
+  # 裁到帽、下月需求回来再招回(就业 53/47 交替,u_volatility 爆)。layoff_speed<1 渐进裁员,
+  # 企业扛过单月需求波动,只对持续超支逐步调整(真实劳动调整成本)。只动裁员侧、招聘仍跟当期需求,
+  # 故不削弱 Okun。实测 5-seed:u_vol 5.38→2.93,Okun 3/5→5/5,Phillips 5/5,矩 |z| 2.04→1.57。
+  firm_layoff_speed: 0.35
+  # 根因2:当期收入消费渠道(实测 w=0.5 已把 mpc −0.32→+0.07;调高至 0.8 推近目标 0.40)。
+  consumption_current_income_weight: 0.8
+  # 根因3:财富异质性——保留债务尾部 + 不削顶富尾 + 代表性抽样(关键:limit<总数时跨全分布
+  # 等距抽样,否则取前 N 行丢尾部。实测 n=50 wealth_gini 0.40→0.84)。
+  household_keep_negative_wealth: true
+  household_wealth_cap_percentile: 0.98
+  household_sampling: "representative"
+
+checkpoint:
+  checkpoint_interval: 999
+  checkpoint_output_dir: "output/checkpoints"
+  checkpoint_compress: false
+
+tax:
+  income_tax_rate:
+    - cutoff: 0
+      rate: 0.1
+    - cutoff: 11601
+      rate: 0.12
+    - cutoff: 47151
+      rate: 0.22
+    - cutoff: 100526
+      rate: 0.24
+    - cutoff: 191951
+      rate: 0.32
+    - cutoff: 243726
+      rate: 0.35
+    - cutoff: 609351
+      rate: 0.37
+  corporate_tax_rate: 0.21
+  vat_rate: 0.08
+  fica_tax_rate: 0.0765
+  interest:
+    rate: 0.005
+
+concurrent config:
+  max_concurrent_tasks: 64
+  max_llm_concurrent: 64

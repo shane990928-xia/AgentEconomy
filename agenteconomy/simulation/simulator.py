@@ -261,6 +261,9 @@ class Simulator:
             economic_center=self.economic_center,
             labor_market=self.labor_market,
             product_market=self.product_market,
+            keep_negative_wealth=bool(getattr(self.config, "household_keep_negative_wealth", False)),
+            wealth_cap_percentile=float(getattr(self.config, "household_wealth_cap_percentile", 0.90) or 0.90),
+            sampling=str(getattr(self.config, "household_sampling", "head") or "head"),
         )
         self._household_by_id = {hh.household_id: hh for hh in (self.households or [])}
 
@@ -1706,6 +1709,7 @@ class Simulator:
             "price_index": round(price_index, 2),
             # 消费利率敏感性传导：策略据此让 MPC 随实际利率偏离自然利率而下降（默认 0 = 无效果）
             "consumption_rate_sensitivity": float(getattr(self.config, "consumption_rate_sensitivity", 0.0) or 0.0),
+            "consumption_current_income_weight": float(getattr(self.config, "consumption_current_income_weight", 0.0) or 0.0),
             "natural_rate_monthly": float(getattr(self.config, "taylor_natural_rate", 0.005) or 0.005) / 12.0,
         }
 
@@ -3912,12 +3916,23 @@ class Simulator:
             if current_wage_bill <= tolerated_wage_cap:
                 continue
 
+            # 劳动力囤积:渐进裁员。target = current - speed*(current - new_cap)。speed=1 立即裁到帽
+            # (旧行为);speed<1 每月只回收超支缺口的一部分,对单月需求波动保留员工 → 阻尼 layoff↔rehire
+            # 周期-2 蛛网。只动裁员侧,招聘侧不变 → 不削弱 Okun。
+            layoff_speed = float(getattr(self.config, "firm_layoff_speed", 1.0) or 1.0)
+            layoff_speed = max(0.0, min(1.0, layoff_speed))
+            effective_target_cap = new_wage_cap
+            if layoff_speed < 1.0:
+                effective_target_cap = current_wage_bill - layoff_speed * (current_wage_bill - new_wage_cap)
+                # 仍不可低于产能下限/最低帽
+                effective_target_cap = max(effective_target_cap, new_wage_cap)
+
             # 执行裁员
             result = self._call_actor(
                 self.labor_market,
                 "layoff_to_budget",
                 firm_id=firm.firm_id,
-                target_wage_cap=new_wage_cap,
+                target_wage_cap=effective_target_cap,
                 reason="budget_reduction",
                 month=month,
                 strategy="highest_wage",
@@ -4153,6 +4168,14 @@ class Simulator:
                     wage_bid_down=float(getattr(self.config, "firm_wage_bid_down", 0.02) or 0.0),
                     wage_premium_min=float(getattr(self.config, "firm_wage_premium_min", 0.5) or 0.0),
                     wage_premium_max=float(getattr(self.config, "firm_wage_premium_max", 2.5) or 1.0),
+                    employment_adjustment_inertia=float(
+                        getattr(self.config, "employment_adjustment_inertia", 0.0) or 0.0
+                    ),
+                    beveridge_overposting_strength=float(
+                        getattr(self.config, "firm_beveridge_overposting_strength", 1.0)
+                        if getattr(self.config, "firm_beveridge_overposting_strength", 1.0) is not None
+                        else 1.0
+                    ),
                 )
             )
             task_firms.append(firm)

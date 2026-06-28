@@ -294,6 +294,24 @@ def build_rule_based_consumption_plan(
         rate_gap_annual = (monthly_rate - natural_monthly) * 12.0
         mpc = _clamp(mpc * (1.0 - rate_sensitivity * rate_gap_annual), 0.30, 0.92)
     income_component = income * mpc
+    # 当期收入消费渠道:当 consumption_current_income_weight>0,在永久收入(PSID 基线 ER85629)
+    # 之上叠加当期收入偏离项,使收入高于常态时多消费、低于时少消费(buffer-stock 一致),
+    # 并按权重下调 habit 惯性对收入响应的稀释。默认 0 = 不改变行为。
+    current_income_weight = _nonnegative_float(
+        macro_indicators.get("consumption_current_income_weight")
+        if isinstance(macro_indicators, Mapping) else None,
+        fallback=0.0,
+    )
+    effective_habit = persona.habit_strength
+    if current_income_weight > 0.0:
+        ref_income = _nonnegative_float(
+            _first_number(state, ("ER85629", "permanent_income", "monthly_income"), default=income),
+            fallback=income,
+        )
+        income_surprise = income - ref_income
+        income_component += current_income_weight * mpc * income_surprise
+        income_component = max(0.0, income_component)
+        effective_habit = persona.habit_strength * (1.0 - _clamp(current_income_weight, 0.0, 1.0))
     shortfall_ratio = _clamp((basic_floor - income) / basic_floor if basic_floor > 0 else 0.0, 0.0, 1.0)
     excess_liquidity = max(0.0, available_cash - target_cash_buffer)
     precautionary_discount = 1.0 - 0.35 * unemployment_pressure * (0.45 + 0.55 * persona.liquidity_preference)
@@ -323,8 +341,8 @@ def build_rule_based_consumption_plan(
     if habit_reference > 0.0:
         habit_reference = min(habit_reference, monthly_flow_cap)
         desired_budget = (
-            desired_budget * (1.0 - persona.habit_strength)
-            + habit_reference * persona.habit_strength
+            desired_budget * (1.0 - effective_habit)
+            + habit_reference * effective_habit
         )
 
     if spendable_after_buffer > 0.0:

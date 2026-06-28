@@ -29,6 +29,9 @@ def create_households(
     labor_market=None,
     product_market=None,
     total_hours: float = 160.0,
+    keep_negative_wealth: bool = False,
+    wealth_cap_percentile: float = 0.90,
+    sampling: str = "head",
 ) -> List[Household]:
     households = load_all_households(
         data_dir=data_dir,
@@ -39,6 +42,9 @@ def create_households(
         household_id_prefix=household_id_prefix,
         limit=limit,
         household_kwargs=household_kwargs,
+        keep_negative_wealth=keep_negative_wealth,
+        wealth_cap_percentile=wealth_cap_percentile,
+        sampling=sampling,
     )
     out = list(households.values())
 
@@ -173,6 +179,9 @@ def load_all_households(
     household_id_prefix: str = "household_",
     limit: Optional[int] = None,
     household_kwargs: Optional[Dict[str, Any]] = None,
+    keep_negative_wealth: bool = False,
+    wealth_cap_percentile: float = 0.90,
+    sampling: str = "head",
 ) -> Dict[str, Household]:
     """
     Bulk loader:
@@ -196,7 +205,11 @@ def load_all_households(
     by_idx = bundle["household_row_by_household_idx"]
     by_fid = bundle["household_row_by_fid"]
 
-    # Filter negative net wealth households and cap extreme wealth at 90th percentile.
+    # Filter negative net wealth households and cap extreme wealth at a percentile.
+    # Defaults reproduce the legacy behavior (drop negative wealth, cap at p90 → compressed
+    # wealth distribution). Setting keep_negative_wealth=True retains the debt tail and
+    # wealth_cap_percentile=1.0 retains the rich tail, both of which raise the wealth Gini
+    # toward the empirical 0.85 and restore wealth>income ordering.
     wealth_rows: List[Tuple[int, Dict[str, Any], float]] = []
     for hh_idx, row in (by_idx or {}).items():
         raw = row.get("ER85692")
@@ -204,21 +217,22 @@ def load_all_households(
             wealth = float(raw)
         except Exception:
             wealth = 0.0
-        if wealth < 0.0:
+        if (not keep_negative_wealth) and wealth < 0.0:
             continue
         wealth_rows.append((hh_idx, row, wealth))
 
     wealth_values = [w for _, _, w in wealth_rows]
-    p90 = None
-    if wealth_values:
+    p_cap = None
+    cap_pct = max(0.0, min(1.0, float(wealth_cap_percentile if wealth_cap_percentile is not None else 0.90)))
+    if wealth_values and cap_pct < 1.0:
         wealth_values.sort()
-        p90 = wealth_values[int((len(wealth_values) - 1) * 0.9)]
+        p_cap = wealth_values[int((len(wealth_values) - 1) * cap_pct)]
 
     filtered_by_idx: Dict[int, Dict[str, Any]] = {}
     kept_row_ids = set()
     for hh_idx, row, wealth in wealth_rows:
-        if p90 is not None and wealth > p90:
-            row["ER85692"] = str(p90)
+        if p_cap is not None and wealth > p_cap:
+            row["ER85692"] = str(p_cap)
         filtered_by_idx[hh_idx] = row
         kept_row_ids.add(id(row))
 
@@ -232,8 +246,36 @@ def load_all_households(
     by_idx = filtered_by_idx
     out: Dict[str, Household] = {}
     kwargs = dict(household_kwargs or {})
+
+    # Selection order when limit < population. "head" = first N sorted indices (legacy).
+    # "representative" = sort by net wealth, then pick N evenly-spaced ranks so the kept
+    # sample spans the full distribution (debt tail .. rich tail) instead of clipping it,
+    # which is what makes the wealth Gini collapse at small num_households.
+    ordered_idx = sorted(by_idx.keys())
+    if str(sampling) == "representative" and limit is not None and 0 < int(limit) < len(ordered_idx):
+        def _w(i):
+            try:
+                return float(by_idx[i].get("ER85692"))
+            except (TypeError, ValueError):
+                return 0.0
+        by_wealth = sorted(ordered_idx, key=_w)
+        k = int(limit)
+        m = len(by_wealth)
+        # evenly-spaced ranks across the wealth-sorted list (inclusive of both tails)
+        picks = sorted({int(round(j * (m - 1) / (k - 1))) for j in range(k)} if k > 1 else {0})
+        # round-collisions can yield <k picks; backfill with nearest unused ranks
+        chosen = [by_wealth[p] for p in picks]
+        if len(chosen) < k:
+            used = set(picks)
+            for p in range(m):
+                if p not in used:
+                    chosen.append(by_wealth[p])
+                    if len(chosen) >= k:
+                        break
+        ordered_idx = chosen
+
     n = 0
-    for hh_idx in sorted(by_idx.keys()):
+    for hh_idx in ordered_idx:
         hid = f"{household_id_prefix}{hh_idx}"
         out[hid] = Household(
             household_id=hid,

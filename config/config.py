@@ -101,7 +101,26 @@ class SimulationConfig:
     wage_adjustment_speed: float = 0.3   # 工资调整速度 kappa
     wage_target_unemployment: float = 0.08  # 工资调整目标失业率
     labor_demand_smoothing: float = 1.0  # 企业劳动需求信号 EMA(alpha<1 平滑,抑制周期-2 蛛网震荡;1=不平滑)
+    # 就业部分调整惯性:企业投放劳动市场的有效需求向上月实际雇佣额收敛(招聘/解雇都有粘性),
+    # 阻尼周期-2 蛛网震荡的频率但保留方向(区别于 labor_demand_smoothing 平滑需求信号会削弱
+    # Okun/Phillips 传导)。0=当前行为;0<λ<1 平滑就业存量调整。
+    employment_adjustment_inertia: float = 0.0
+    # 贝弗里奇超额发布强度:_compute_labor_budget 在低失业时把劳动预算乘以一个 >1 的超发倍数
+    # (U<5%→×2.5 等),意图是"低失业→企业抢人→多发岗位→高空缺"。但该倍数直接进预算→职位→
+    # 被失业者填满→成真实工资帐单,而裁员工资帽不含此倍数 → 招聘按 ×2.5 过冲、裁员按 ×1.0 拉回,
+    # 形成劳动市场的周期-2 蛛网(就业 53/46/53/46 交替,U volatility 爆炸)。strength 线性缩放
+    # 超发幅度:adj=1+(adj-1)*strength。1.0=完全保留旧行为;0.0=无幻影超发(空缺由真实匹配摩擦+
+    # 需求→发岗链内生,劳动市场不再过冲)。
+    firm_beveridge_overposting_strength: float = 1.0
     household_dollar_scale: float = 1.0  # 家庭部门美元缩放(收入/财富/支出),与工资尺度一致(1=不缩放)
+    # 家庭财富异质性:保留负财富(债务尾部)+ 削顶分位可调。默认复现旧行为(丢负财富、p90 削顶,
+    # 财富分布被压缩)。keep_negative_wealth=True + wealth_cap_percentile=1.0 恢复债务/富尾,
+    # 拉高 wealth Gini 向经验值 0.85 并恢复 wealth>income 排序。
+    household_keep_negative_wealth: bool = False
+    household_wealth_cap_percentile: float = 0.90
+    # 家庭抽样方式:"head"=取前 N 行(旧行为);"representative"=按净财富排序后跨全分布
+    # 等距抽样,使小样本(num_households<总数)保留债务+富尾,wealth Gini 不被截断压平。
+    household_sampling: str = "head"
     wage_scale_init: float = 1.0  # 初始工资缩放(内生工资从此起调);=AGENTECO_WAGE_SCALE 的 config 化
     firm_job_posting_use_llm: bool = False
     labor_match_top_k: int = 8
@@ -142,6 +161,9 @@ class SimulationConfig:
     investment_capacity_trigger: float = 0.8  # 产能利用率超此值才扩张投资
     # 消费利率敏感性:实际利率上升→MPC 下降(储蓄增加)。默认 0 = 不改变现有行为。
     consumption_rate_sensitivity: float = 0.0
+    # 当期收入消费渠道:>0 时在永久收入之上叠加当期收入偏离项并下调 habit 惯性,使消费随当期
+    # 收入波动(提高 MPC、修正 cons_rel_volatility 方向)。默认 0 = 不改变现有行为。
+    consumption_current_income_weight: float = 0.0
     firm_min_part_time_hours_per_month: float = 20.0
     firm_max_startup_part_time_hours_per_month: float = 160.0
     firm_min_job_budget_coverage: float = 1.0
@@ -151,6 +173,13 @@ class SimulationConfig:
     firm_layoff_min_wage_cap: float = 0.0
     firm_layoff_min_employees_to_keep: int = 0
     firm_layoff_wage_cap_tolerance: float = 0.25
+    # 解雇速度(劳动力囤积):裁员目标帽 = current - speed*(current - new_cap)。1.0=立即裁到帽
+    # (旧行为);speed<1=渐进裁员=labor hoarding(企业面对单月需求波动保留员工,只对持续超支
+    # 逐步调整)。这阻尼 layoff→rehire 的劳动市场周期-2 蛛网(无平滑时企业每月把超预算员工裁到底、
+    # 下月需求回来再招回 → 就业 53/47 交替)。仅作用于裁员侧,招聘侧仍完全响应当期需求,故不削弱
+    # Okun 的需求→就业上行传导(区别于 employment_adjustment_inertia/labor_demand_smoothing 同时
+    # 阻尼招聘 → 杀 Okun)。
+    firm_layoff_speed: float = 1.0
     retail_channel_diversification_enabled: bool = True
     retail_channel_max_household_share: float = 0.70
     retail_channel_min_purchase_count: int = 3
@@ -324,7 +353,12 @@ class SimulationConfig:
             wage_adjustment_speed=float(sim_data.get('wage_adjustment_speed', 0.3)),
             wage_target_unemployment=float(sim_data.get('wage_target_unemployment', 0.08)),
             labor_demand_smoothing=float(sim_data.get('labor_demand_smoothing', 1.0)),
+            employment_adjustment_inertia=float(sim_data.get('employment_adjustment_inertia', 0.0)),
+            firm_beveridge_overposting_strength=float(sim_data.get('firm_beveridge_overposting_strength', 1.0)),
             household_dollar_scale=float(sim_data.get('household_dollar_scale', 1.0)),
+            household_keep_negative_wealth=bool(sim_data.get('household_keep_negative_wealth', False)),
+            household_wealth_cap_percentile=float(sim_data.get('household_wealth_cap_percentile', 0.90)),
+            household_sampling=str(sim_data.get('household_sampling', 'head')),
             wage_scale_init=float(sim_data.get('wage_scale_init', 1.0)),
             firm_job_posting_use_llm=bool(sim_data.get('firm_job_posting_use_llm', False)),
             labor_match_top_k=int(sim_data.get('labor_match_top_k', 8)),
@@ -356,6 +390,7 @@ class SimulationConfig:
             capital_depreciation_annual_rate=float(sim_data.get('capital_depreciation_annual_rate', 0.08)),
             investment_capacity_trigger=float(sim_data.get('investment_capacity_trigger', 0.8)),
             consumption_rate_sensitivity=float(sim_data.get('consumption_rate_sensitivity', 0.0)),
+            consumption_current_income_weight=float(sim_data.get('consumption_current_income_weight', 0.0)),
             firm_min_part_time_hours_per_month=float(sim_data.get('firm_min_part_time_hours_per_month', 20.0)),
             firm_max_startup_part_time_hours_per_month=float(sim_data.get('firm_max_startup_part_time_hours_per_month', 160.0)),
             firm_min_job_budget_coverage=float(sim_data.get('firm_min_job_budget_coverage', 1.0)),
@@ -365,6 +400,7 @@ class SimulationConfig:
             firm_layoff_min_wage_cap=float(sim_data.get('firm_layoff_min_wage_cap', 0.0)),
             firm_layoff_min_employees_to_keep=int(sim_data.get('firm_layoff_min_employees_to_keep', 0)),
             firm_layoff_wage_cap_tolerance=float(sim_data.get('firm_layoff_wage_cap_tolerance', 0.25)),
+            firm_layoff_speed=float(sim_data.get('firm_layoff_speed', 1.0)),
             retail_channel_diversification_enabled=bool(
                 sim_data.get('retail_channel_diversification_enabled', True)
             ),

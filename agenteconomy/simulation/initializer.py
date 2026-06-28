@@ -343,6 +343,9 @@ class SimulationInitializer:
             economic_center=self.context.economic_center,
             labor_market=self.context.labor_market,
             product_market=self.context.product_market,
+            keep_negative_wealth=bool(getattr(self.config, "household_keep_negative_wealth", False)),
+            wealth_cap_percentile=float(getattr(self.config, "household_wealth_cap_percentile", 0.90) or 0.90),
+            sampling=str(getattr(self.config, "household_sampling", "head") or "head"),
         )
         self.context.households.extend(households)
         self.context.household_by_id = {h.household_id: h for h in self.context.households}

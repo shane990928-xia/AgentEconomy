@@ -429,6 +429,8 @@ class Firm:
         current_demand_value: Optional[float] = None,
         allow_cash_based_startup_hiring: bool = False,
         retail_labor_value_share: float = 0.25,
+        employment_adjustment_inertia: float = 0.0,
+        beveridge_overposting_strength: float = 1.0,
     ) -> float:
         """
         计算本期劳动预算
@@ -523,7 +525,21 @@ class Firm:
         effective_ratio = max(actual_ratio, MIN_COMPENSATION_RATIO)
         
         budget = base_value * effective_ratio
-        
+
+        # 就业部分调整惯性:有效劳动预算向上月实际工资支出(已匹配的真实雇佣存量,
+        # 同为月美元量纲)收敛。模拟招聘/解雇粘性——企业一个月内不会从满员砍到零、也不会
+        # 翻倍扩张。这阻尼 demand→hiring→production→demand 的周期-2 蛛网震荡频率,但保留
+        # 需求→就业的方向(区别于平滑需求信号本身,后者会削弱 Okun/Phillips 传导)。0=关闭。
+        _emp_lambda = max(0.0, min(1.0, float(employment_adjustment_inertia or 0.0)))
+        if _emp_lambda > 0.0 and self.labor_market is not None:
+            try:
+                wage_bill = self._call_labor_market("get_firm_wage_bill", self.firm_id)
+                prev_payroll = float((wage_bill or {}).get("total_wage", 0.0) or 0.0)
+            except Exception:
+                prev_payroll = 0.0
+            if prev_payroll > 0.0:
+                budget = (1.0 - _emp_lambda) * budget + _emp_lambda * prev_payroll
+
         # ========== 贝弗里奇曲线修正：根据失业率调整职位发布倍数 ==========
         # 核心经济逻辑：
         #   低失业率 → 企业预期招人困难 → 超额发布职位（但大部分填不满）→ 高空缺率
@@ -550,6 +566,11 @@ class Firm:
                     else:
                         # 高失业：正常发布（1.0倍），不压缩
                         self._beveridge_adjustment = 1.0
+                    # 超发强度线性缩放:adj=1+(adj-1)*strength。strength=1 保留旧行为;
+                    # strength<1 收敛向 1.0;strength=0 完全关闭幻影超发(消除劳动市场周期-2 蛛网)。
+                    _bev_strength = max(0.0, float(beveridge_overposting_strength if beveridge_overposting_strength is not None else 1.0))
+                    if _bev_strength != 1.0:
+                        self._beveridge_adjustment = 1.0 + (self._beveridge_adjustment - 1.0) * _bev_strength
                     budget = budget * self._beveridge_adjustment
                     _logger.debug(
                         f"[劳动预算-贝弗里奇] {self.firm_id}: unemp_rate={unemployment_rate:.3f}, "
@@ -574,6 +595,8 @@ class Firm:
         min_job_budget_coverage: float = 1.0,
         allow_cash_based_startup_hiring: bool = False,
         retail_labor_value_share: float = 0.25,
+        employment_adjustment_inertia: float = 0.0,
+        beveridge_overposting_strength: float = 1.0,
     ) -> List[Job]:
         if not self.industry:
             return []
@@ -618,6 +641,8 @@ class Firm:
             current_demand_value=current_demand_value,
             allow_cash_based_startup_hiring=allow_cash_based_startup_hiring,
             retail_labor_value_share=retail_labor_value_share,
+            employment_adjustment_inertia=employment_adjustment_inertia,
+            beveridge_overposting_strength=beveridge_overposting_strength,
         )
         if labor_budget <= 0:
             return []
@@ -835,6 +860,8 @@ class Firm:
         wage_bid_down: float = 0.02,
         wage_premium_min: float = 0.5,
         wage_premium_max: float = 2.5,
+        employment_adjustment_inertia: float = 0.0,
+        beveridge_overposting_strength: float = 1.0,
     ):
         """
         Post jobs to the labor market
@@ -865,6 +892,8 @@ class Firm:
             min_job_budget_coverage=min_job_budget_coverage,
             allow_cash_based_startup_hiring=allow_cash_based_startup_hiring,
             retail_labor_value_share=retail_labor_value_share,
+            employment_adjustment_inertia=employment_adjustment_inertia,
+            beveridge_overposting_strength=beveridge_overposting_strength,
         )
         if jobs:
             snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
