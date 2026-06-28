@@ -45,6 +45,7 @@ REGIMES = [
     ("hardcoded", "output/grid_*", "Hardcoded\n(shortcuts ON)", "#e15759"),
     ("bid_rules", "output/bidgrid_*", "Wage bidding\n(rules)", "#4e79a7"),
     ("bid_llm", "output/bidllm_*", "Wage bidding\n(LLM)", "#59a14f"),
+    ("calibrated", "output/calibgrid_*_ls035", "Calibrated\n(+hoarding+Phase2/3)", "#b07aa1"),
 ]
 OUT = Path("output/paper_figures")
 
