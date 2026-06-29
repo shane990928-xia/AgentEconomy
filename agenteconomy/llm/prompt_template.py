@@ -7,10 +7,50 @@ Design principle:
 """
 
 
-def build_firm_post_job_prompt(firm):
-    prompt = f"""
+def build_firm_post_job_prompt(firm, *, candidate_socs=None, labor_budget=0.0,
+                               demand_value=0.0, anchor_weights=None):
+    """Build a constrained firm-hiring prompt.
+
+    The LLM decides the firm's HIRING EMPHASIS across its candidate occupations
+    (SOC codes) given its industry, current headcount, labor budget, and demand.
+    Output is a strict-JSON weight per SOC; the caller renormalizes these onto
+    the rule-based allocation machinery, so the LLM shapes the occupation MIX
+    while the budget/position math stays valid (mirrors the constrained
+    consumption design: LLM intent + rule-guaranteed feasibility).
+
+    anchor_weights = the rule baseline (national SOC employment distribution),
+    given to the LLM as a reference so it adjusts rather than inventing.
     """
-    return prompt
+    socs = list(candidate_socs or [])
+    anchor = anchor_weights or {}
+    lines = []
+    for soc in socs:
+        title = ""
+        try:
+            title = (firm and getattr(firm, "_soc_titles", {}) or {}).get(soc, "")
+        except Exception:
+            title = ""
+        a = float(anchor.get(soc, 0.0) or 0.0)
+        lines.append(f'  "{soc}": (occupation: {title or soc}, reference_weight: {a:.3f})')
+    soc_block = "\n".join(lines) if lines else "  (none)"
+    industry = getattr(firm, "industry", None) or "unknown"
+    headcount = int(getattr(firm, "employee_count", 0) or 0)
+    return f"""You are the hiring manager of a firm in industry "{industry}".
+Current headcount: {headcount}. Labor budget this month: {labor_budget:.0f}.
+Recent demand signal (revenue basis): {demand_value:.0f}.
+
+You may hire across these occupations (SOC code -> reference national weight):
+{soc_block}
+
+Decide how to PRIORITIZE hiring across these occupations this month given the
+firm's demand and budget. Return STRICT JSON only, mapping each SOC code to a
+non-negative priority weight (they need not sum to 1; relative magnitude is what
+matters). Emphasize occupations that best serve current demand; you may keep
+weights near the reference if no strong reason to deviate.
+
+Output format (JSON object, no prose):
+{{"<SOC>": <weight>, ...}}"""
+
 
 
 # =============================================================================

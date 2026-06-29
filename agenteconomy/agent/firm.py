@@ -585,7 +585,54 @@ class Firm:
         )
         return budget
 
-    def _decide_job_postings_from_data(
+    async def _llm_reweight_hiring(self, *, candidate_socs, anchor_weights,
+                                   labor_budget, demand_value, job_data):
+        """Ask the LLM for a hiring-priority weight per candidate SOC.
+
+        Returns a {soc: weight>=0} dict restricted to candidate_socs, or None on
+        any failure (caller then keeps the rule weights). Constrained decision:
+        the LLM only sets relative emphasis; feasibility/positions stay rule-based.
+        """
+        socs = [s for s in (candidate_socs or []) if s]
+        if not socs:
+            return None
+        # attach occupation titles for the prompt
+        self._soc_titles = {
+            s: (job_data.get(s, {}) or {}).get("title", "") for s in socs
+        }
+        prompt = build_firm_post_job_prompt(
+            self,
+            candidate_socs=socs,
+            labor_budget=float(labor_budget or 0.0),
+            demand_value=float(demand_value or 0.0),
+            anchor_weights=anchor_weights,
+        )
+        raw = await call_llm(prompt)
+        if not raw:
+            return None
+        text = str(raw).strip()
+        # strip code fences / extract the JSON object
+        if "```" in text:
+            text = text.split("```")[1] if len(text.split("```")) > 1 else text
+            text = text.replace("json", "", 1).strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, dict):
+            return None
+        out = {}
+        for s in socs:
+            try:
+                w = float(parsed.get(s, anchor_weights.get(s, 0.0)))
+            except (TypeError, ValueError):
+                w = float(anchor_weights.get(s, 0.0) or 0.0)
+            out[s] = max(0.0, w)
+        if sum(out.values()) <= 0.0:
+            return None
+        return out
+
+    async def _decide_job_postings_from_data(
         self,
         period: Optional[int] = None,
         max_job_types: int = 10,
@@ -597,6 +644,7 @@ class Firm:
         retail_labor_value_share: float = 0.25,
         employment_adjustment_inertia: float = 0.0,
         beveridge_overposting_strength: float = 1.0,
+        use_llm: bool = False,
     ) -> List[Job]:
         if not self.industry:
             return []
@@ -646,6 +694,27 @@ class Firm:
         )
         if labor_budget <= 0:
             return []
+
+        # LLM hiring decision (constrained): the LLM reweights the candidate-SOC
+        # hiring emphasis given the firm's industry/headcount/budget/demand; the
+        # rule distribution serves as the anchor. Output flows through the same
+        # allocation machinery below, so positions/budget math stays valid (only
+        # the occupation MIX is LLM-driven). On any failure the rule weights are
+        # kept, so use_llm never breaks hiring.
+        if use_llm:
+            try:
+                llm_weights = await self._llm_reweight_hiring(
+                    candidate_socs=candidate_socs,
+                    anchor_weights=weights,
+                    labor_budget=labor_budget,
+                    demand_value=float(current_demand_value or 0.0),
+                    job_data=job_data,
+                )
+                if llm_weights:
+                    weights = llm_weights
+                    total_weight = sum(weights.values()) or float(len(candidate_socs))
+            except Exception as e:
+                logger.debug(f"[岗位发布-LLM] {self.firm_id}: reweight failed, keep rule weights: {e}")
 
         hours_per_week = 40.0
         weeks_per_month = 4.0
@@ -873,8 +942,9 @@ class Firm:
         Args:
             period: 当前期间
             current_demand_value: 本月的需求/生产价值（用于计算劳动预算）
-            use_llm: If True, allow the legacy LLM fallback when no data-driven
-                job plan can be produced.
+            use_llm: If True, the LLM sets the hiring emphasis across candidate
+                occupations (constrained SOC reweight inside
+                _decide_job_postings_from_data); positions/budget stay rule-based.
             wage_bidding_enabled: 若开启,先按上轮空缺填补情况内生调整 self.wage_premium。
         """
         if wage_bidding_enabled:
@@ -884,7 +954,7 @@ class Firm:
                 premium_min=wage_premium_min,
                 premium_max=wage_premium_max,
             )
-        jobs = self._decide_job_postings_from_data(
+        jobs = await self._decide_job_postings_from_data(
             period=period,
             current_demand_value=current_demand_value,
             min_part_time_hours_per_month=min_part_time_hours_per_month,
@@ -894,6 +964,7 @@ class Firm:
             retail_labor_value_share=retail_labor_value_share,
             employment_adjustment_inertia=employment_adjustment_inertia,
             beveridge_overposting_strength=beveridge_overposting_strength,
+            use_llm=use_llm,
         )
         if jobs:
             snapshot = self._call_labor_market("get_firm_job_snapshot", self.firm_id)
@@ -943,12 +1014,10 @@ class Firm:
                 if reduce_by > 0:
                     self._call_labor_market("reduce_job_positions", self.firm_id, soc, reduce_by)
 
-        if not use_llm:
-            return []
-
-        prompt = build_firm_post_job_prompt(self) # TODO
-        response = await call_llm(prompt)
-        return response
+        # No fundable job plan this month → post nothing. (LLM hiring is applied
+        # inside _decide_job_postings_from_data as a constrained SOC reweight, not
+        # as a separate free-text fallback.)
+        return []
 
     def evaluate_candidates(self):
         """Evaluate candidates for the job"""

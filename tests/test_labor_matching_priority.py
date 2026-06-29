@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from agenteconomy.agent.firm import Firm
@@ -5,6 +6,15 @@ from agenteconomy.agent.household import Household, JobMatch
 from agenteconomy.center.Model import Job, LaborHour
 from agenteconomy.simulation.simulator import Simulator
 from config.config import SimulationConfig
+
+
+def _run(coro):
+    """Drive an async firm method to completion in a sync test."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class FakeLaborMarket:
@@ -130,12 +140,12 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm = Firm(firm_id="mfg_food", name="Food Producer", industry="311FT")
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=2,
             current_demand_value=50.0,
             min_part_time_hours_per_month=20.0,
             max_startup_part_time_hours_per_month=160.0,
-        )
+        ))
 
         self.assertEqual(jobs, [])
 
@@ -143,12 +153,12 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm = Firm(firm_id="mfg_food", name="Food Producer", industry="311FT")
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=2,
             current_demand_value=2000.0,
             min_part_time_hours_per_month=10.0,
             max_startup_part_time_hours_per_month=160.0,
-        )
+        ))
 
         self.assertTrue(jobs)
         self.assertEqual(jobs[0].positions_available, 1)
@@ -159,13 +169,13 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm = Firm(firm_id="mfg_food", name="Food Producer", industry="311FT")
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=2,
             current_demand_value=2000.0,
             min_part_time_hours_per_month=10.0,
             max_startup_part_time_hours_per_month=160.0,
             min_job_budget_coverage=3.0,
-        )
+        ))
 
         self.assertEqual(jobs, [])
 
@@ -173,12 +183,12 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm = Firm(firm_id="mfg_food", name="Food Producer", industry="311FT")
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=2,
             current_demand_value=40000.0,
             min_part_time_hours_per_month=10.0,
             max_startup_part_time_hours_per_month=160.0,
-        )
+        ))
 
         planned_wage = sum(
             job.wage_per_hour * (job.hours_per_period or 160.0) * job.positions_available
@@ -193,12 +203,12 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm.cash = 10000.0
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=1,
             current_demand_value=0.0,
             min_part_time_hours_per_month=10.0,
             max_startup_part_time_hours_per_month=160.0,
-        )
+        ))
 
         self.assertEqual(jobs, [])
 
@@ -207,13 +217,13 @@ class FirmPartTimePostingTests(unittest.TestCase):
         firm.cash = 10000.0
         firm.compensation_ratio = 0.2
 
-        jobs = firm._decide_job_postings_from_data(
+        jobs = _run(firm._decide_job_postings_from_data(
             period=1,
             current_demand_value=0.0,
             min_part_time_hours_per_month=10.0,
             max_startup_part_time_hours_per_month=160.0,
             allow_cash_based_startup_hiring=True,
-        )
+        ))
 
         self.assertTrue(jobs)
 
@@ -280,7 +290,9 @@ class FirmJobPostingAlignmentTests(unittest.IsolatedAsyncioTestCase):
             hours_per_period=160.0,
         )
         desired_job.positions_available = 3
-        firm._decide_job_postings_from_data = lambda **kwargs: [desired_job]
+        async def _fake_decide(**kwargs):
+            return [desired_job]
+        firm._decide_job_postings_from_data = _fake_decide
 
         jobs = await firm.post_jobs(period=2, current_demand_value=10000.0, use_llm=False)
 
@@ -311,7 +323,9 @@ class FirmJobPostingAlignmentTests(unittest.IsolatedAsyncioTestCase):
             hours_per_period=160.0,
         )
         desired_job.positions_available = 2
-        firm._decide_job_postings_from_data = lambda **kwargs: [desired_job]
+        async def _fake_decide(**kwargs):
+            return [desired_job]
+        firm._decide_job_postings_from_data = _fake_decide
 
         jobs = await firm.post_jobs(period=2, current_demand_value=10000.0, use_llm=False)
 
