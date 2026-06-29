@@ -88,6 +88,14 @@ class SimulationConfig:
     firm_credit_annual_interest_rate: float = 0.08
     firm_credit_repayment_cash_buffer: float = 1000.0
     firm_credit_default_distress_months: int = 3
+    # 企业进入/退出(熊彼特创造性破坏):持续违约的企业退出(写销资本+豁免坏账),其行业槽位
+    # 在延迟后由新企业(债务融资种子资本,守恒安全)重新进入。给 firm-size 幂律真实的生成机制。
+    # 默认关闭(僵尸企业留存=旧行为)。退出/进入都在既有行业槽内,保持 IO 表 66 行业结构不变。
+    firm_entry_exit_enabled: bool = False
+    firm_exit_distress_months: int = 6      # 连续违约达此月数→退出(>credit默认distress,避免误杀暂时困难)
+    firm_entry_delay_months: int = 3        # 退出后延迟几月再有新企业进入该槽
+    firm_entry_seed_capital: float = 50000.0  # 新进入企业的种子资本存量
+    firm_entry_seed_cash: float = 20000.0     # 新进入企业的债务融资种子现金(startup loan)
 
     # Behavioral policy configuration
     consumption_use_llm: bool = True  # LLM-assisted consumption is constrained by empirical budget anchors
@@ -486,6 +494,11 @@ class SimulationConfig:
             firm_credit_annual_interest_rate=float(sim_data.get('firm_credit_annual_interest_rate', 0.08)),
             firm_credit_repayment_cash_buffer=float(sim_data.get('firm_credit_repayment_cash_buffer', 1000.0)),
             firm_credit_default_distress_months=int(sim_data.get('firm_credit_default_distress_months', 3)),
+            firm_entry_exit_enabled=bool(sim_data.get('firm_entry_exit_enabled', False)),
+            firm_exit_distress_months=int(sim_data.get('firm_exit_distress_months', 6)),
+            firm_entry_delay_months=int(sim_data.get('firm_entry_delay_months', 3)),
+            firm_entry_seed_capital=float(sim_data.get('firm_entry_seed_capital', 50000.0)),
+            firm_entry_seed_cash=float(sim_data.get('firm_entry_seed_cash', 20000.0)),
         )
 
         logger.info(f"Configuration loaded from {yaml_path}")

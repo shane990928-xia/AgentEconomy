@@ -475,6 +475,70 @@ class EconomicCenter:
             "firms": firms,
         }
 
+    def exit_firm(self, firm_id: str, month: int) -> Dict[str, float]:
+        """Wind down an exiting firm (Schumpeterian creative destruction).
+
+        Conservation-safe: the firm's capital stock is written off (capital is a
+        real/physical stock, not ledger cash) and any outstanding debt is
+        forgiven by crediting bank_credit_system (mirror of the credit
+        double-entry, so the endogenous-deposit counterpart is removed). The
+        firm's remaining LEDGER CASH is left in place (not destroyed) so total
+        ledger cash is invariant. Returns what was written off.
+        """
+        cid = str(firm_id or "")
+        if not cid:
+            return {"capital_written_off": 0.0, "debt_forgiven": 0.0}
+        capital = float(self.firm_capital_stock.get(cid, 0.0) or 0.0)
+        self.firm_capital_stock[cid] = 0.0
+        debt = float(self.firm_debt_balance.get(cid, 0.0) or 0.0)
+        if debt > 0.0:
+            # Forgive the bad debt: remove the firm's liability and the bank's
+            # offsetting derived-deposit claim (non-cash, conservation-neutral).
+            self.firm_debt_balance[cid] = 0.0
+            self._ensure_ledger_entry("bank_credit_system")
+            self.ledger["bank_credit_system"].amount += debt
+        self.firm_credit_defaulted[cid] = True
+        self.firm_credit_distress_months[cid] = 0
+        return {"capital_written_off": float(capital), "debt_forgiven": float(debt)}
+
+    def reenter_firm(self, firm_id: str, seed_capital: float, seed_cash: float,
+                     month: int) -> Dict[str, float]:
+        """Re-enter a firm in an existing industry slot with debt-financed seed.
+
+        Conservation-safe: seed cash is created exactly like a startup loan via
+        the existing firm-credit double-entry (bank_credit_system debited, firm
+        ledger credited, firm_debt_balance increased — endogenous money, net
+        ledger cash invariant). Capital stock is a physical stock set directly.
+        Clears the prior default/distress so the entrant starts fresh.
+        """
+        cid = str(firm_id or "")
+        if not cid:
+            return {"seed_cash": 0.0, "seed_capital": 0.0}
+        if cid not in self.firm_id:
+            self.firm_id.append(cid)
+        if cid not in self.ledger:
+            self.ledger[cid] = Ledger.create(cid, 0.0)
+        self.firm_capital_stock[cid] = max(0.0, float(seed_capital or 0.0))
+        self.firm_credit_defaulted[cid] = False
+        self.firm_credit_distress_months[cid] = 0
+        cash = max(0.0, float(seed_cash or 0.0))
+        if cash > 0.0:
+            # startup loan: same double-entry as _draw_firm_credit_if_needed
+            self.ledger[cid].amount += cash
+            self.firm_debt_balance[cid] = float(self.firm_debt_balance.get(cid, 0.0) or 0.0) + cash
+            self._ensure_ledger_entry("bank_credit_system")
+            self.ledger["bank_credit_system"].amount -= cash
+            self._ensure_firm_credit_limit(cid)
+            self._record_transaction(
+                sender_id="bank_credit_system",
+                receiver_id=cid,
+                amount=cash,
+                tx_type="financial",
+                month=month,
+                metadata={"subtype": "firm_entry_seed_loan"},
+            )
+        return {"seed_cash": cash, "seed_capital": max(0.0, float(seed_capital or 0.0))}
+
     def query_firm_assets(self, firm_id: str) -> Dict[str, float]:
         cid = str(firm_id or "")
         if not cid:

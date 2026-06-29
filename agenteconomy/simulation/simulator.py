@@ -80,6 +80,10 @@ class Simulator:
         self.abstract_resource_market: Optional[AbstractResourceMarket] = None
         self._firm_by_id: Dict[str, Firm] = {}
         self._household_by_id: Dict[str, Household] = {}
+        # Firm entry/exit (creative destruction): firm_id -> months until re-entry.
+        # A firm marked exited stays out; when its countdown reaches 0 a new firm
+        # re-enters the same industry slot. Empty unless firm_entry_exit_enabled.
+        self._exited_firms: Dict[str, int] = {}
         
         self.current_month = 1
         self._record_dir: Optional[str] = None
@@ -1300,6 +1304,7 @@ class Simulator:
         with self._time_block("企业信贷结算", month=month, preheat=True):
             firm_credit_stats = self._settle_firm_credit(econ_month)
             self._apply_credit_default_labor_closure(econ_month, firm_credit_stats)
+            self._process_firm_entry_exit(econ_month, firm_credit_stats)
         with self._time_block("税收再分配", month=month, preheat=True):
             await self._redistribute_taxes(econ_month)
         with self._time_block("企业分红", month=month, preheat=True):
@@ -1579,6 +1584,7 @@ class Simulator:
         with self._time_block("企业信贷结算", month=month, preheat=False):
             firm_credit_stats = self._settle_firm_credit(econ_month)
             self._apply_credit_default_labor_closure(econ_month, firm_credit_stats)
+            self._process_firm_entry_exit(econ_month, firm_credit_stats)
 
         # 资本折旧(仅在固定投资启用时):资本存量按月折旧,计提折旧费用(权责发生制,不动现金)。
         if bool(getattr(self.config, "fixed_investment_enabled", False)) and self.economic_center is not None:
@@ -5520,6 +5526,74 @@ class Simulator:
             "closed_positions": closed_positions,
             "by_firm": by_firm,
         }
+
+    def _process_firm_entry_exit(self, month: int, firm_credit_stats: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Firm exit (persistent default → wind-down) + entry (delayed debt-financed
+        respawn in the same industry slot). Schumpeterian creative destruction —
+        gives the firm-size distribution a real generative churn. Config-gated;
+        no-op (legacy zombie behavior) unless firm_entry_exit_enabled.
+        """
+        if not bool(getattr(self.config, "firm_entry_exit_enabled", False)):
+            return {}
+        if self.economic_center is None:
+            return {}
+        exit_distress = max(1, int(getattr(self.config, "firm_exit_distress_months", 6) or 6))
+        entry_delay = max(0, int(getattr(self.config, "firm_entry_delay_months", 3) or 0))
+        seed_capital = float(getattr(self.config, "firm_entry_seed_capital", 50000.0) or 0.0)
+        seed_cash = float(getattr(self.config, "firm_entry_seed_cash", 20000.0) or 0.0)
+
+        firms_stats = (firm_credit_stats or {}).get("firms", {}) if isinstance(firm_credit_stats, dict) else {}
+        exited, entered = [], []
+
+        # 1) EXIT: firms in default with distress >= exit threshold, not already exited.
+        for firm in list(self.firms or []):
+            fid = str(firm.firm_id)
+            if fid in self._exited_firms:
+                continue
+            st = firms_stats.get(fid) if isinstance(firms_stats, dict) else None
+            distress = int((st or {}).get("distress_months", 0) or 0)
+            defaulted = bool((st or {}).get("defaulted", False))
+            if defaulted and distress >= exit_distress:
+                try:
+                    wind = self._call_actor(self.economic_center, "exit_firm", fid, month) or {}
+                except Exception as e:
+                    logger.debug(f"[企业退出] {fid} 失败: {e}")
+                    continue
+                # close any labor + clear local firm state
+                if self.labor_market is not None:
+                    self._call_actor(self.labor_market, "close_firm_positions", fid, "firm_exit")
+                    self._call_actor(self.labor_market, "layoff_to_budget", firm_id=fid,
+                                     target_wage_cap=0.0, reason="firm_exit", month=month,
+                                     strategy="highest_wage")
+                firm.employee_count = 0
+                firm.employee_list = []
+                firm.capital_stock = 0.0
+                self._exited_firms[fid] = entry_delay
+                exited.append(fid)
+
+        # 2) ENTRY: decrement countdowns; at 0, respawn the slot fresh.
+        for fid in list(self._exited_firms.keys()):
+            self._exited_firms[fid] -= 1
+            if self._exited_firms[fid] <= 0:
+                try:
+                    self._call_actor(self.economic_center, "reenter_firm", fid,
+                                     seed_capital, seed_cash, month)
+                except Exception as e:
+                    logger.debug(f"[企业进入] {fid} 失败: {e}")
+                    self._exited_firms[fid] = entry_delay  # retry next month
+                    continue
+                firm = self._firm_by_id.get(fid)
+                if firm is not None:
+                    firm.cash = seed_cash
+                    firm.capital_stock = seed_capital
+                    firm.wage_premium = 1.0
+                del self._exited_firms[fid]
+                entered.append(fid)
+
+        if exited or entered:
+            logger.info(f"[企业进入/退出] month={month} 退出={exited} 进入={entered} "
+                        f"当前退出中={len(self._exited_firms)}")
+        return {"exited": exited, "entered": entered, "in_exit": len(self._exited_firms)}
 
     async def _redistribute_taxes(self, month: int) -> Dict[str, Any]:
         """
