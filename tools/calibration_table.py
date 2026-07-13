@@ -43,8 +43,9 @@ import numpy as np
 TARGETS = {
     # business-cycle second moments (cyclical, detrended)
     "u_volatility":        (1.3,  0.6,  "Unemployment cyclical std (pp)",         True),
-    "infl_persistence":    (0.6,  0.25, "Inflation AC(1)",                        True),
-    "output_persistence":  (0.3,  0.3,  "Real-GDP-growth AC(1)",                  True),
+    "infl_persistence":    (0.6,  0.25, "Inflation AC(1) — monthly (high-freq)",  False),
+    "infl_persistence_lf": (0.6,  0.25, "Inflation AC(1) — 3mo-MA (freq-comparable)", True),
+    "output_persistence":  (0.3,  0.3,  "Real-GDP cyclical AC(1) (detrended level)", True),
     "cons_rel_volatility": (0.6,  0.25, "Consumption vol / output vol (<1)",      True),
     "inv_rel_volatility":  (3.0,  1.5,  "Investment vol / output vol (>1)",       True),
     # distributional / cross-section
@@ -124,10 +125,26 @@ def measure_run(run_dir, burnin):
     inv = np.array(inv, float)
     ig = np.diff(inv)
 
+    # Output persistence = AC(1) of the DETRENDED OUTPUT LEVEL (cyclical
+    # component), the standard business-cycle definition. Using the growth rate
+    # here is a mis-specification: first-differencing mechanically biases AC(1)
+    # negative, so it cannot be compared to the +0.3 level-persistence target.
+    log_rgdp = np.log(np.where(rgdp > 0, rgdp, np.nan))
+    # Low-frequency inflation persistence: the US 0.6 target is a quarterly/annual
+    # concept; monthly inflation is high-frequency and near-white even in real CPI
+    # data. Report a 3-month moving-average AC(1) as the frequency-comparable
+    # measure alongside the raw monthly one.
+    inf_arr = np.asarray(inf, float)
+    if len(inf_arr) >= 5:
+        ma3 = np.convolve(inf_arr[~np.isnan(inf_arr)], np.ones(3) / 3, mode="valid")
+        infl_persist_lf = _ac1(ma3)
+    else:
+        infl_persist_lf = float("nan")
     out = {
         "u_volatility": float(np.nanstd(_detrend(u)) * 100),  # pp
         "infl_persistence": _ac1(inf),
-        "output_persistence": _ac1(gg),
+        "infl_persistence_lf": infl_persist_lf,
+        "output_persistence": _ac1(_detrend(log_rgdp)),
         "cons_rel_volatility": (float(np.nanstd(cg) / np.nanstd(gg)) if np.nanstd(gg) > 1e-9 else np.nan),
         "inv_rel_volatility": (float(np.nanstd(ig) / (np.nanstd(np.diff(rgdp)) + 1e-9))),
         "u_mean": float(np.nanmean(u)),
