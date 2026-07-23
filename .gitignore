@@ -10,3 +10,4 @@ qdrant_database/
 .codex/
 *.log
 .ipynb_checkpoints/
+/docs/*

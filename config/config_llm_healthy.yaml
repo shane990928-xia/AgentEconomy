@@ -1,0 +1,65 @@
+simulation:
+  num_months: 60
+  preheat_months: 3
+  num_households: 50
+  debug_logging: true
+  debug_max_households: 0
+  debug_max_firms: 0
+  local_record_dir: "output/llm_healthy"
+  enable_accounting_invariant_checks: true
+  num_firms: 66
+  num_banks: 10
+  num_government: 1
+  consumption_use_llm: true
+  consumption_llm_mode: "profile"
+  unemployment_replacement_rate: 0.3
+  demand_shock_std: 0.06
+  demand_shock_rho: 0.7
+  random_seed: 12345
+  endogenous_wages: true
+  wage_adjustment_speed: 0.3
+  wage_target_unemployment: 0.08
+  household_dollar_scale: 1.0
+  wage_scale_init: 0.3
+  labor_demand_smoothing: 1.0
+  firm_job_posting_use_llm: false
+  active_production_planning: true
+  production_apply_capacity_constraints: true
+  production_ema_alpha: 0.5
+  # 回退生产率到基线 2.5（降生产率经实测引发短缺+通胀+就业更差，非就业杠杆）。
+  production_labor_productivity: 2.5
+  labor_match_top_k: 24
+  retailer_procurement_safety_factor: 0.85
+  labor_match_offer_backups: 12
+  production_value_calibrated_labor_productivity: true
+
+checkpoint:
+  checkpoint_interval: 999
+  checkpoint_output_dir: "output/checkpoints"
+  checkpoint_compress: false
+
+tax:
+  income_tax_rate:
+    - cutoff: 0
+      rate: 0.1
+    - cutoff: 11601
+      rate: 0.12
+    - cutoff: 47151
+      rate: 0.22
+    - cutoff: 100526
+      rate: 0.24
+    - cutoff: 191951
+      rate: 0.32
+    - cutoff: 243726
+      rate: 0.35
+    - cutoff: 609351
+      rate: 0.37
+  corporate_tax_rate: 0.21
+  vat_rate: 0.08
+  fica_tax_rate: 0.0765
+  interest:
+    rate: 0.005
+
+concurrent config:
+  max_concurrent_tasks: 64
+  max_llm_concurrent: 64
